@@ -110,8 +110,32 @@ jobs:
           jq -e '(.data[0].totals.branches.count == 0) or (.data[0].totals.branches.percent >= 80)' core.json
       - name: Whole workspace (lines >= 80%)
         run: cargo llvm-cov report --ignore-filename-regex 'xtask' --fail-under-lines 80
-      - name: Diff coverage (>= 90% of changed lines)
-        if: github.event_name == 'pull_request'
-        run: |
-          cargo llvm-cov report --ignore-filename-regex 'xtask' --lcov --output-path lcov.info
-          pipx run diff-cover lcov.info --compare-branch=origin/${{ github.base_ref }} --fail-under=90
+
+  # PR 新增或修改的代码覆盖率 >= 90%。用 stable 且不收集分支信息：
+  # nightly llvm-cov 导出带分支数据的 lcov 时会崩溃（LLVM 自身的 bug）
+  diff-coverage:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: scion
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U scion" --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      SCION_TEST_PG_URL: postgres://scion:scion@localhost:5432/scion
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo llvm-cov --workspace --ignore-filename-regex 'xtask' --lcov --output-path lcov.info
+      - run: pipx run diff-cover lcov.info --compare-branch=origin/${{ github.base_ref }} --fail-under=90
