@@ -131,6 +131,15 @@ impl MetaStore for MemStore {
             .collect())
     }
 
+    async fn object_sizes(&self, repo: &str, ids: &[ObjectId]) -> Result<HashMap<ObjectId, u64>> {
+        let inner = self.read()?;
+        let data = repo_ref(&inner, repo)?;
+        Ok(ids
+            .iter()
+            .filter_map(|id| data.objects.get(id).map(|s| (*id, *s)))
+            .collect())
+    }
+
     async fn put_changeset(&self, repo: &str, rec: &ChangesetRecord) -> Result<()> {
         let mut inner = self.write()?;
         repo_mut(&mut inner, repo)?.changesets.entry(rec.id).or_insert(*rec);

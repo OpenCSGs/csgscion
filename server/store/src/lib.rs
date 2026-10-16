@@ -13,6 +13,8 @@ mod repo;
 #[cfg(any(test, feature = "testsuite"))]
 pub mod testsuite;
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use scion_object::ObjectId;
@@ -60,6 +62,9 @@ pub trait MetaStore: Send + Sync + 'static {
     /// 返回 `ids` 中**该仓库**索引里没有的对象，保持输入中的相对顺序，重复的 id 只返回一次。
     /// 对象字节全局只存一份，但仓库之间互相看不到对方有哪些对象。
     async fn missing_objects(&self, repo: &str, ids: &[ObjectId]) -> Result<Vec<ObjectId>>;
+
+    /// 返回 `ids` 中**该仓库**已登记对象的大小；未登记的不出现在结果里。
+    async fn object_sizes(&self, repo: &str, ids: &[ObjectId]) -> Result<HashMap<ObjectId, u64>>;
 
     /// 记录一个已创建的 changeset 及其根目录树（服务端设计文档 §4.3 的 `cs_tree`）。
     /// 幂等：同一 id 重复写入时保留第一次的记录（相同 changeset 建出的树必然相同）。

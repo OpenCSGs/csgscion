@@ -66,21 +66,30 @@ impl WriteSvc {
             return Err(status::objects_not_uploaded(&missing_parents));
         }
 
-        let blob_ids: Vec<ObjectId> = cs
+        let puts: Vec<(&str, ObjectId, u64)> = cs
             .delta
             .iter()
             .filter_map(|c| match &c.op {
-                scion_object::FileOp::Put { id, .. } => Some(*id),
+                scion_object::FileOp::Put { id, size, .. } => Some((c.path.as_str(), *id, *size)),
                 scion_object::FileOp::Delete => None,
             })
             .collect();
-        let missing = self
-            .meta
-            .missing_objects(repo, &blob_ids)
-            .await
-            .map_err(status::from_store)?;
+        let ids: Vec<ObjectId> = puts.iter().map(|(_, id, _)| *id).collect();
+        let sizes = self.meta.object_sizes(repo, &ids).await.map_err(status::from_store)?;
+        let mut missing: Vec<ObjectId> = ids.iter().filter(|id| !sizes.contains_key(id)).copied().collect();
+        missing.dedup();
         if !missing.is_empty() {
             return Err(status::objects_not_uploaded(&missing));
+        }
+        // 目录树里的 size 来自客户端声明，必须与实际上传的大小一致
+        for (path, id, declared) in &puts {
+            let actual = sizes[id];
+            if actual != *declared {
+                return Err(status::invalid_changeset(
+                    path,
+                    format!("{path:?} declares {declared} bytes but {id} is {actual} bytes"),
+                ));
+            }
         }
 
         let src = BlobTreeSource(self.blobs.clone());
@@ -566,6 +575,19 @@ pub(crate) mod tests {
         assert_eq!(
             code(w.create(REPO, &cs(&[ghost], vec![])).await),
             Some(Code::FailedPrecondition)
+        );
+        // 声明的大小与实际不符
+        upload(&w, b"four").await;
+        let mut lie = put("a", b"four");
+        if let Some(file_change::Op::Put(p)) = &mut lie.op {
+            p.size = 999;
+        }
+        assert_eq!(
+            code(
+                w.create(REPO, &spec_to_changeset(spec(&[], vec![lie]), 10).expect("spec"))
+                    .await
+            ),
+            Some(Code::InvalidArgument)
         );
         // delta 无法应用
         assert_eq!(

@@ -222,6 +222,30 @@ impl MetaStore for PgMetaStore {
         Ok(subtract_present(ids, &present))
     }
 
+    async fn object_sizes(&self, repo: &str, ids: &[ObjectId]) -> Result<std::collections::HashMap<ObjectId, u64>> {
+        let repo_id = self.repo_id(repo).await?;
+        let mut out = std::collections::HashMap::new();
+        for chunk in ids.chunks(MAX_IDS_PER_QUERY) {
+            let mut qb =
+                sqlx::QueryBuilder::<sqlx::Postgres>::new("SELECT id, size FROM objects_index WHERE repo_id = ");
+            qb.push_bind(repo_id).push(" AND id IN (");
+            let mut sep = qb.separated(", ");
+            for id in chunk {
+                sep.push_bind(id.to_bytes().to_vec());
+            }
+            qb.push(")");
+            let rows: Vec<(Vec<u8>, i64)> = qb
+                .build_query_as()
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| backend("object sizes", e))?;
+            for (id, size) in rows {
+                out.insert(id_from_db(&id)?, version_from_db(size)?);
+            }
+        }
+        Ok(out)
+    }
+
     async fn put_changeset(&self, repo: &str, rec: &ChangesetRecord) -> Result<()> {
         let repo_id = self.repo_id(repo).await?;
         sqlx::query(
