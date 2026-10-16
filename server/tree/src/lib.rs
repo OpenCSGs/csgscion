@@ -429,11 +429,10 @@ mod tests {
         let store = Arc::new(scion_store::MemStore::new());
         let t = Tree::default();
         store.put(t.id(), Bytes::from(t.encode())).await.expect("put");
-        let bad = ObjectId::hash(scion_object::ObjectKind::Tree, b"bad");
-        store
-            .put(bad, Bytes::from_static(b"\x02\x01\x05"))
-            .await
-            .expect("put garbage");
+        // 字节与 id 相符（存储层会校验），但不是合法的目录树编码
+        let garbage = Bytes::from_static(b"\x02\x01\x05");
+        let bad = ObjectId::hash(scion_object::ObjectKind::Tree, &garbage);
+        store.put(bad, garbage).await.expect("put garbage");
         let src = BlobTreeSource(store);
         assert_eq!(src.load_tree(&t.id()).await, Ok(t));
         assert!(matches!(src.load_tree(&bad).await, Err(TreeError::BadTree(..))));
