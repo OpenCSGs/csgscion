@@ -300,6 +300,11 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_fp_skip_chain() {
+        testsuite::fp_skip_chain(&MemStore::new()).await;
+    }
+
+    #[tokio::test]
     async fn conformance_blob() {
         testsuite::blob_store(&MemStore::new()).await;
     }

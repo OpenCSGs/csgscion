@@ -176,6 +176,8 @@ pub async fn changesets_and_refs<S: MetaStore + ?Sized>(s: &S) {
         root_tree: tree,
         parents: vec![],
         generation: 1,
+        fp_depth: 0,
+        fp_jump: None,
     };
     // 合并提交：多个父提交，顺序必须保留
     let child = ChangesetRecord {
@@ -183,6 +185,8 @@ pub async fn changesets_and_refs<S: MetaStore + ?Sized>(s: &S) {
         root_tree: tree,
         parents: vec![cs(1), cs(9), cs(5)],
         generation: u64::from(u32::MAX) + 7,
+        fp_depth: 2,
+        fp_jump: Some(cs(1)),
     };
 
     assert_eq!(s.get_changeset("cs/a", &cs(1)).await, Ok(None));
@@ -276,6 +280,8 @@ pub async fn history_index<S: MetaStore + ?Sized>(s: &S) {
             root_tree: tree,
             parents: vec![],
             generation: u64::from(g),
+            fp_depth: 0,
+            fp_jump: None,
         };
         s.put_changeset("hist/a", &rec).await.expect("put");
     }
@@ -299,6 +305,8 @@ pub async fn history_index<S: MetaStore + ?Sized>(s: &S) {
         root_tree: tree,
         parents: vec![cs(5)],
         generation: u64::from(u32::MAX) + 1,
+        fp_depth: 0,
+        fp_jump: None,
     };
     s.put_changeset("hist/a", &big).await.expect("put");
     assert_eq!(
@@ -377,6 +385,58 @@ pub async fn history_index<S: MetaStore + ?Sized>(s: &S) {
         s.changesets_below("nope", 1, 1).await,
         Err(Error::RepoNotFound(_))
     ));
+}
+
+/// 第一父提交链跳表：线性历史上 fp_skip 的深度与跳跃指针满足 skew-binary 规则。
+pub async fn fp_skip_chain<S: MetaStore>(s: &S) {
+    s.create_repo("skip").await.expect("create");
+    let tree = ObjectId::hash(ObjectKind::Tree, b"t");
+    let mut prev: Option<ObjectId> = None;
+    let mut recs = Vec::new();
+    for n in 0..40u8 {
+        let (fp_depth, fp_jump) = crate::fp_skip(s, "skip", prev).await.expect("skip");
+        let rec = ChangesetRecord {
+            id: cs(100 + n),
+            root_tree: tree,
+            parents: prev.into_iter().collect(),
+            generation: u64::from(n) + 1,
+            fp_depth,
+            fp_jump,
+        };
+        s.put_changeset("skip", &rec).await.expect("put");
+        prev = Some(rec.id);
+        recs.push(rec);
+    }
+    assert_eq!((recs[0].fp_depth, recs[0].fp_jump), (1, None), "root jumps to itself");
+    let depth_of = |id: ObjectId| recs.iter().find(|r| r.id == id).map(|r| r.fp_depth).expect("known");
+    for r in &recs[1..] {
+        assert_eq!(r.fp_depth, r.generation);
+        let j = depth_of(r.fp_jump.expect("jump"));
+        assert!(j < r.fp_depth, "jump goes strictly up the chain");
+    }
+    // 跳跃长度覆盖多个尺度（skew-binary：1, 3, 7, 15, …）
+    let longest = recs
+        .iter()
+        .skip(1)
+        .map(|r| r.fp_depth - depth_of(r.fp_jump.expect("jump")))
+        .max()
+        .expect("max");
+    assert!(longest >= 15, "longest jump {longest}");
+    // 父提交深度未知：结果也未知
+    let legacy = ChangesetRecord {
+        id: cs(250),
+        root_tree: tree,
+        parents: vec![],
+        generation: 1,
+        fp_depth: 0,
+        fp_jump: None,
+    };
+    s.put_changeset("skip", &legacy).await.expect("put");
+    assert_eq!(crate::fp_skip(s, "skip", Some(cs(250))).await, Ok((0, None)));
+    assert!(
+        matches!(crate::fp_skip(s, "skip", Some(cs(251))).await, Err(Error::Backend(_))),
+        "parent not recorded"
+    );
 }
 
 /// 并发 CAS：同一版本上的多个竞争者恰好只有一个成功，且版本严格连续。

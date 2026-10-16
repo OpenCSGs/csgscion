@@ -48,6 +48,10 @@ pub struct ServerConfig {
     pub read_endpoints: Vec<ReadEndpoint>,
     /// 服务端实现版本，仅供展示。
     pub server_version: String,
+    /// 进程内缓存的提交记录条数上限（记录不可变，缓存无需失效）。
+    pub record_cache_capacity: u64,
+    /// 启动后在后台把各仓库的提交记录预热进缓存。
+    pub warm_record_cache: bool,
 }
 
 impl Default for ServerConfig {
@@ -56,6 +60,8 @@ impl Default for ServerConfig {
             limits: Limits::default(),
             read_endpoints: Vec::new(),
             server_version: env!("CARGO_PKG_VERSION").to_string(),
+            record_cache_capacity: 1_000_000,
+            warm_record_cache: true,
         }
     }
 }
@@ -98,5 +104,6 @@ mod tests {
         let c = ServerConfig::default();
         assert_eq!(c.server_version, env!("CARGO_PKG_VERSION"));
         assert!(c.read_endpoints.is_empty());
+        assert!(c.record_cache_capacity > 0);
     }
 }

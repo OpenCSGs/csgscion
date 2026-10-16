@@ -67,12 +67,50 @@ impl<'a> Graph<'a> {
     /// 沿历史往回走时把逐条查询变成每 [`PREFETCH_WINDOW`] 条一次。
     pub(crate) async fn get_below(&mut self, id: ObjectId, below: u64) -> Result<&ChangesetRecord> {
         if !self.records.contains_key(&id) {
+            // 进程级缓存命中就不必发出窗口查询
+            if let Some(rec) = self.meta.cached_changeset(self.repo, &id) {
+                self.records.insert(id, rec);
+                return Ok(&self.records[&id]);
+            }
             for rec in self.meta.changesets_below(self.repo, below, PREFETCH_WINDOW).await? {
                 self.records.entry(rec.id).or_insert(rec);
             }
         }
         self.get(id).await
     }
+}
+
+/// 第一父提交链上深度为 `depth` 的祖先（从 `x` 往回，O(log n) 步）。
+/// 遇到深度未知的记录（跳表建立之前写入的数据）或 `depth` 不在链上时返回 None。
+pub(crate) async fn fp_ancestor_at(g: &mut Graph<'_>, x: ObjectId, depth: u64) -> Result<Option<ObjectId>> {
+    let mut cur = g.get(x).await?.clone();
+    if cur.fp_depth == 0 || depth == 0 || depth > cur.fp_depth {
+        return Ok(None);
+    }
+    while cur.fp_depth > depth {
+        let jump = g.get(cur.jump()).await?.clone();
+        if jump.fp_depth == 0 {
+            return Ok(None);
+        }
+        cur = if jump.fp_depth >= depth {
+            jump
+        } else {
+            match cur.first_parent() {
+                Some(p) => g.get(p).await?.clone(),
+                None => return Ok(None),
+            }
+        };
+    }
+    Ok(Some(cur.id))
+}
+
+/// `x` 是否在 `c` 的第一父提交链上（含相等）。None 表示无法判断（深度未知）。
+pub(crate) async fn on_first_parent_chain(g: &mut Graph<'_>, c: ObjectId, x: ObjectId) -> Result<Option<bool>> {
+    let depth = g.get(x).await?.fp_depth;
+    if depth == 0 || g.get(c).await?.fp_depth == 0 {
+        return Ok(None);
+    }
+    Ok(Some(fp_ancestor_at(g, c, depth).await? == Some(x)))
 }
 
 /// 批量预取的窗口大小。
@@ -88,6 +126,10 @@ pub async fn is_ancestor(meta: &dyn MetaStore, repo: &str, ancestor: ObjectId, d
 }
 
 async fn is_ancestor_in(g: &mut Graph<'_>, ancestor: ObjectId, descendant: ObjectId) -> Result<bool> {
+    // 快速路径：在第一父提交链上（最常见的情况，O(log n)）
+    if on_first_parent_chain(g, descendant, ancestor).await? == Some(true) {
+        return Ok(true);
+    }
     let target_gen = g.get(ancestor).await?.generation;
     let mut queue = vec![(descendant, u64::MAX)];
     let mut seen = HashSet::new();
@@ -218,6 +260,20 @@ pub async fn log(
     limit: usize,
     max_scan: usize,
 ) -> Result<LogPage> {
+    log_with(meta, blobs, repo, start, path, limit, max_scan, PATH_CANDIDATES).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn log_with(
+    meta: &dyn MetaStore,
+    blobs: &dyn BlobStore,
+    repo: &str,
+    start: &[ObjectId],
+    path: Option<&str>,
+    limit: usize,
+    max_scan: usize,
+    candidate_limit: usize,
+) -> Result<LogPage> {
     let mut g = Graph::new(meta, repo);
     let mut queue: BinaryHeap<(u64, ObjectId)> = BinaryHeap::new();
     let mut queued = HashSet::new();
@@ -232,8 +288,8 @@ pub async fn log(
     let top = queue.peek().map_or(0, |(generation, _)| *generation);
     let candidates = match path {
         Some(p) => {
-            let hist = meta.path_history(repo, p, top, PATH_CANDIDATES).await?;
-            let truncated = hist.len() == PATH_CANDIDATES;
+            let hist = meta.path_history(repo, p, top, candidate_limit).await?;
+            let truncated = hist.len() == candidate_limit;
             let floor = hist.last().map_or(0, |e| e.generation);
             let set: HashSet<ObjectId> = hist.into_iter().map(|e| e.cs).collect();
             (!set.is_empty()).then_some((set, truncated, floor))
@@ -301,13 +357,19 @@ mod tests {
     struct Builder {
         store: MemStore,
         n: u8,
+        /// 是否写 PathHistory 索引（false 模拟索引建立之前的旧数据）。
+        indexed: bool,
     }
 
     impl Builder {
         async fn new() -> Self {
+            Self::with_index(true).await
+        }
+
+        async fn with_index(indexed: bool) -> Self {
             let store = MemStore::new();
             store.create_repo(REPO).await.expect("repo");
-            Self { store, n: 0 }
+            Self { store, n: 0, indexed }
         }
 
         async fn commit(&mut self, parents: &[ObjectId], paths: &[&str]) -> ObjectId {
@@ -346,12 +408,30 @@ mod tests {
                         .generation,
                 );
             }
+            let (fp_depth, fp_jump) = scion_store::fp_skip(&self.store, REPO, parents.first().copied())
+                .await
+                .expect("skip");
             let rec = ChangesetRecord {
                 id,
                 root_tree: ObjectId::hash(scion_object::ObjectKind::Tree, b""),
                 parents: parents.to_vec(),
                 generation: generation + 1,
+                fp_depth,
+                fp_jump,
             };
+            if self.indexed {
+                let changes: Vec<_> = paths
+                    .iter()
+                    .map(|p| scion_store::PathChange {
+                        path: (*p).to_owned(),
+                        deleted: false,
+                    })
+                    .collect();
+                self.store
+                    .index_paths(REPO, id, generation + 1, &changes)
+                    .await
+                    .expect("index");
+            }
             self.store.put_changeset(REPO, &rec).await.expect("record");
             id
         }
@@ -365,7 +445,11 @@ mod tests {
     ///      \           /
     ///       d ─ e ────'
     async fn diamond() -> (Builder, [ObjectId; 7]) {
-        let mut b = Builder::new().await;
+        diamond_with(true).await
+    }
+
+    async fn diamond_with(indexed: bool) -> (Builder, [ObjectId; 7]) {
+        let mut b = Builder::with_index(indexed).await;
         let a = b.commit(&[], &["root.txt"]).await;
         let bb = b.commit(&[a], &["src/b.rs"]).await;
         let c = b.commit(&[bb], &["src/c.rs"]).await;
@@ -388,6 +472,60 @@ mod tests {
         assert!(is_ancestor(s, REPO, bb, d).await.expect("ok"));
         let ghost = ObjectId::hash(scion_object::ObjectKind::Changeset, b"ghost");
         assert_eq!(is_ancestor(s, REPO, ghost, n).await, Err(QueryError::NotFound(ghost)));
+    }
+
+    #[tokio::test]
+    async fn first_parent_chain_queries() {
+        let (b, [a, bb, c, d, e, m, n]) = diamond().await;
+        let mut g = Graph::new(&b.store, REPO);
+        assert_eq!(fp_ancestor_at(&mut g, n, 1).await.expect("ok"), Some(a));
+        assert_eq!(fp_ancestor_at(&mut g, n, 4).await.expect("ok"), Some(m));
+        assert_eq!(fp_ancestor_at(&mut g, n, 5).await.expect("ok"), Some(n));
+        assert_eq!(fp_ancestor_at(&mut g, n, 6).await.expect("ok"), None, "deeper than n");
+        assert_eq!(fp_ancestor_at(&mut g, n, 0).await.expect("ok"), None);
+        assert_eq!(on_first_parent_chain(&mut g, n, c).await.expect("ok"), Some(true));
+        assert_eq!(on_first_parent_chain(&mut g, n, bb).await.expect("ok"), Some(true));
+        assert_eq!(
+            on_first_parent_chain(&mut g, n, e).await.expect("ok"),
+            Some(false),
+            "second parent side"
+        );
+        assert_eq!(on_first_parent_chain(&mut g, e, d).await.expect("ok"), Some(true));
+        // 深度未知的旧数据：无法判断
+        let legacy = ObjectId::hash(scion_object::ObjectKind::Changeset, b"legacy");
+        let rec = ChangesetRecord {
+            id: legacy,
+            root_tree: legacy,
+            parents: vec![],
+            generation: 1,
+            fp_depth: 0,
+            fp_jump: None,
+        };
+        b.store.put_changeset(REPO, &rec).await.expect("put");
+        assert_eq!(on_first_parent_chain(&mut g, n, legacy).await.expect("ok"), None);
+        assert_eq!(fp_ancestor_at(&mut g, legacy, 1).await.expect("ok"), None);
+    }
+
+    /// 长链上的跳表：任意深度的祖先都能找到，结果与逐个往回走一致。
+    #[tokio::test]
+    async fn fp_ancestor_at_matches_linear_walk_on_long_chain() {
+        let mut b = Builder::new().await;
+        let mut chain = vec![b.commit(&[], &["f"]).await];
+        for _ in 0..200 {
+            let tip = *chain.last().expect("tip");
+            chain.push(b.commit(&[tip], &["f"]).await);
+        }
+        let tip = *chain.last().expect("tip");
+        let mut g = Graph::new(&b.store, REPO);
+        for (i, id) in chain.iter().enumerate() {
+            assert_eq!(
+                fp_ancestor_at(&mut g, tip, i as u64 + 1).await.expect("ok"),
+                Some(*id),
+                "depth {}",
+                i + 1
+            );
+        }
+        assert!(is_ancestor(&b.store, REPO, chain[0], tip).await.expect("ok"));
     }
 
     #[tokio::test]
@@ -465,15 +603,24 @@ mod tests {
 
     #[tokio::test]
     async fn log_filters_by_path() {
-        let (b, [a, bb, c, _d, _e, _m, n]) = diamond().await;
-        let page = log(&b.store, &b.store, REPO, &[n], Some("src"), 100, 1000)
-            .await
-            .expect("log");
-        assert_eq!(ids(&page), vec![n, c, bb]);
-        let page = log(&b.store, &b.store, REPO, &[n], Some("root.txt"), 100, 1000)
-            .await
-            .expect("log");
-        assert_eq!(ids(&page), vec![a]);
+        // 有索引与无索引（逐个解码）结果一致
+        for indexed in [true, false] {
+            let (b, [a, bb, c, _d, _e, _m, n]) = diamond_with(indexed).await;
+            let page = log(&b.store, &b.store, REPO, &[n], Some("src"), 100, 1000)
+                .await
+                .expect("log");
+            assert_eq!(ids(&page), vec![n, c, bb], "indexed={indexed}");
+            let page = log(&b.store, &b.store, REPO, &[n], Some("root.txt"), 100, 1000)
+                .await
+                .expect("log");
+            assert_eq!(ids(&page), vec![a], "indexed={indexed}");
+            let page = log(&b.store, &b.store, REPO, &[n], Some("docs"), 1, 1000)
+                .await
+                .expect("log");
+            assert_eq!(page.entries.len(), 1, "page size respected, indexed={indexed}");
+            assert!(page.next.is_some());
+        }
+        let (b, [_a, _bb, c, _d, _e, _m, n]) = diamond().await;
         let page = log(&b.store, &b.store, REPO, &[n], Some("src/c.rs/deeper"), 100, 1000)
             .await
             .expect("log");
@@ -482,6 +629,25 @@ mod tests {
             .await
             .expect("empty path = no filter");
         assert_eq!(ids(&page), vec![n]);
+    }
+
+    /// 候选被截断时，下一页会重新读取索引，不遗漏也不重复。
+    #[tokio::test]
+    async fn log_index_candidates_truncated_across_pages() {
+        let (b, [_a, bb, c, _d, _e, _m, n]) = diamond().await;
+        let mut start = vec![n];
+        let mut seen = Vec::new();
+        for _ in 0..20 {
+            let page = log_with(&b.store, &b.store, REPO, &start, Some("src"), 100, 1000, 1)
+                .await
+                .expect("log");
+            seen.extend(ids(&page));
+            match page.next {
+                Some(next) => start = next,
+                None => break,
+            }
+        }
+        assert_eq!(seen, vec![n, c, bb]);
     }
 
     #[tokio::test]
@@ -512,6 +678,8 @@ mod tests {
             root_tree: ghost,
             parents: vec![],
             generation: 1,
+            fp_depth: 0,
+            fp_jump: None,
         };
         b.store.put_changeset(REPO, &rec).await.expect("record");
         assert!(matches!(

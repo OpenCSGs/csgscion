@@ -13,7 +13,7 @@ use scion_object::{EntryMode, ObjectId, Tree};
 use scion_store::{BlobStore, MetaStore};
 use scion_tree::{TreeError, TreeSource, lookup};
 
-use crate::{Graph, QueryError, Result};
+use crate::{Graph, QueryError, Result, on_first_parent_chain};
 
 /// 派生数据种类与算法版本。
 pub const BLAME_KIND: &str = "blame";
@@ -162,6 +162,146 @@ fn line_count(data: &[u8]) -> usize {
         .sum()
 }
 
+/// 各版本 (引入提交, blob)，从新到旧；以及最老那个版本的缓存结果（如果命中缓存）。
+type Versions = (Vec<(ObjectId, ObjectId)>, Option<Vec<ObjectId>>);
+
+async fn cached(meta: &dyn MetaStore, repo: &str, intro: &ObjectId, path: &str) -> Result<Option<Vec<ObjectId>>> {
+    // 缓存损坏（无法解码）时忽略并重新计算
+    let raw = meta
+        .get_derived(repo, BLAME_KIND, BLAME_VERSION, &cache_key(intro, path))
+        .await?;
+    Ok(raw.as_deref().and_then(decode))
+}
+
+/// 第一个父提交（批量预取）。
+async fn first_parent(g: &mut Graph<'_>, id: ObjectId) -> Result<Option<ObjectId>> {
+    let rec = g.get(id).await?.clone();
+    match rec.first_parent() {
+        Some(p) => Ok(Some(g.get_below(p, rec.generation.saturating_sub(1)).await?.id)),
+        None => Ok(None),
+    }
+}
+
+/// 用 PathHistory 索引收集版本：候选提交按代数从新到旧，用第一父提交链跳表（O(log n)）判断是否在链上，
+/// 只在真正的版本引入处读目录树，不逐个提交往回走。
+/// 索引缺失、深度未知（旧数据）或与实际不一致时返回 None，由调用方退回扫描。
+async fn versions_by_index(
+    meta: &dyn MetaStore,
+    g: &mut Graph<'_>,
+    trees: &Trees<'_>,
+    repo: &str,
+    cs: ObjectId,
+    blob: ObjectId,
+    path: &str,
+) -> Result<Option<Versions>> {
+    let top = g.get(cs).await?.generation;
+    // 按代数从高到低（path_history 已排序）
+    let candidates: Vec<(ObjectId, bool)> = meta
+        .path_history(repo, path, top, usize::MAX >> 1)
+        .await?
+        .into_iter()
+        .filter(|e| e.path == path)
+        .map(|e| (e.cs, e.deleted))
+        .collect();
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    // 在 `from` 的第一父提交链上、从下标 `start` 起的第一个候选
+    async fn next_on_chain(
+        g: &mut Graph<'_>,
+        candidates: &[(ObjectId, bool)],
+        start: usize,
+        from: ObjectId,
+    ) -> Result<Option<Option<usize>>> {
+        for (i, (c, _)) in candidates.iter().enumerate().skip(start) {
+            match on_first_parent_chain(g, from, *c).await {
+                Ok(Some(true)) => return Ok(Some(Some(i))),
+                Ok(Some(false)) => {}
+                Ok(None) => return Ok(None),
+                // 写索引后、写记录前崩溃留下的孤立索引行：不属于任何历史，跳过
+                Err(QueryError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(Some(None))
+    }
+
+    let mut versions = Vec::new();
+    let mut blob = blob;
+    let mut idx = match next_on_chain(g, &candidates, 0, cs).await? {
+        Some(Some(i)) => i,
+        // 深度未知，或文件存在却没有任何改动记录：索引不可用
+        _ => return Ok(None),
+    };
+    loop {
+        let (intro, deleted) = candidates[idx];
+        if deleted {
+            return Ok(None);
+        }
+        if let Some(lines) = cached(meta, repo, &intro, path).await? {
+            versions.push((intro, blob));
+            return Ok(Some((versions, Some(lines))));
+        }
+        versions.push((intro, blob));
+        let Some(parent) = first_parent(g, intro).await? else {
+            return Ok(Some((versions, None)));
+        };
+        let older = match next_on_chain(g, &candidates, idx + 1, parent).await? {
+            Some(Some(i)) => i,
+            // 链上更早没有改动：文件在 intro 之前不存在
+            Some(None) => return Ok(Some((versions, None))),
+            None => return Ok(None),
+        };
+        let (y, y_deleted) = candidates[older];
+        if y_deleted {
+            return Ok(Some((versions, None)));
+        }
+        match file_at(g, trees, y, path).await? {
+            Some(b) => blob = b,
+            None => return Ok(None),
+        }
+        idx = older;
+    }
+}
+
+/// 不依赖索引：沿第一父提交链逐个比较目录树中的文件。
+async fn versions_by_scan(
+    meta: &dyn MetaStore,
+    g: &mut Graph<'_>,
+    trees: &Trees<'_>,
+    repo: &str,
+    cs: ObjectId,
+    blob: ObjectId,
+    path: &str,
+) -> Result<Versions> {
+    let mut versions: Vec<(ObjectId, ObjectId)> = Vec::new();
+    let (mut cur, mut blob) = (cs, blob);
+    loop {
+        // 找到当前 blob 的引入提交：沿第一父提交链走到 blob 不同为止
+        while let Some(parent) = first_parent(g, cur).await? {
+            if file_at(g, trees, parent, path).await? != Some(blob) {
+                break;
+            }
+            cur = parent;
+        }
+        if let Some(lines) = cached(meta, repo, &cur, path).await? {
+            versions.push((cur, blob));
+            return Ok((versions, Some(lines)));
+        }
+        versions.push((cur, blob));
+        let Some(parent) = first_parent(g, cur).await? else {
+            return Ok((versions, None));
+        };
+        match file_at(g, trees, parent, path).await? {
+            Some(older) => {
+                cur = parent;
+                blob = older;
+            }
+            None => return Ok((versions, None)),
+        }
+    }
+}
+
 /// `path` 在提交 `cs` 中的逐行归属。
 pub async fn blame(
     meta: &dyn MetaStore,
@@ -180,75 +320,30 @@ pub async fn blame(
         return Err(QueryError::NotAFile(path.to_owned()));
     }
 
-    // 往回收集各版本 (引入提交, blob)，从新到旧；遇到已缓存的版本就停
-    let mut versions: Vec<(ObjectId, ObjectId)> = Vec::new();
-    let mut base: Option<Vec<ObjectId>> = None;
-    let (mut cur, mut blob) = (cs, entry.id);
-    loop {
-        // 找到当前 blob 的引入提交：沿第一父提交链走到 blob 不同为止
-        loop {
-            let Some(parent) = g.get(cur).await?.first_parent() else {
-                break;
-            };
-            if file_at(&mut g, &trees, parent, path).await? != Some(blob) {
-                break;
-            }
-            cur = parent;
-        }
-        // 已缓存则从这里开始往新算；缓存损坏（无法解码）时忽略并重新计算
-        let cached = meta
-            .get_derived(repo, BLAME_KIND, BLAME_VERSION, &cache_key(&cur, path))
-            .await?;
-        if let Some(lines) = cached.as_deref().and_then(decode) {
-            base = Some(lines);
-            versions.push((cur, blob));
-            break;
-        }
-        versions.push((cur, blob));
-        let Some(parent) = g.get(cur).await?.first_parent() else {
-            break;
-        };
-        match file_at(&mut g, &trees, parent, path).await? {
-            Some(older) => {
-                cur = parent;
-                blob = older;
-            }
-            None => break,
-        }
-    }
-
-    // 从最老的版本往新计算
-    versions.reverse();
-    let mut iter = versions.into_iter();
-    let (first_cs, first_blob) = iter.next().ok_or_else(|| QueryError::PathNotFound(path.to_owned()))?;
-    let mut prev = content(blobs, &first_blob).await?;
-    let mut lines = match base {
-        Some(l) => l,
-        None => {
-            let l = vec![first_cs; line_count(&prev)];
-            meta.put_derived(
-                repo,
-                BLAME_KIND,
-                BLAME_VERSION,
-                &cache_key(&first_cs, path),
-                &encode(&l),
-            )
-            .await?;
-            l
-        }
+    let (mut versions, base) = match versions_by_index(meta, &mut g, &trees, repo, cs, entry.id, path).await? {
+        Some(v) => v,
+        None => versions_by_scan(meta, &mut g, &trees, repo, cs, entry.id, path).await?,
     };
+
+    // 从最老的版本往新计算。只缓存最终版本和每 CHECKPOINT_EVERY 个版本一个检查点：
+    // 每次缓存都是一次持久化写入，逐版本缓存会让冷启动的耗时被写入主导。
+    versions.reverse();
+    let total = versions.len();
+    let mut iter = versions.into_iter().enumerate();
+    let (_, (first_cs, first_blob)) = iter.next().ok_or_else(|| QueryError::PathNotFound(path.to_owned()))?;
+    let mut prev = content(blobs, &first_blob).await?;
+    let from_cache = base.is_some();
+    let mut lines = base.unwrap_or_else(|| vec![first_cs; line_count(&prev)]);
+    if !from_cache && total == 1 {
+        save(meta, repo, &first_cs, path, &lines).await?;
+    }
     let mut last = (first_cs, first_blob);
-    for (introduced_by, blob) in iter {
+    for (i, (introduced_by, blob)) in iter {
         let data = content(blobs, &blob).await?;
         lines = carry(&prev, &lines, &data, introduced_by);
-        meta.put_derived(
-            repo,
-            BLAME_KIND,
-            BLAME_VERSION,
-            &cache_key(&introduced_by, path),
-            &encode(&lines),
-        )
-        .await?;
+        if i + 1 == total || i % CHECKPOINT_EVERY == 0 {
+            save(meta, repo, &introduced_by, path, &lines).await?;
+        }
         prev = data;
         last = (introduced_by, blob);
     }
@@ -257,6 +352,15 @@ pub async fn blame(
         introduced_by: last.0,
         lines,
     })
+}
+
+/// 中间版本每隔多少个存一个缓存检查点。
+const CHECKPOINT_EVERY: usize = 32;
+
+async fn save(meta: &dyn MetaStore, repo: &str, intro: &ObjectId, path: &str, lines: &[ObjectId]) -> Result<()> {
+    Ok(meta
+        .put_derived(repo, BLAME_KIND, BLAME_VERSION, &cache_key(intro, path), &encode(lines))
+        .await?)
 }
 
 #[cfg(test)]
@@ -272,13 +376,19 @@ mod tests {
     struct Repo {
         store: MemStore,
         n: u8,
+        /// 是否写 PathHistory 索引（false 模拟索引建立之前的旧数据）。
+        indexed: bool,
     }
 
     impl Repo {
         async fn new() -> Self {
+            Self::with_index(true).await
+        }
+
+        async fn with_index(indexed: bool) -> Self {
             let store = MemStore::new();
             store.create_repo(REPO).await.expect("repo");
-            Self { store, n: 0 }
+            Self { store, n: 0, indexed }
         }
 
         /// 提交：用 scion-tree 真正建树，写入内容、目录树、提交对象与记录。
@@ -344,12 +454,31 @@ mod tests {
                         .generation,
                 );
             }
+            let (fp_depth, fp_jump) = scion_store::fp_skip(&self.store, REPO, parents.first().copied())
+                .await
+                .expect("skip");
             let rec = ChangesetRecord {
                 id,
                 root_tree: built.root,
                 parents: parents.to_vec(),
                 generation: generation + 1,
+                fp_depth,
+                fp_jump,
             };
+            if self.indexed {
+                let changes: Vec<_> = cs
+                    .delta
+                    .iter()
+                    .map(|c| scion_store::PathChange {
+                        path: c.path.clone(),
+                        deleted: matches!(c.op, scion_object::FileOp::Delete),
+                    })
+                    .collect();
+                self.store
+                    .index_paths(REPO, id, rec.generation, &changes)
+                    .await
+                    .expect("index");
+            }
             self.store.put_changeset(REPO, &rec).await.expect("record");
             id
         }
@@ -439,6 +568,116 @@ mod tests {
         let empty = MemStore::new();
         let id = ObjectId::of_blob(b"missing");
         assert!(matches!(content(&empty, &id).await, Err(QueryError::Corrupt(..))));
+    }
+
+    /// 同一段历史：有索引与无索引（扫描）得到完全相同的 blame。
+    #[tokio::test]
+    async fn index_and_scan_agree_on_every_file_and_commit() {
+        let steps: Vec<Vec<(&str, Option<&str>)>> = vec![
+            vec![("a", Some("1\n2\n3\n")), ("dir/b", Some("x\n"))],
+            vec![("a", Some("1\nX\n3\n"))],
+            vec![("c", Some("c\n"))],
+            vec![("dir/b", Some("x\ny\n")), ("a", Some("0\n1\nX\n3\n"))],
+            vec![("c", None)],
+            vec![("c", Some("again\n")), ("a", Some("0\n1\nX\n"))],
+        ];
+        let (mut fast, mut slow) = (Repo::with_index(true).await, Repo::with_index(false).await);
+        let (mut tf, mut ts) = (Vec::new(), Vec::new());
+        for step in &steps {
+            let pf: Vec<_> = tf.last().copied().into_iter().collect();
+            let ps: Vec<_> = ts.last().copied().into_iter().collect();
+            tf.push(fast.commit(&pf, step).await);
+            ts.push(slow.commit(&ps, step).await);
+        }
+        assert_eq!(tf, ts, "same history, same ids");
+        for (i, cs) in tf.iter().enumerate() {
+            for path in ["a", "dir/b", "c"] {
+                let (x, y) = (fast.blame(*cs, path).await, slow.blame(*cs, path).await);
+                match (x, y) {
+                    (Ok(x), Ok(y)) => assert_eq!(x, y, "{path} at step {i}"),
+                    (Err(QueryError::PathNotFound(_)), Err(QueryError::PathNotFound(_))) => {}
+                    other => panic!("{path} at step {i}: {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// 索引与实际不一致（声称在文件仍存在时被删除）时，退回扫描，结果依然正确。
+    #[tokio::test]
+    async fn inconsistent_index_falls_back_to_scan() {
+        let mut r = Repo::new().await;
+        let a = r.commit(&[], &[("f", Some("1\n"))]).await;
+        let b = r.commit(&[a], &[("f", Some("1\n2\n"))]).await;
+        let rec = r.store.get_changeset(REPO, &b).await.expect("ok").expect("b");
+        // 伪造一条 b 删除了 f 的索引（与实际相反）
+        let lie = [scion_store::PathChange {
+            path: "f".into(),
+            deleted: true,
+        }];
+        let fake = ObjectId::hash(scion_object::ObjectKind::Changeset, b"fake");
+        r.store
+            .index_paths(REPO, fake, rec.generation, &lie)
+            .await
+            .expect("index");
+        let c = r.commit(&[b], &[("g", Some("g"))]).await;
+        r.store
+            .index_paths(REPO, c, rec.generation + 1, &lie)
+            .await
+            .expect("lie about c");
+        assert_eq!(r.blame(c, "f").await.expect("blame").lines, vec![a, b]);
+    }
+
+    /// 只缓存最终版本与检查点；之后 blame 中间版本仍然正确。
+    #[tokio::test]
+    async fn caches_final_version_and_checkpoints_only() {
+        let mut r = Repo::new().await;
+        let mut ids = Vec::new();
+        let mut content = String::new();
+        for i in 0..40 {
+            content.push_str(&format!("line {i}\n"));
+            let parents: Vec<_> = ids.last().copied().into_iter().collect();
+            ids.push(r.commit(&parents, &[("f", Some(content.as_str()))]).await);
+        }
+        let tip = *ids.last().expect("tip");
+        assert_eq!(r.blame(tip, "f").await.expect("blame").lines, ids);
+        async fn has(r: &Repo, id: ObjectId) -> bool {
+            r.store
+                .get_derived(REPO, BLAME_KIND, BLAME_VERSION, &cache_key(&id, "f"))
+                .await
+                .expect("ok")
+                .is_some()
+        }
+        assert!(has(&r, tip).await, "final version cached");
+        assert!(has(&r, ids[32]).await, "checkpoint");
+        assert!(!has(&r, ids[5]).await, "intermediate not cached");
+        // 中间版本：从检查点或最早版本重新计算，结果正确
+        assert_eq!(r.blame(ids[20], "f").await.expect("blame").lines, ids[..21].to_vec());
+        assert_eq!(r.blame(ids[35], "f").await.expect("blame").lines, ids[..36].to_vec());
+    }
+
+    /// 先写索引后写记录：中途崩溃留下的孤立索引行被忽略。
+    #[tokio::test]
+    async fn orphan_index_rows_are_ignored() {
+        let mut r = Repo::new().await;
+        let a = r.commit(&[], &[("f", Some("1\n"))]).await;
+        let b = r.commit(&[a], &[("f", Some("1\n2\n"))]).await;
+        let gen_b = r
+            .store
+            .get_changeset(REPO, &b)
+            .await
+            .expect("ok")
+            .expect("b")
+            .generation;
+        let orphan = ObjectId::hash(scion_object::ObjectKind::Changeset, b"never recorded");
+        let row = [scion_store::PathChange {
+            path: "f".into(),
+            deleted: false,
+        }];
+        r.store
+            .index_paths(REPO, orphan, gen_b, &row)
+            .await
+            .expect("orphan row");
+        assert_eq!(r.blame(b, "f").await.expect("blame").lines, vec![a, b]);
     }
 
     #[test]

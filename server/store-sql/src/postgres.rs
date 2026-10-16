@@ -12,8 +12,8 @@ use scion_store::{
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 
 use crate::common::{
-    MAX_IDS_PER_QUERY, backend, id_from_db, ids_from_db, ids_to_db, is_unique_violation, now_ms, size_to_db,
-    subtract_present, version_from_db, version_to_db,
+    CHANGESET_COLUMNS, ChangesetRow, MAX_IDS_PER_QUERY, backend, id_from_db, ids_to_db, is_unique_violation, now_ms,
+    record_from_row, size_to_db, subtract_present, version_from_db, version_to_db,
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
@@ -252,8 +252,8 @@ impl MetaStore for PgMetaStore {
     async fn put_changeset(&self, repo: &str, rec: &ChangesetRecord) -> Result<()> {
         let repo_id = self.repo_id(repo).await?;
         sqlx::query(
-            "INSERT INTO changesets (repo_id, cs_id, root_tree, first_parent, generation, parents) \
-             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (repo_id, cs_id) DO NOTHING",
+            "INSERT INTO changesets (repo_id, cs_id, root_tree, first_parent, generation, parents, fp_depth, fp_jump) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (repo_id, cs_id) DO NOTHING",
         )
         .bind(repo_id)
         .bind(rec.id.to_bytes().to_vec())
@@ -261,6 +261,8 @@ impl MetaStore for PgMetaStore {
         .bind(rec.first_parent().map(|p| p.to_bytes().to_vec()))
         .bind(version_to_db(rec.generation)?)
         .bind(ids_to_db(&rec.parents))
+        .bind(version_to_db(rec.fp_depth)?)
+        .bind(rec.fp_jump.map(|j| j.to_bytes().to_vec()))
         .execute(&self.pool)
         .await
         .map_err(|e| backend("put changeset", e))?;
@@ -269,46 +271,32 @@ impl MetaStore for PgMetaStore {
 
     async fn get_changeset(&self, repo: &str, id: &ObjectId) -> Result<Option<ChangesetRecord>> {
         let repo_id = self.repo_id(repo).await?;
-        let row = sqlx::query_as::<_, (Vec<u8>, Vec<u8>, i64)>(
-            "SELECT root_tree, parents, generation FROM changesets WHERE repo_id = $1 AND cs_id = $2",
-        )
-        .bind(repo_id)
-        .bind(id.to_bytes().to_vec())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| backend("get changeset", e))?;
-        row.map(|(root, parents, generation)| {
-            Ok(ChangesetRecord {
-                id: *id,
-                root_tree: id_from_db(&root)?,
-                parents: ids_from_db(&parents)?,
-                generation: version_from_db(generation)?,
-            })
-        })
-        .transpose()
+        let sql = format!("SELECT {CHANGESET_COLUMNS} FROM changesets WHERE repo_id = $1 AND cs_id = $2");
+        sqlx::query_as::<_, ChangesetRow>(&sql)
+            .bind(repo_id)
+            .bind(id.to_bytes().to_vec())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| backend("get changeset", e))?
+            .map(record_from_row)
+            .transpose()
     }
 
     async fn changesets_below(&self, repo: &str, max_generation: u64, limit: usize) -> Result<Vec<ChangesetRecord>> {
         let repo_id = self.repo_id(repo).await?;
-        let rows = sqlx::query_as::<_, (Vec<u8>, Vec<u8>, Vec<u8>, i64)>(
-            "SELECT cs_id, root_tree, parents, generation FROM changesets \
-             WHERE repo_id = $1 AND generation <= $2 ORDER BY generation DESC LIMIT $3",
-        )
-        .bind(repo_id)
-        .bind(version_to_db(max_generation.min(i64::MAX as u64))?)
-        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| backend("changesets below", e))?;
-        rows.into_iter()
-            .map(|(id, root, parents, generation)| {
-                Ok(ChangesetRecord {
-                    id: id_from_db(&id)?,
-                    root_tree: id_from_db(&root)?,
-                    parents: ids_from_db(&parents)?,
-                    generation: version_from_db(generation)?,
-                })
-            })
+        let sql = format!(
+            "SELECT {CHANGESET_COLUMNS} FROM changesets WHERE repo_id = $1 AND generation <= $2 \
+             ORDER BY generation DESC LIMIT $3"
+        );
+        sqlx::query_as::<_, ChangesetRow>(&sql)
+            .bind(repo_id)
+            .bind(version_to_db(max_generation.min(i64::MAX as u64))?)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| backend("changesets below", e))?
+            .into_iter()
+            .map(record_from_row)
             .collect()
     }
 
@@ -525,6 +513,12 @@ mod tests {
     async fn conformance_history_index() {
         let s = pg_or_skip!();
         testsuite::history_index(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_fp_skip_chain() {
+        let s = pg_or_skip!();
+        testsuite::fp_skip_chain(&s).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

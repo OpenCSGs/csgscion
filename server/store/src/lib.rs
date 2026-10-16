@@ -7,6 +7,7 @@
 //! 本 crate 提供内存实现 [`MemStore`]；SQLite / PostgreSQL / YugabyteDB 与 S3 实现位于其它 crate，
 //! 都必须通过 [`testsuite`]（feature `testsuite`）中的一致性测试。
 
+mod cached;
 mod error;
 mod mem;
 mod repo;
@@ -19,6 +20,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use scion_object::ObjectId;
 
+pub use cached::CachedMeta;
 pub use error::{Error, Result};
 pub use mem::MemStore;
 pub use repo::{MAX_REPO_NAME_LEN, validate_repo_name};
@@ -72,6 +74,12 @@ pub trait MetaStore: Send + Sync + 'static {
 
     async fn get_changeset(&self, repo: &str, id: &ObjectId) -> Result<Option<ChangesetRecord>>;
 
+    /// 只查内存缓存、不访问存储的提交记录读取；没有缓存层的实现返回 None。
+    /// 查询层在批量预取之前先调用它，命中缓存就不必发出窗口查询。
+    fn cached_changeset(&self, _repo: &str, _id: &ObjectId) -> Option<ChangesetRecord> {
+        None
+    }
+
     /// 按名字字节序列出仓库的全部 ref。
     async fn list_refs(&self, repo: &str) -> Result<Vec<(String, RefState)>>;
 
@@ -110,12 +118,53 @@ pub struct ChangesetRecord {
     pub parents: Vec<ObjectId>,
     /// 代数：根提交为 1，其余为所有 parent 中最大代数加 1。用于 log 排序和祖先判断剪枝。
     pub generation: u64,
+    /// 在第一父提交链上的深度：根提交为 1；0 表示未知（跳表建立之前写入的数据）。
+    pub fp_depth: u64,
+    /// 第一父提交链上的跳跃指针（skew-binary 跳表）；None 表示指向自己（根提交）或未知。
+    pub fp_jump: Option<ObjectId>,
 }
 
 impl ChangesetRecord {
     pub fn first_parent(&self) -> Option<ObjectId> {
         self.parents.first().copied()
     }
+
+    /// 跳跃指针指向的提交（根提交指向自己）。
+    pub fn jump(&self) -> ObjectId {
+        self.fp_jump.unwrap_or(self.id)
+    }
+}
+
+/// 由第一个父提交计算新提交的 `(fp_depth, fp_jump)`。
+///
+/// Myers 的 skew-binary 跳表：只存一个跳跃指针，即可在 O(log n) 步内找到第一父提交链上任意深度的祖先。
+/// 规则：父提交 p 的跳跃 j = jump(p)、jj = jump(j)；若 depth(p) - depth(j) == depth(j) - depth(jj)
+/// 则跳到 jj，否则跳到 p。父提交深度未知时结果也未知（0, None）。
+pub async fn fp_skip(
+    meta: &dyn MetaStore,
+    repo: &str,
+    first_parent: Option<ObjectId>,
+) -> Result<(u64, Option<ObjectId>)> {
+    let Some(p) = first_parent else { return Ok((1, None)) };
+    let missing = |id: ObjectId| Error::Backend(format!("changeset {id} referenced but not recorded"));
+    let p = meta.get_changeset(repo, &p).await?.ok_or_else(|| missing(p))?;
+    if p.fp_depth == 0 {
+        return Ok((0, None));
+    }
+    let j = meta
+        .get_changeset(repo, &p.jump())
+        .await?
+        .ok_or_else(|| missing(p.jump()))?;
+    let jj = meta
+        .get_changeset(repo, &j.jump())
+        .await?
+        .ok_or_else(|| missing(j.jump()))?;
+    let jump = if p.fp_depth - j.fp_depth == j.fp_depth - jj.fp_depth {
+        jj.id
+    } else {
+        p.id
+    };
+    Ok((p.fp_depth + 1, Some(jump)))
 }
 
 /// 提交对一个路径的改动。
@@ -182,6 +231,8 @@ mod tests {
             root_tree: id,
             parents: vec![],
             generation: 1,
+            fp_depth: 0,
+            fp_jump: None,
         };
         assert_eq!(rec.first_parent(), None);
     }

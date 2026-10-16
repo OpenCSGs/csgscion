@@ -78,6 +78,8 @@ mod tests {
             root_tree: tree,
             parents: vec![],
             generation: 1,
+            fp_depth: 0,
+            fp_jump: None,
         };
         s.put_changeset("r", &rec).await.expect("put");
         s.cas_ref("r", "main", RefExpect::Absent, cs(1)).await.expect("ref");

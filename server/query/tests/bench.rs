@@ -99,6 +99,20 @@ async fn commit(
     for p in parents {
         generation = generation.max(meta.get_changeset(REPO, p).await.expect("ok").expect("p").generation);
     }
+    let changes: Vec<_> = cs
+        .delta
+        .iter()
+        .map(|c| scion_store::PathChange {
+            path: c.path.clone(),
+            deleted: matches!(c.op, scion_object::FileOp::Delete),
+        })
+        .collect();
+    meta.index_paths(REPO, id, generation + 1, &changes)
+        .await
+        .expect("index");
+    let (fp_depth, fp_jump) = scion_store::fp_skip(meta, REPO, parents.first().copied())
+        .await
+        .expect("skip");
     meta.put_changeset(
         REPO,
         &ChangesetRecord {
@@ -106,6 +120,8 @@ async fn commit(
             root_tree: built.root,
             parents: parents.to_vec(),
             generation: generation + 1,
+            fp_depth,
+            fp_jump,
         },
     )
     .await
@@ -221,7 +237,21 @@ async fn history_queries_on_large_repo() {
     let t = Instant::now();
     let h = build(commits, meta).await;
     eprintln!("built in {:.1}s", t.elapsed().as_secs_f64());
-    let s = h.meta.as_ref();
+    // 与服务端一致：查询经过进程级的提交记录缓存（所有采样共享，模拟运行中的服务端）
+    let cached = scion_store::CachedMeta::new(std::sync::Arc::from(h.meta), 1_000_000);
+    let h = History {
+        meta: Box::new(scion_store::MemStore::new()),
+        ..h
+    };
+    let warm = Instant::now();
+    let loaded = cached.warm(REPO, 4096).await.expect("warm");
+    println!(
+        "{:<44} {loaded} records in {:.0}ms",
+        "record cache warm-up",
+        warm.elapsed().as_secs_f64() * 1000.0
+    );
+    let s: &dyn MetaStore = &cached;
+
     let blobs = &h.store;
     let tip = *h.main.last().expect("tip");
     let mut rng = Rng(42);
@@ -320,23 +350,32 @@ async fn history_queries_on_large_repo() {
     }
     report("merge_bases(recent side branch, tip)", v);
 
+    // 每个文件第一次 blame：派生数据缓存为空。第一次采样时记录缓存也基本为空（进程刚启动）
     let mut cold = Vec::new();
     let mut warm = Vec::new();
-    for _ in 0..20 {
-        let f = h.files[rng.below(h.files.len() as u64) as usize].clone();
+    let mut files: Vec<String> = h.files.clone();
+    for i in (1..files.len()).rev() {
+        files.swap(i, rng.below(i as u64 + 1) as usize);
+    }
+    for f in files.iter().take(100) {
         cold.push(
             time(async {
-                blame(s, blobs, REPO, tip, &f).await.expect("blame");
+                blame(s, blobs, REPO, tip, f).await.expect("blame");
             })
             .await,
         );
         warm.push(
             time(async {
-                blame(s, blobs, REPO, tip, &f).await.expect("blame");
+                blame(s, blobs, REPO, tip, f).await.expect("blame");
             })
             .await,
         );
     }
-    report("blame random file (cold)", cold);
-    report("blame random file (warm cache)", warm);
+    println!(
+        "{:<44} {:.2}ms",
+        "blame first query after start",
+        cold[0].as_secs_f64() * 1000.0
+    );
+    report("blame new file (derived cache empty)", cold[1..].to_vec());
+    report("blame same file again (derived cached)", warm);
 }

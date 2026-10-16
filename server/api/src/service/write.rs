@@ -101,11 +101,16 @@ impl WriteSvc {
         objects.push((cs_id, cs_bytes));
         self.store(repo, &objects).await?;
 
+        let (fp_depth, fp_jump) = scion_store::fp_skip(self.meta.as_ref(), repo, cs.first_parent().copied())
+            .await
+            .map_err(status::from_store)?;
         let rec = ChangesetRecord {
             id: cs_id,
             root_tree: built.root,
             parents: cs.parents.clone(),
             generation: generation.saturating_add(1),
+            fp_depth,
+            fp_jump,
         };
         // 先写路径索引，再写记录：记录存在即表示索引完整
         let changes: Vec<PathChange> = cs
@@ -560,6 +565,8 @@ pub(crate) mod tests {
             .expect("child");
         assert_eq!(child.generation, 2);
         assert_eq!(child.first_parent(), Some(root.id));
+        assert_eq!((root.fp_depth, child.fp_depth), (1, 2));
+        assert_eq!(child.fp_jump, Some(root.id));
         assert_eq!(child.root_tree, scion_object::Tree::default().id());
         assert_eq!(store.get_changeset(REPO, &child.id).await, Ok(Some(child.clone())));
         // 路径索引已写入
