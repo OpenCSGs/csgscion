@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait.workspace = true
+scion-tree.workspace = true
+similar = { version = "3", features = ["bytes"] }
 scion-object.workspace = true
 scion-store.workspace = true
 thiserror.workspace = true

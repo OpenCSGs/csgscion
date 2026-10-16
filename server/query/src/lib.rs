@@ -3,6 +3,10 @@
 //! 只依赖 [`MetaStore`] 里的提交记录（父提交与代数）；log 需要提交说明时再从 [`BlobStore`] 读取提交对象。
 //! 遍历按代数从高到低进行：祖先的代数一定比后代小，因此可以用代数剪枝，并保证分页时不会重复。
 
+mod blame;
+
+pub use blame::{BLAME_KIND, BLAME_VERSION, BlameResult, blame};
+
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
@@ -20,19 +24,26 @@ pub enum QueryError {
     Corrupt(ObjectId, String),
     #[error(transparent)]
     Store(#[from] scion_store::Error),
+    #[error("path {0:?} not found")]
+    PathNotFound(String),
+    #[error("{0:?} is a directory")]
+    NotAFile(String),
+    /// 目录树缺失或损坏，或读取目录树时存储出错。
+    #[error(transparent)]
+    Tree(#[from] scion_tree::TreeError),
 }
 
 pub type Result<T> = std::result::Result<T, QueryError>;
 
 /// 一次查询内的提交记录缓存。
-struct Graph<'a> {
+pub(crate) struct Graph<'a> {
     meta: &'a dyn MetaStore,
     repo: &'a str,
     records: HashMap<ObjectId, ChangesetRecord>,
 }
 
 impl<'a> Graph<'a> {
-    fn new(meta: &'a dyn MetaStore, repo: &'a str) -> Self {
+    pub(crate) fn new(meta: &'a dyn MetaStore, repo: &'a str) -> Self {
         Self {
             meta,
             repo,
@@ -40,7 +51,7 @@ impl<'a> Graph<'a> {
         }
     }
 
-    async fn get(&mut self, id: ObjectId) -> Result<&ChangesetRecord> {
+    pub(crate) async fn get(&mut self, id: ObjectId) -> Result<&ChangesetRecord> {
         if !self.records.contains_key(&id) {
             let rec = self
                 .meta
@@ -501,6 +512,8 @@ mod tests {
 
     #[test]
     fn error_display() {
+        assert!(QueryError::PathNotFound("p".into()).to_string().contains("not found"));
+        assert!(QueryError::NotAFile("d".into()).to_string().contains("directory"));
         let id = ObjectId::hash(scion_object::ObjectKind::Changeset, b"x");
         assert!(QueryError::NotFound(id).to_string().contains("not found"));
         assert!(QueryError::Corrupt(id, "bad".into()).to_string().contains("corrupt"));

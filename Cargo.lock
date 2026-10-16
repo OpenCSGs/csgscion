@@ -2460,9 +2460,12 @@ dependencies = [
 name = "scion-query"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "scion-object",
  "scion-store",
+ "scion-tree",
+ "similar",
  "thiserror",
  "tokio",
 ]
