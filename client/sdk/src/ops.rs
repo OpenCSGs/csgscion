@@ -54,6 +54,28 @@ pub struct Person {
     pub email: String,
 }
 
+/// 带时间的签名（导入外部历史时用来保留原始时间与时区）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Signature {
+    pub name: String,
+    pub email: String,
+    /// Unix 毫秒。
+    pub time_ms: i64,
+    /// 相对 UTC 的分钟数。
+    pub tz_offset_minutes: i32,
+}
+
+impl Signature {
+    fn to_proto(&self) -> v1::Signature {
+        v1::Signature {
+            name: self.name.clone(),
+            email: self.email.clone(),
+            time_ms: self.time_ms,
+            tz_offset_minutes: self.tz_offset_minutes,
+        }
+    }
+}
+
 fn bytes_of(id: &ObjectId) -> Bytes {
     Bytes::copy_from_slice(&id.to_bytes())
 }
@@ -149,6 +171,8 @@ impl Client {
             client: self,
             parents: parent.into_iter().collect(),
             author: None,
+            committer: None,
+            change_id: None,
             message: String::new(),
             puts: Vec::new(),
             deletes: Vec::new(),
@@ -293,7 +317,9 @@ impl Client {
 pub struct ChangesetBuilder<'a> {
     client: &'a Client,
     parents: Vec<ObjectId>,
-    author: Option<Person>,
+    author: Option<Signature>,
+    committer: Option<Signature>,
+    change_id: Option<[u8; 16]>,
     message: String,
     puts: Vec<(String, EntryMode, Bytes)>,
     deletes: Vec<String>,
@@ -327,11 +353,31 @@ impl ChangesetBuilder<'_> {
         self
     }
 
+    /// 作者（时间取当前时间，时区为 UTC）。提交者未单独设置时与作者相同。
     pub fn author(mut self, name: impl Into<String>, email: impl Into<String>) -> Self {
-        self.author = Some(Person {
+        self.author = Some(Signature {
             name: name.into(),
             email: email.into(),
+            time_ms: now_ms(),
+            tz_offset_minutes: 0,
         });
+        self
+    }
+
+    /// 带原始时间与时区的作者。
+    pub fn author_signature(mut self, sig: Signature) -> Self {
+        self.author = Some(sig);
+        self
+    }
+
+    pub fn committer_signature(mut self, sig: Signature) -> Self {
+        self.committer = Some(sig);
+        self
+    }
+
+    /// 指定 change_id（默认随机生成）。导入外部历史时用确定的值，使重复导入得到相同的提交 id。
+    pub fn change_id(mut self, id: [u8; 16]) -> Self {
+        self.change_id = Some(id);
         self
     }
 
@@ -341,16 +387,13 @@ impl ChangesetBuilder<'_> {
     }
 
     fn spec(&self, ids: &[ObjectId]) -> ChangesetSpec {
-        let person = self.author.clone().unwrap_or(Person {
+        let author = self.author.clone().unwrap_or_else(|| Signature {
             name: "scion".into(),
             email: "scion@localhost".into(),
-        });
-        let sig = v1::Signature {
-            name: person.name,
-            email: person.email,
             time_ms: now_ms(),
             tz_offset_minutes: 0,
-        };
+        });
+        let committer = self.committer.clone().unwrap_or_else(|| author.clone());
         let mut delta: Vec<v1::FileChange> = self
             .puts
             .iter()
@@ -370,10 +413,13 @@ impl ChangesetBuilder<'_> {
         }));
         ChangesetSpec {
             parents: self.parents.iter().map(bytes_of).collect(),
-            author: Some(sig.clone()),
-            committer: Some(sig),
+            author: Some(author.to_proto()),
+            committer: Some(committer.to_proto()),
             message: self.message.clone(),
-            change_id: Bytes::copy_from_slice(uuid::Uuid::now_v7().as_bytes()),
+            change_id: match self.change_id {
+                Some(id) => Bytes::copy_from_slice(&id),
+                None => Bytes::copy_from_slice(uuid::Uuid::now_v7().as_bytes()),
+            },
             delta,
             extensions: self.extensions.clone().into_iter().collect(),
         }

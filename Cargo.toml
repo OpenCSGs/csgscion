@@ -14,6 +14,7 @@ members = [
     # 客户端
     "client/sdk",
     "client/wc",
+    "client/gitimport",
     "client/cli",
     # 开发工具（依赖分层检查等）
     "xtask",
@@ -35,6 +36,7 @@ scion-tree = { path = "server/tree" }
 scion-api = { path = "server/api" }
 scion-client = { path = "client/sdk" }
 scion-wc = { path = "client/wc" }
+scion-gitimport = { path = "client/gitimport" }
 
 anyhow = "1"
 async-trait = "0.1"

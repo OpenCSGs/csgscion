@@ -199,3 +199,75 @@ async fn clone_commit_land_sync_workflow() {
     .expect("join");
     let _ = tx.send(());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn import_git_repository() {
+    use scion_store::MetaStore;
+    let store = Arc::new(MemStore::new());
+    store.create_repo("imported").await.expect("repo");
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("addr"));
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let app = App {
+        config: Arc::new(ServerConfig::default()),
+        meta: store.clone(),
+        blobs: store,
+    };
+    tokio::spawn(serve(listener, app, async {
+        let _ = rx.await;
+    }));
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().to_path_buf();
+    let u = url.clone();
+    tokio::task::spawn_blocking(move || {
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .current_dir(root.join("src-repo"))
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "A")
+                .env("GIT_AUTHOR_EMAIL", "a@x")
+                .env("GIT_COMMITTER_NAME", "A")
+                .env("GIT_COMMITTER_EMAIL", "a@x")
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        };
+        std::fs::create_dir(root.join("src-repo")).expect("mkdir");
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("src-repo/hello.txt"), "from git\n").expect("write");
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "first"]);
+
+        let v = json_of(&scn_in(
+            &root,
+            &[
+                "import",
+                "git",
+                "src-repo",
+                "--repo",
+                "imported",
+                "--endpoint",
+                &u,
+                "--json",
+            ],
+        ));
+        assert_eq!(v["schema"], "scion.cli.import/v1");
+        assert_eq!(v["commits"], 1);
+        let out = scn_in(&root, &["cat", "hello.txt", "--repo", "imported", "--endpoint", &u]);
+        assert_eq!(out.stdout, b"from git\n");
+        let text = scn_in(
+            &root,
+            &["import", "git", "src-repo", "--repo", "imported", "--endpoint", &u],
+        );
+        assert!(String::from_utf8_lossy(&text.stdout).contains("imported 1 commits"));
+        // 不是 git 仓库
+        let out = scn_in(&root, &["import", "git", ".", "--repo", "imported", "--endpoint", &u]);
+        assert_eq!(out.status.code(), Some(1));
+    })
+    .await
+    .expect("join");
+    let _ = tx.send(());
+}

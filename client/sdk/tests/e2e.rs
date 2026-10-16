@@ -267,6 +267,43 @@ async fn write_land_and_query_end_to_end() {
 }
 
 #[tokio::test]
+async fn explicit_signatures_and_change_id_make_ids_deterministic() {
+    let srv = start(Limits::default(), &[]).await;
+    let c = Client::builder()
+        .endpoint(&srv.url)
+        .repo("mono")
+        .build()
+        .await
+        .expect("connect");
+    let sig = |name: &str, t| scion_client::Signature {
+        name: name.into(),
+        email: format!("{name}@example.com"),
+        time_ms: t,
+        tz_offset_minutes: 480,
+    };
+    let make = || {
+        c.changeset(None)
+            .put("a", "a")
+            .message("imported")
+            .author_signature(sig("ada", 1_000))
+            .committer_signature(sig("bot", 2_000))
+            .change_id([9; 16])
+            .extension("git.sha1", vec![0xab; 20])
+    };
+    let first = make().create().await.expect("first");
+    let second = make().create().await.expect("second");
+    assert_eq!(first.id, second.id, "same input gives the same changeset id");
+    let other = c
+        .changeset(None)
+        .put("a", "a")
+        .message("imported")
+        .create()
+        .await
+        .expect("random ids");
+    assert_ne!(other.id, first.id);
+}
+
+#[tokio::test]
 async fn upload_above_server_limit_rejected_client_side() {
     let srv = start(
         Limits {

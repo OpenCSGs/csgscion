@@ -6,7 +6,7 @@
 - 对象格式规范：[`SPEC.md`](SPEC.md)，golden 测试向量在 [`testdata/vectors/`](testdata/vectors/)
 - 协议：[`proto/scion/v1/`](proto/scion/v1/)
 
-当前进度：**M1 最小闭环**进行中（写入路径、Lite 模式、`scn` 工作副本已可用；git 导入尚未完成）。
+当前进度：**M1 最小闭环**已完成（写入路径、Lite 模式、`scn` 工作副本、git 导入）。下一步 M2：派生数据与查询（log / blame / diff）。
 
 ## 目录结构
 
@@ -30,6 +30,7 @@ server/              服务端（可依赖 common 与更低层的 server crate�
 client/              客户端（只能依赖 common 与 client，禁止依赖 server）
   sdk/               scion-client  Rust SDK
   wc/                scion-wc      工作副本（clone / status / commit / land / sync）
+  gitimport/         scion-gitimport  git 历史导入
   cli/               scion-cli     命令行二进制 scn
 
 xtask/               仓库维护任务（cargo xtask layers：依赖方向检查）
@@ -61,6 +62,9 @@ scn land                            # 快进合入 main
 scn sync                            # 拉取别人合入的改动；有未合入的提交时自动做文件级 rebase
 scn cat main:README.md              # 不需要工作副本也能读文件（工作副本外加 --repo）
 scn ls main:                        # 列目录；所有命令都支持 --json
+
+# 导入已有的 git 仓库（保留全部历史、作者与时间）
+scn import git ~/src/my-repo --repo mono
 ```
 
 ## 开发

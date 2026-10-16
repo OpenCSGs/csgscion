@@ -15,7 +15,17 @@ pub const EXIT_AUTH: u8 = 5;
 pub enum CliError {
     Client(scion_client::Error),
     Wc(scion_wc::Error),
+    Import(scion_gitimport::Error),
     Usage(String),
+}
+
+impl From<scion_gitimport::Error> for CliError {
+    fn from(e: scion_gitimport::Error) -> Self {
+        match e {
+            scion_gitimport::Error::Client(c) => CliError::Client(c),
+            other => CliError::Import(other),
+        }
+    }
 }
 
 impl From<scion_client::Error> for CliError {
@@ -38,6 +48,7 @@ impl std::fmt::Display for CliError {
         match self {
             CliError::Client(e) => e.fmt(f),
             CliError::Wc(e) => e.fmt(f),
+            CliError::Import(e) => e.fmt(f),
             CliError::Usage(m) => f.write_str(m),
         }
     }
@@ -56,7 +67,7 @@ impl CliError {
         match self {
             CliError::Usage(_) => EXIT_USAGE,
             CliError::Wc(scion_wc::Error::Conflict(_)) => EXIT_CONFLICT,
-            CliError::Wc(_) => EXIT_GENERAL,
+            CliError::Wc(_) | CliError::Import(_) => EXIT_GENERAL,
             CliError::Client(e) => match e {
                 scion_client::Error::Rpc {
                     code: Code::Unauthenticated | Code::PermissionDenied,
@@ -90,6 +101,9 @@ impl CliError {
             CliError::Wc(scion_wc::Error::Dirty) => Some("run `scn commit -m <message>` first"),
             CliError::Wc(scion_wc::Error::NothingToLand) => Some("run `scn commit -m <message>` first"),
             CliError::Wc(scion_wc::Error::NotAWorkingCopy(_)) => Some("run `scn clone <repo>` first, or pass --repo"),
+            CliError::Import(scion_gitimport::Error::Diverged { .. }) => {
+                Some("the git history was rewritten; import into a new ref with --ref")
+            }
             CliError::Wc(scion_wc::Error::Conflict(_)) => Some(
                 "both sides changed these files; M1 cannot merge them automatically. \
                  Re-apply your change on a fresh `scn clone` (server-side merge arrives in M3)",
@@ -326,6 +340,22 @@ mod tests {
         }
         assert!(CliError::Client(scion_client::Error::MissingRepo).hint().is_none());
         assert!(CliError::Usage("u".into()).hint().is_none());
+    }
+
+    #[test]
+    fn import_errors_map() {
+        let e: CliError = scion_gitimport::Error::Client(scion_client::Error::MissingRepo).into();
+        assert!(matches!(e, CliError::Client(_)));
+        let e: CliError = scion_gitimport::Error::Git("not a git repository".into()).into();
+        assert_eq!(e.exit_code(), EXIT_GENERAL);
+        assert_eq!(e.to_string(), "not a git repository");
+        let id = scion_client::ObjectId::of_blob(b"x");
+        let e: CliError = scion_gitimport::Error::Diverged {
+            reference: "main".into(),
+            current: id,
+        }
+        .into();
+        assert!(e.hint().expect("hint").contains("--ref"));
     }
 
     #[test]

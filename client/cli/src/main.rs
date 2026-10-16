@@ -62,6 +62,24 @@ enum Command {
     Cat { spec: String },
     /// 列出目录：[REV:][DIR]。
     Ls { spec: Option<String> },
+    /// 导入外部历史。
+    #[command(subcommand)]
+    Import(ImportCmd),
+}
+
+#[derive(Debug, Subcommand)]
+enum ImportCmd {
+    /// 把本地 git 仓库的历史导入 --repo 指定的 Scion 仓库。
+    Git {
+        /// git 仓库目录。
+        path: PathBuf,
+        /// 要导入的 git 引用。
+        #[arg(long, default_value = "main")]
+        git_ref: String,
+        /// 导入后更新的 Scion ref。
+        #[arg(long = "ref", default_value = "main")]
+        reference: String,
+    },
 }
 
 fn emit<T: Render>(v: Result<T, CliError>, json: bool) -> ExitCode {
@@ -114,6 +132,11 @@ async fn run(cli: Cli) -> ExitCode {
         Command::Land => emit(commands::land(&ctx).await, json),
         Command::Sync => emit(commands::sync(&ctx).await, json),
         Command::Ls { spec } => emit(commands::ls(&ctx, spec.as_deref()).await, json),
+        Command::Import(ImportCmd::Git {
+            path,
+            git_ref,
+            reference,
+        }) => emit(commands::import_git(&ctx, &path, &git_ref, &reference).await, json),
         // 文本模式下原样输出字节（文件可能不是文本）
         Command::Cat { spec } => match commands::cat(&ctx, &spec).await {
             Ok(out) if !json => {
@@ -160,6 +183,9 @@ mod tests {
         let cli = Cli::try_parse_from(["scn", "commit", "-m", "msg", "--author", "A <a@b>"]).expect("parse");
         assert!(matches!(cli.command, Command::Commit { ref message, .. } if message == "msg"));
         assert!(Cli::try_parse_from(["scn", "commit"]).is_err(), "message required");
+        let cli =
+            Cli::try_parse_from(["scn", "import", "git", "../repo", "--repo", "r", "--git-ref", "dev"]).expect("parse");
+        assert!(matches!(cli.command, Command::Import(ImportCmd::Git { ref git_ref, .. }) if git_ref == "dev"));
         let cli = Cli::try_parse_from(["scn", "ls"]).expect("parse");
         assert!(matches!(cli.command, Command::Ls { spec: None }));
     }

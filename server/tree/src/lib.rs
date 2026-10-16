@@ -137,8 +137,12 @@ fn apply_dir<'a>(
             let existing_is_dir = existing.as_ref().is_some_and(|e| e.mode == EntryMode::Tree);
             match g.own {
                 Some(FileOp::Put { mode, id, size }) => {
-                    if !g.below.is_empty() || existing_is_dir {
-                        return Err(TreeError::PathConflict(path));
+                    // 用文件替换目录：只有当同一个 delta 把该目录下的文件全部删掉时才允许
+                    if existing_is_dir || !g.below.is_empty() {
+                        let sub_base = existing.as_ref().filter(|e| e.mode == EntryMode::Tree).map(|e| e.id);
+                        if apply_dir(src, sub_base, &path, &g.below, out).await?.is_some() {
+                            return Err(TreeError::PathConflict(path));
+                        }
                     }
                     let entry = TreeEntry {
                         name: name.to_owned(),
@@ -350,6 +354,22 @@ mod tests {
             .await
             .expect("v2");
         assert_eq!(flatten(&src, r2).await.keys().collect::<Vec<_>>(), ["a/b"]);
+    }
+
+    #[tokio::test]
+    async fn directory_replaced_by_file_when_emptied_in_same_delta() {
+        let src = MemSource::default();
+        let r1 = build(&src, None, vec![put("a/x", "1"), put("a/sub/y", "2"), put("keep", "k")])
+            .await
+            .expect("v1");
+        let r2 = build(&src, Some(r1), vec![del("a/x"), del("a/sub/y"), put("a", "now a file")])
+            .await
+            .expect("v2");
+        let files = flatten(&src, r2).await;
+        assert_eq!(files.keys().collect::<Vec<_>>(), ["a", "keep"]);
+        // 没删干净则仍是冲突
+        let r = build(&src, Some(r1), vec![del("a/x"), put("a", "file")]).await;
+        assert_eq!(r, Err(TreeError::PathConflict("a".into())));
     }
 
     #[tokio::test]

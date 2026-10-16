@@ -285,6 +285,60 @@ pub async fn sync(ctx: &Ctx) -> Result<SyncOut, CliError> {
     Ok(sync_out(&wc, &o))
 }
 
+// ---------- import ----------
+
+#[derive(Debug, Serialize)]
+pub struct ImportOut {
+    pub schema: &'static str,
+    pub repo: String,
+    #[serde(rename = "ref")]
+    pub reference: String,
+    pub commits: usize,
+    pub skipped_gitlinks: usize,
+    pub tip: Option<String>,
+}
+
+impl Render for ImportOut {
+    fn text(&self) -> String {
+        let mut s = match &self.tip {
+            Some(t) => format!(
+                "imported {} commits into {} ({} at {})",
+                self.commits,
+                self.repo,
+                self.reference,
+                short(t)
+            ),
+            None => format!("nothing to import into {}", self.repo),
+        };
+        if self.skipped_gitlinks > 0 {
+            s.push_str(&format!(
+                "\nskipped {} submodule entries (not supported yet)",
+                self.skipped_gitlinks
+            ));
+        }
+        s
+    }
+}
+
+/// 把本地 git 仓库的历史导入 Scion。
+pub async fn import_git(ctx: &Ctx, git_dir: &Path, git_ref: &str, target_ref: &str) -> Result<ImportOut, CliError> {
+    let repo = ctx
+        .repo
+        .clone()
+        .ok_or_else(|| CliError::Usage("--repo is required for import".into()))?;
+    let endpoint = ctx.endpoint.clone().unwrap_or_else(|| DEFAULT_ENDPOINT.to_owned());
+    let client = connect(&endpoint, Some(&repo)).await?;
+    let summary = scion_gitimport::import(&client, &ctx.cwd.join(git_dir), git_ref, target_ref, |_, _| {}).await?;
+    Ok(ImportOut {
+        schema: "scion.cli.import/v1",
+        repo,
+        reference: target_ref.to_owned(),
+        commits: summary.commits,
+        skipped_gitlinks: summary.skipped_gitlinks,
+        tip: summary.tip.map(|t| t.to_string()),
+    })
+}
+
 // ---------- cat / ls（不需要工作副本） ----------
 
 /// 拆分 `rev:path`；没有 `:` 时整个视为路径，rev 用默认值。
@@ -579,6 +633,28 @@ mod tests {
     }
 
     #[test]
+    fn import_render() {
+        let o = ImportOut {
+            schema: "s",
+            repo: "r".into(),
+            reference: "main".into(),
+            commits: 3,
+            skipped_gitlinks: 1,
+            tip: Some("c1tiptiptiptip".into()),
+        };
+        assert_eq!(
+            o.text(),
+            "imported 3 commits into r (main at c1tiptiptipt)\nskipped 1 submodule entries (not supported yet)"
+        );
+        let o = ImportOut {
+            tip: None,
+            skipped_gitlinks: 0,
+            ..o
+        };
+        assert_eq!(o.text(), "nothing to import into r");
+    }
+
+    #[test]
     fn endpoint_precedence() {
         let ctx = Ctx {
             endpoint: Some("http://flag".into()),
@@ -602,5 +678,9 @@ mod tests {
             Err(CliError::Wc(scion_wc::Error::NotAWorkingCopy(_)))
         ));
         assert!(matches!(commit(&ctx, "m", Some("bad")).await, Err(CliError::Usage(_))));
+        assert!(matches!(
+            import_git(&ctx, Path::new("."), "main", "main").await,
+            Err(CliError::Usage(_))
+        ));
     }
 }

@@ -360,6 +360,7 @@ client/                客户端，只能依赖 common 与 client，禁止依赖
   wc/                  scion-wc           工作副本
   daemon/              scion-daemon       节点 L1 缓存
   vfs/                 scion-vfs          虚拟化 checkout（M7 之后）
+  gitimport/           scion-gitimport    git 历史导入（只走公开协议，scn import git）
   cli/                 scion-cli          二进制 scn
 
 testing/               scion-testkit（假后端、故障注入、git 差分对照、lincheck）
@@ -592,6 +593,10 @@ SDK、工作副本、daemon 和 CLI 的完整设计见 [`rust-client-architectur
 |---|---|---|---|
 | **M0 协议与骨架** | 2 周 | proto v1 + buf CI、`scion-object`、golden 测试向量、内存版 store、单二进制骨架、`GetServerInfo`、覆盖率门槛接入 CI | 编码向量测试通过；`scion-client` 能连上并完成能力协商；满足 §12.1 |
 | **M1 最小闭环** | 4 周 | sqlx（SQLite + PostgreSQL）+ object_store（本地文件系统 + S3 兼容存储，CI 用 SeaweedFS）、Lite 模式、Upload/CreateChangeset/TreeBuilder、直接 CAS 的 Land、ReadFile/ListDir/GetTrees、git 导入 | `scn` 完成 clone(sparse)/commit/land；差分测试通过 |
+
+> **M1 实现说明**（2026-10-16）：
+> - **git 导入放在客户端**（`client/gitimport`，命令 `scn import git <path> --repo NAME`），只通过公开协议写入，与普通用户走同一条校验路径；服务端不需要额外的写入通道。结果确定：`change_id` 由 git sha 推导，git sha 存入扩展字段 `git.sha1`，重复导入得到相同的提交 id；增量导入沿第一父提交链逐个快进。差分测试逐个提交比对 git 与 Scion 的文件列表、mode、内容和元数据。大仓库的批量导入（starhub 迁移，§16）后续改为服务端直写。
+> - **合入只支持快进**；工作副本的 `scn sync` 在客户端做文件级 rebase，冲突以退出码 3 报告。M3 的服务端 rebase 上线后，`Land` 直接处理落后的提交。
 | **M2 派生与查询** | 3 周 | 派生框架、Gen/SkipList/PathHistory/Blame、Log/Blame/Diff/MergeBase、deriver 进程 | 在 10 万提交的仓库上，查询 p99 小于 100 毫秒 |
 | **M3 高并发** | 3 周 | LandCoordinator 批处理和租约、幂等表、限流与过载丢弃、lincheck | 单 ref 每秒 200 次以上 land；leader 被杀时没有重复或丢失的合入 |
 | **M4 缓存层** | 3 周 | `scion cache`(foyer + rendezvous + singleflight + 对冲)、WatchRefs、预热 | L2 命中率不低于 99%；单节点 20 万对象读/秒以上 |
