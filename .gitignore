@@ -2,3 +2,4 @@
 *.profraw
 lcov.info
 .DS_Store
+/.scion-data

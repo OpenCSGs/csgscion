@@ -25,14 +25,14 @@ server/              服务端（可依赖 common 与更低层的 server crate�
   store-blob/        scion-store-blob  本地目录 / S3 兼容对象存储
   tree/              scion-tree        增量建树
   api/               scion-api         gRPC 服务实现与启动入口
-  scion/             scion         服务端二进制
+  scion/             scion             服务端二进制（scion server --lite / --meta / --blobs）
 
 client/              客户端（只能依赖 common 与 client，禁止依赖 server）
   sdk/               scion-client  Rust SDK
   cli/               scion-cli     命令行二进制 scn
 
 xtask/               仓库维护任务（cargo xtask layers：依赖方向检查）
-deploy/dev/          本地开发依赖（MinIO、PostgreSQL）
+deploy/dev/          本地开发依赖（SeaweedFS、PostgreSQL）
 docs/design/         设计文档与架构图
 ```
 
