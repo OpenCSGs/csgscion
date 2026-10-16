@@ -38,6 +38,8 @@ jobs:
           # 已发布的 v1 协议不允许出现破坏性变更
           breaking: ${{ github.event_name == 'pull_request' }}
           breaking_against: ${{ github.event.repository.clone_url }}#branch=${{ github.base_ref }}
+          # 结果看 CI 日志即可；发 PR 评论需要额外的写权限
+          pr_comment: false
 
   test:
     strategy:
