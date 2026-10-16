@@ -223,6 +223,33 @@ async fn rebase_conflict_reported_and_identical_changes_merge() {
 }
 
 #[tokio::test]
+async fn local_changes_report_old_versions_and_new_content() {
+    let srv = server().await;
+    let c = client(&srv.url).await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path().join("wc");
+    let mut wc = WorkingCopy::clone(&c, &srv.url, "mono", "main", &dir)
+        .await
+        .expect("clone");
+    write(&dir, "keep", "k");
+    write(&dir, "edit", "v1");
+    write(&dir, "gone", "g");
+    wc.commit(&c, "base", None).await.expect("commit").expect("changes");
+    write(&dir, "edit", "v2");
+    std::fs::remove_file(dir.join("gone")).expect("rm");
+    write(&dir, "new", "n");
+    let mut changes = wc.local_changes().expect("changes");
+    changes.sort_by(|a, b| a.path.cmp(&b.path));
+    let paths: Vec<_> = changes.iter().map(|c| c.path.as_str()).collect();
+    assert_eq!(paths, ["edit", "gone", "new"]);
+    let edit = &changes[0];
+    assert_eq!(edit.old.map(|(_, id)| id), Some(scion_object::ObjectId::of_blob(b"v1")));
+    assert_eq!(edit.new.as_ref().map(|(_, b)| b.as_ref()), Some(&b"v2"[..]));
+    assert!(changes[1].new.is_none() && changes[1].old.is_some(), "deleted");
+    assert!(changes[2].old.is_none() && changes[2].new.is_some(), "added");
+}
+
+#[tokio::test]
 async fn sync_refuses_dirty_tree() {
     let srv = server().await;
     let c = client(&srv.url).await;

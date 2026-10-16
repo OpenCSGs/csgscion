@@ -351,7 +351,7 @@ pub fn split_spec<'a>(spec: &'a str, default_rev: &'a str) -> (&'a str, &'a str)
 }
 
 /// 不需要工作副本的命令：仓库来自 --repo 或当前工作副本。
-async fn query_client(ctx: &Ctx) -> Result<(Client, String), CliError> {
+pub(crate) async fn query_client(ctx: &Ctx) -> Result<(Client, String), CliError> {
     let wc = ctx.working_copy();
     let repo = ctx
         .repo

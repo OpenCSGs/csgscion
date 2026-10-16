@@ -44,6 +44,9 @@ scn land                            # fast-forward main
 scn sync                            # pull others' changes; rebases a pending commit at file level
 scn cat main:README.md              # read files without a working copy (add --repo outside one)
 scn ls main:                        # list a directory; every command supports --json
+scn log --path src -n 10            # history, newest first, optionally limited to a path
+scn diff                            # uncommitted local changes (unified diff)
+scn diff main                       # what the tip of main changed; `scn diff A B` compares two revisions
 
 # Import an existing git repository with its history, authors and timestamps
 # (see docs/guide/git-import.md)

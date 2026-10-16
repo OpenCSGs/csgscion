@@ -75,6 +75,9 @@ scn land                            # 快进合入 main
 scn sync                            # 拉取别人合入的改动；有未合入的提交时自动做文件级 rebase
 scn cat main:README.md              # 不需要工作副本也能读文件（工作副本外加 --repo）
 scn ls main:                        # 列目录；所有命令都支持 --json
+scn log --path src -n 10            # 历史，从新到旧，可按路径过滤
+scn diff                            # 本地未提交的改动（unified diff）
+scn diff main                       # main 最新提交引入的改动；`scn diff A B` 比较两个版本
 
 # 导入已有的 git 仓库（保留全部历史、作者与时间），详见 docs/guide/git-import.md
 scn import git ~/src/my-repo --repo mono

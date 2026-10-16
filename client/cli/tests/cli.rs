@@ -271,3 +271,82 @@ async fn import_git_repository() {
     .expect("join");
     let _ = tx.send(());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn log_and_diff_commands() {
+    use scion_store::MetaStore;
+    let store = Arc::new(MemStore::new());
+    store.create_repo("hist").await.expect("repo");
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("addr"));
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let app = App {
+        config: Arc::new(ServerConfig::default()),
+        meta: store.clone(),
+        blobs: store,
+    };
+    tokio::spawn(serve(listener, app, async {
+        let _ = rx.await;
+    }));
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().to_path_buf();
+    let u = url.clone();
+    tokio::task::spawn_blocking(move || {
+        json_of(&scn_in(&root, &["clone", "hist", "--endpoint", &u, "--json"]));
+        let wc = root.join("hist");
+        std::fs::write(wc.join("a.txt"), "one\ntwo\n").expect("write");
+        json_of(&scn_in(
+            &wc,
+            &["commit", "-m", "first", "--author", "Ada <a@x>", "--json"],
+        ));
+        json_of(&scn_in(&wc, &["land", "--json"]));
+        std::fs::write(wc.join("a.txt"), "one\nthree\n").expect("edit");
+        std::fs::write(wc.join("b.bin"), [0u8, 1, 2]).expect("binary");
+
+        // 本地未提交的改动
+        let out = scn_in(&wc, &["diff"]);
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(text.contains("-two") && text.contains("+three"), "{text}");
+        assert!(text.contains("Binary files a/b.bin and b/b.bin differ"), "{text}");
+        let v = json_of(&scn_in(&wc, &["diff", "--name-only", "--json"]));
+        assert_eq!(v["files"].as_array().expect("files").len(), 2);
+        let v = json_of(&scn_in(&wc, &["diff", "--path", "a.txt", "--json"]));
+        assert_eq!(v["files"][0]["status"], "M");
+
+        json_of(&scn_in(&wc, &["commit", "-m", "second", "--json"]));
+        json_of(&scn_in(&wc, &["land", "--json"]));
+
+        // log：从新到旧，按路径过滤
+        let v = json_of(&scn_in(&wc, &["log", "--json"]));
+        let msgs: Vec<_> = v["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .map(|e| e["message"].as_str().expect("msg").to_owned())
+            .collect();
+        assert_eq!(msgs, ["second", "first"]);
+        let first_id = v["entries"][1]["id"].as_str().expect("id").to_owned();
+        let v = json_of(&scn_in(&wc, &["log", "--path", "b.bin", "--json"]));
+        assert_eq!(v["entries"].as_array().expect("entries").len(), 1);
+        let text = String::from_utf8_lossy(&scn_in(&wc, &["log", "-n", "1"]).stdout).to_string();
+        assert!(text.contains("second") && !text.contains("first"), "{text}");
+
+        // 某个提交引入的改动；两个版本之间的差异
+        let v = json_of(&scn_in(&wc, &["diff", "main", "--name-only", "--json"]));
+        let names: Vec<_> = v["files"]
+            .as_array()
+            .expect("files")
+            .iter()
+            .map(|f| f["path"].as_str().expect("p").to_owned())
+            .collect();
+        assert_eq!(names, ["a.txt", "b.bin"]);
+        let text = String::from_utf8_lossy(&scn_in(&wc, &["diff", &first_id, "main"]).stdout).to_string();
+        assert!(text.contains("+three"), "{text}");
+        let out = scn_in(&wc, &["diff", "a", "b", "c"]);
+        assert_eq!(out.status.code(), Some(2));
+    })
+    .await
+    .expect("join");
+    let _ = tx.send(());
+}
