@@ -1,0 +1,9 @@
+{
+  "identities": [
+    {
+      "name": "scion",
+      "credentials": [{ "accessKey": "scion", "secretKey": "scion-dev-secret" }],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }
+  ]
+}

@@ -54,8 +54,8 @@ jobs:
       # golden 向量必须与构造逻辑一致（不允许手改 JSON）
       - run: git diff --exit-code testdata/
 
-  # PostgreSQL 后端的一致性测试（macOS runner 不支持服务容器，单独成 job）
-  test-postgres:
+  # 真实存储后端（PostgreSQL、S3）的一致性测试；macOS runner 不支持服务容器，单独成 job
+  test-backends:
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -69,11 +69,26 @@ jobs:
           --health-cmd "pg_isready -U scion" --health-interval 5s --health-timeout 5s --health-retries 20
     env:
       SCION_TEST_PG_URL: postgres://scion:scion@localhost:5432/scion
+      SCION_TEST_S3_ENDPOINT: http://localhost:8333
+      SCION_TEST_S3_BUCKET: scion-test
+      SCION_TEST_S3_ACCESS_KEY: scion
+      SCION_TEST_S3_SECRET_KEY: scion-dev-secret
     steps:
       - uses: actions/checkout@v5
+      # S3 兼容存储（SeaweedFS）；服务容器不支持自定义命令，所以在步骤里启动
+      - name: Start S3 (SeaweedFS)
+        run: |
+          docker run -d --name s3 -p 8333:8333 -v "$PWD/deploy/dev/s3.json:/etc/s3.json:ro" \
+            chrislusf/seaweedfs:4.48 server -s3 -s3.config=/etc/s3.json
+          for i in $(seq 1 60); do
+            docker exec s3 sh -c "echo 's3.bucket.create -name scion-test' | weed shell" 2>/dev/null \
+              | grep -q "created bucket" && exit 0
+            sleep 2
+          done
+          docker logs s3; exit 1
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p scion-store-sql
+      - run: cargo test -p scion-store-sql -p scion-store-blob
 
   # 函数级测试要求（服务端设计文档 §12.1）
   coverage:
@@ -90,11 +105,26 @@ jobs:
           --health-cmd "pg_isready -U scion" --health-interval 5s --health-timeout 5s --health-retries 20
     env:
       SCION_TEST_PG_URL: postgres://scion:scion@localhost:5432/scion
+      SCION_TEST_S3_ENDPOINT: http://localhost:8333
+      SCION_TEST_S3_BUCKET: scion-test
+      SCION_TEST_S3_ACCESS_KEY: scion
+      SCION_TEST_S3_SECRET_KEY: scion-dev-secret
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       # 分支覆盖率需要 nightly
+      # S3 兼容存储（SeaweedFS）；服务容器不支持自定义命令，所以在步骤里启动
+      - name: Start S3 (SeaweedFS)
+        run: |
+          docker run -d --name s3 -p 8333:8333 -v "$PWD/deploy/dev/s3.json:/etc/s3.json:ro" \
+            chrislusf/seaweedfs:4.48 server -s3 -s3.config=/etc/s3.json
+          for i in $(seq 1 60); do
+            docker exec s3 sh -c "echo 's3.bucket.create -name scion-test' | weed shell" 2>/dev/null \
+              | grep -q "created bucket" && exit 0
+            sleep 2
+          done
+          docker logs s3; exit 1
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: llvm-tools-preview
@@ -104,7 +134,7 @@ jobs:
         run: cargo llvm-cov --workspace --branch --no-report
       - name: Core crates (lines >= 90%, branches >= 80%)
         run: |
-          cargo llvm-cov report --package scion-object --package scion-store --package scion-store-sql \
+          cargo llvm-cov report --package scion-object --package scion-store --package scion-store-sql --package scion-store-blob \
             --ignore-filename-regex '(xtask|testsuite)' --json --summary-only > core.json
           jq -e '.data[0].totals.lines.percent >= 90' core.json
           jq -e '(.data[0].totals.branches.count == 0) or (.data[0].totals.branches.percent >= 80)' core.json
@@ -128,10 +158,25 @@ jobs:
           --health-cmd "pg_isready -U scion" --health-interval 5s --health-timeout 5s --health-retries 20
     env:
       SCION_TEST_PG_URL: postgres://scion:scion@localhost:5432/scion
+      SCION_TEST_S3_ENDPOINT: http://localhost:8333
+      SCION_TEST_S3_BUCKET: scion-test
+      SCION_TEST_S3_ACCESS_KEY: scion
+      SCION_TEST_S3_SECRET_KEY: scion-dev-secret
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
+      # S3 兼容存储（SeaweedFS）；服务容器不支持自定义命令，所以在步骤里启动
+      - name: Start S3 (SeaweedFS)
+        run: |
+          docker run -d --name s3 -p 8333:8333 -v "$PWD/deploy/dev/s3.json:/etc/s3.json:ro" \
+            chrislusf/seaweedfs:4.48 server -s3 -s3.config=/etc/s3.json
+          for i in $(seq 1 60); do
+            docker exec s3 sh -c "echo 's3.bucket.create -name scion-test' | weed shell" 2>/dev/null \
+              | grep -q "created bucket" && exit 0
+            sleep 2
+          done
+          docker logs s3; exit 1
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
