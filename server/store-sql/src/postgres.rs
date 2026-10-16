@@ -300,6 +300,21 @@ impl MetaStore for PgMetaStore {
             .collect()
     }
 
+    async fn set_fp_skip(&self, repo: &str, id: &ObjectId, fp_depth: u64, fp_jump: Option<ObjectId>) -> Result<()> {
+        let repo_id = self.repo_id(repo).await?;
+        sqlx::query(
+            "UPDATE changesets SET fp_depth = $1, fp_jump = $2 WHERE repo_id = $3 AND cs_id = $4 AND fp_depth = 0",
+        )
+        .bind(version_to_db(fp_depth)?)
+        .bind(fp_jump.map(|j| j.to_bytes().to_vec()))
+        .bind(repo_id)
+        .bind(id.to_bytes().to_vec())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| backend("set fp skip", e))?;
+        Ok(())
+    }
+
     async fn index_paths(&self, repo: &str, cs: ObjectId, generation: u64, changes: &[PathChange]) -> Result<()> {
         let repo_id = self.repo_id(repo).await?;
         if changes.is_empty() {

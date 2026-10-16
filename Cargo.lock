@@ -2394,6 +2394,7 @@ dependencies = [
  "scion-api",
  "scion-client",
  "scion-object",
+ "scion-query",
  "scion-store",
  "scion-store-blob",
  "scion-store-sql",

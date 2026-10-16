@@ -173,6 +173,17 @@ impl MetaStore for MemStore {
         Ok(recs)
     }
 
+    async fn set_fp_skip(&self, repo: &str, id: &ObjectId, fp_depth: u64, fp_jump: Option<ObjectId>) -> Result<()> {
+        let mut inner = self.write()?;
+        if let Some(rec) = repo_mut(&mut inner, repo)?.changesets.get_mut(id) {
+            if rec.fp_depth == 0 {
+                rec.fp_depth = fp_depth;
+                rec.fp_jump = fp_jump;
+            }
+        }
+        Ok(())
+    }
+
     async fn index_paths(&self, repo: &str, cs: ObjectId, generation: u64, changes: &[PathChange]) -> Result<()> {
         let mut inner = self.write()?;
         let data = repo_mut(&mut inner, repo)?;

@@ -87,6 +87,10 @@ pub trait MetaStore: Send + Sync + 'static {
     /// 用于沿历史批量预取，避免逐条查询。
     async fn changesets_below(&self, repo: &str, max_generation: u64, limit: usize) -> Result<Vec<ChangesetRecord>>;
 
+    /// 为跳表建立之前写入的提交补上 `fp_depth` / `fp_jump`：只在当前深度为 0（未知）时写入，
+    /// 已有的值不会被覆盖。提交记录的其它字段不可变。
+    async fn set_fp_skip(&self, repo: &str, id: &ObjectId, fp_depth: u64, fp_jump: Option<ObjectId>) -> Result<()>;
+
     /// 登记提交改动的路径（PathHistory 索引，相对第一个父提交）。幂等。
     /// 应在 [`MetaStore::put_changeset`] 之前写入：记录存在即表示索引完整。
     async fn index_paths(&self, repo: &str, cs: ObjectId, generation: u64, changes: &[PathChange]) -> Result<()>;

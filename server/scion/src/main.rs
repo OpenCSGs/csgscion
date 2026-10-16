@@ -34,16 +34,29 @@ enum Command {
     Server(ServerArgs),
     /// 打印版本与协议版本。
     Version,
+    /// 运维命令。
+    #[command(subcommand)]
+    Admin(AdminCmd),
+}
+
+#[derive(Debug, Subcommand)]
+enum AdminCmd {
+    /// 为旧数据补建派生索引（跳表、PathHistory、GitSha）。可重复执行。
+    Reindex(ReindexArgs),
 }
 
 #[derive(Debug, clap::Args)]
-struct ServerArgs {
-    /// gRPC 监听地址。
-    #[arg(long, default_value = "127.0.0.1:7080", env = "SCION_LISTEN")]
-    listen: SocketAddr,
-    /// 启动时确保存在的仓库（已存在则跳过），可重复指定。
+struct ReindexArgs {
+    /// 只处理这个仓库；不指定时处理全部仓库。
     #[arg(long = "repo", value_name = "NAME")]
-    repos: Vec<String>,
+    repo: Option<String>,
+    #[command(flatten)]
+    storage: StorageArgs,
+}
+
+/// 存储后端选项，server 与 admin 共用。
+#[derive(Debug, clap::Args)]
+struct StorageArgs {
     /// Lite 档：SQLite + 本地目录，单进程、零外部依赖。需要 --data-dir。
     #[arg(long, requires = "data_dir", conflicts_with_all = ["meta", "blobs"])]
     lite: bool,
@@ -56,6 +69,27 @@ struct ServerArgs {
     /// 对象存储：mem、目录路径、s3://bucket[/prefix]（连接参数见 SCION_S3_* 环境变量）。
     #[arg(long, value_name = "SPEC", default_value = "mem", env = "SCION_BLOBS")]
     blobs: String,
+}
+
+impl StorageArgs {
+    fn specs(&self) -> anyhow::Result<(storage::MetaSpec, storage::BlobSpec)> {
+        Ok(match (&self.data_dir, self.lite) {
+            (Some(dir), true) => storage::lite(dir),
+            _ => (storage::parse_meta(&self.meta)?, storage::parse_blobs(&self.blobs)?),
+        })
+    }
+}
+
+#[derive(Debug, clap::Args)]
+struct ServerArgs {
+    /// gRPC 监听地址。
+    #[arg(long, default_value = "127.0.0.1:7080", env = "SCION_LISTEN")]
+    listen: SocketAddr,
+    /// 启动时确保存在的仓库（已存在则跳过），可重复指定。
+    #[arg(long = "repo", value_name = "NAME")]
+    repos: Vec<String>,
+    #[command(flatten)]
+    storage: StorageArgs,
 }
 
 fn init_tracing(format: LogFormat) {
@@ -88,10 +122,7 @@ fn scion_proto_version() -> &'static str {
 
 /// 打开存储并确保 `--repo` 指定的仓库存在。
 async fn build_app(args: &ServerArgs, env: impl Fn(&str) -> Option<String>) -> anyhow::Result<(App, String)> {
-    let (meta_spec, blob_spec) = match (&args.data_dir, args.lite) {
-        (Some(dir), true) => storage::lite(dir),
-        _ => (storage::parse_meta(&args.meta)?, storage::parse_blobs(&args.blobs)?),
-    };
+    let (meta_spec, blob_spec) = args.storage.specs()?;
     let (meta, blobs) = storage::open(&meta_spec, &blob_spec, env).await?;
     for repo in &args.repos {
         match meta.create_repo(repo).await {
@@ -105,6 +136,24 @@ async fn build_app(args: &ServerArgs, env: impl Fn(&str) -> Option<String>) -> a
         blobs,
     };
     Ok((app, storage::describe(&meta_spec, &blob_spec)))
+}
+
+/// `scion admin reindex`：返回每个仓库的一行摘要。
+async fn reindex(args: &ReindexArgs, env: impl Fn(&str) -> Option<String>) -> anyhow::Result<Vec<String>> {
+    let (meta_spec, blob_spec) = args.storage.specs()?;
+    let (meta, blobs) = storage::open(&meta_spec, &blob_spec, env).await?;
+    let repos = match &args.repo {
+        Some(r) => vec![r.clone()],
+        None => meta.list_repos().await?,
+    };
+    let mut out = Vec::with_capacity(repos.len());
+    for repo in repos {
+        let stats = scion_query::reindex(meta.as_ref(), blobs.as_ref(), &repo)
+            .await
+            .with_context(|| format!("reindex {repo:?}"))?;
+        out.push(scion_query::describe(&stats, &repo));
+    }
+    Ok(out)
 }
 
 async fn shutdown_signal() {
@@ -157,6 +206,12 @@ async fn main() -> anyhow::Result<()> {
             init_tracing(cli.log_format);
             run_server(args).await
         }
+        Command::Admin(AdminCmd::Reindex(args)) => {
+            for line in reindex(&args, |k| std::env::var(k).ok()).await? {
+                println!("{line}");
+            }
+            Ok(())
+        }
     }
 }
 
@@ -178,7 +233,7 @@ mod tests {
                 assert_eq!(a.listen, "127.0.0.1:7080".parse().expect("addr"));
                 assert!(a.repos.is_empty());
             }
-            Command::Version => panic!("expected server"),
+            _ => panic!("expected server"),
         }
         assert_eq!(cli.log_format, LogFormat::Text);
     }
@@ -199,7 +254,7 @@ mod tests {
         assert_eq!(cli.log_format, LogFormat::Json);
         match cli.command {
             Command::Server(a) => assert_eq!(a.repos, ["a", "b/c"]),
-            Command::Version => panic!("expected server"),
+            _ => panic!("expected server"),
         }
     }
 
@@ -219,7 +274,7 @@ mod tests {
         argv.extend_from_slice(extra);
         match Cli::try_parse_from(argv).expect("parse").command {
             Command::Server(a) => a,
-            Command::Version => panic!("expected server"),
+            _ => panic!("expected server"),
         }
     }
 
@@ -254,11 +309,47 @@ mod tests {
         assert_eq!(backends, "meta=mem blobs=mem");
     }
 
+    #[tokio::test]
+    async fn admin_reindex_runs_on_lite_storage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let d = dir.path().to_str().expect("utf8");
+        // 先用 server 的方式建两个仓库
+        drop(
+            build_app(
+                &args(&["--lite", "--data-dir", d, "--repo", "a", "--repo", "b"]),
+                no_env,
+            )
+            .await
+            .expect("app"),
+        );
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["scion", "admin", "reindex", "--lite", "--data-dir", d];
+            argv.extend_from_slice(extra);
+            match Cli::try_parse_from(argv).expect("parse").command {
+                Command::Admin(AdminCmd::Reindex(r)) => r,
+                _ => panic!("expected reindex"),
+            }
+        };
+        let all = reindex(&parse(&[]), no_env).await.expect("all repos");
+        assert_eq!(
+            all,
+            [
+                "a: 0 changesets, 0 skip pointers filled, 0 path entries, 0 git shas",
+                "b: 0 changesets, 0 skip pointers filled, 0 path entries, 0 git shas"
+            ]
+        );
+        assert_eq!(reindex(&parse(&["--repo", "a"]), no_env).await.expect("one").len(), 1);
+        assert!(reindex(&parse(&["--repo", "nope"]), no_env).await.is_err());
+    }
+
     #[test]
     fn parse_lite_requires_data_dir_and_excludes_meta() {
         assert!(Cli::try_parse_from(["scion", "server", "--lite"]).is_err());
         assert!(Cli::try_parse_from(["scion", "server", "--lite", "--data-dir", "/d", "--meta", "mem"]).is_err());
         let a = args(&["--meta", "sqlite:///x.db", "--blobs", "/b"]);
-        assert_eq!((a.meta.as_str(), a.blobs.as_str()), ("sqlite:///x.db", "/b"));
+        assert_eq!(
+            (a.storage.meta.as_str(), a.storage.blobs.as_str()),
+            ("sqlite:///x.db", "/b")
+        );
     }
 }
