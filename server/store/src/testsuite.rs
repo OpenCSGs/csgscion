@@ -8,7 +8,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use scion_object::{ObjectId, ObjectKind};
 
-use crate::{BlobStore, ChangesetRecord, Error, IndexedObject, MetaStore, RefExpect, RefState};
+use crate::{
+    BlobStore, ChangesetRecord, Error, IndexedObject, MetaStore, PathChange, PathHistoryEntry, RefExpect, RefState,
+};
 
 fn cs(n: u8) -> ObjectId {
     ObjectId::hash(ObjectKind::Changeset, &[n])
@@ -259,6 +261,120 @@ pub async fn derived<S: MetaStore + ?Sized>(s: &S) {
     ));
     assert!(matches!(
         s.put_derived("nope", "x", 1, b"k", b"v").await,
+        Err(Error::RepoNotFound(_))
+    ));
+}
+
+/// 批量读取提交记录与 PathHistory 索引。
+pub async fn history_index<S: MetaStore + ?Sized>(s: &S) {
+    s.create_repo("hist/a").await.expect("create");
+    s.create_repo("hist/b").await.expect("create");
+    let tree = ObjectId::hash(ObjectKind::Tree, b"t");
+    for g in 1..=5u8 {
+        let rec = ChangesetRecord {
+            id: cs(g),
+            root_tree: tree,
+            parents: vec![],
+            generation: u64::from(g),
+        };
+        s.put_changeset("hist/a", &rec).await.expect("put");
+    }
+    let gens = |v: Vec<ChangesetRecord>| v.into_iter().map(|r| r.generation).collect::<Vec<_>>();
+    assert_eq!(
+        gens(s.changesets_below("hist/a", 4, 2).await.expect("below")),
+        vec![4, 3]
+    );
+    assert_eq!(
+        gens(s.changesets_below("hist/a", 100, 100).await.expect("below")),
+        vec![5, 4, 3, 2, 1]
+    );
+    assert_eq!(
+        gens(s.changesets_below("hist/a", 0, 10).await.expect("below")),
+        Vec::<u64>::new()
+    );
+    assert_eq!(s.changesets_below("hist/b", 10, 10).await.expect("below"), vec![]);
+    // 大代数（超过 i32）
+    let big = ChangesetRecord {
+        id: cs(9),
+        root_tree: tree,
+        parents: vec![cs(5)],
+        generation: u64::from(u32::MAX) + 1,
+    };
+    s.put_changeset("hist/a", &big).await.expect("put");
+    assert_eq!(
+        s.changesets_below("hist/a", u64::from(u32::MAX) + 1, 1)
+            .await
+            .expect("below"),
+        vec![big]
+    );
+
+    let ch = |p: &str, deleted| PathChange {
+        path: p.into(),
+        deleted,
+    };
+    s.index_paths("hist/a", cs(1), 1, &[ch("src/a.rs", false), ch("README", false)])
+        .await
+        .expect("index");
+    s.index_paths("hist/a", cs(2), 2, &[ch("src/a.rs", false), ch("src/b/c.rs", false)])
+        .await
+        .expect("index");
+    s.index_paths(
+        "hist/a",
+        cs(3),
+        3,
+        &[ch("src/a.rs", true), ch("srcx/d.rs", false), ch("src.txt", false)],
+    )
+    .await
+    .expect("index");
+    s.index_paths("hist/a", cs(3), 3, &[ch("src/a.rs", true)])
+        .await
+        .expect("idempotent");
+    s.index_paths("hist/a", cs(4), 4, &[]).await.expect("empty");
+    let hist = |v: Vec<PathHistoryEntry>| {
+        v.into_iter()
+            .map(|e| (e.generation, e.path, e.deleted))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        hist(s.path_history("hist/a", "src/a.rs", 10, 10).await.expect("file")),
+        vec![
+            (3, "src/a.rs".into(), true),
+            (2, "src/a.rs".into(), false),
+            (1, "src/a.rs".into(), false)
+        ]
+    );
+    assert_eq!(
+        hist(s.path_history("hist/a", "src", 10, 10).await.expect("dir")),
+        vec![
+            (3, "src/a.rs".into(), true),
+            (2, "src/a.rs".into(), false),
+            (2, "src/b/c.rs".into(), false),
+            (1, "src/a.rs".into(), false)
+        ],
+        "directory matches descendants only, not src.txt or srcx/"
+    );
+    assert_eq!(s.path_history("hist/a", "src", 2, 1).await.expect("limit").len(), 1);
+    assert_eq!(
+        hist(s.path_history("hist/a", "src/a.rs", 2, 10).await.expect("max gen")).len(),
+        2
+    );
+    assert!(s.path_history("hist/a", "nope", 10, 10).await.expect("none").is_empty());
+    assert!(
+        s.path_history("hist/b", "src", 10, 10)
+            .await
+            .expect("isolated")
+            .is_empty()
+    );
+    assert!(matches!(
+        s.path_history("nope", "src", 1, 1).await,
+        Err(Error::RepoNotFound(_))
+    ));
+    assert!(matches!(
+        s.index_paths("nope", cs(1), 1, &[]).await,
+        Err(Error::RepoNotFound(_))
+    ));
+    assert!(matches!(
+        s.changesets_below("nope", 1, 1).await,
         Err(Error::RepoNotFound(_))
     ));
 }

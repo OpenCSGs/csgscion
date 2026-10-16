@@ -9,7 +9,10 @@ use scion_object::ObjectId;
 
 use crate::error::{Error, Result};
 use crate::repo::validate_repo_name;
-use crate::{BlobStore, ChangesetRecord, IndexedObject, MetaStore, RefExpect, RefState};
+use crate::{
+    BlobStore, ChangesetRecord, IndexedObject, MetaStore, PathChange, PathHistoryEntry, RefExpect, RefState,
+    path_within,
+};
 
 #[derive(Default)]
 struct RepoData {
@@ -17,6 +20,8 @@ struct RepoData {
     objects: HashMap<ObjectId, u64>,
     changesets: HashMap<ObjectId, ChangesetRecord>,
     derived: HashMap<(String, u32, Vec<u8>), Vec<u8>>,
+    /// PathHistory：(路径, 提交) → (代数, 是否删除)。
+    paths: BTreeMap<(String, ObjectId), (u64, bool)>,
 }
 
 #[derive(Default)]
@@ -155,6 +160,65 @@ impl MetaStore for MemStore {
         Ok(repo_ref(&inner, repo)?.changesets.get(id).cloned())
     }
 
+    async fn changesets_below(&self, repo: &str, max_generation: u64, limit: usize) -> Result<Vec<ChangesetRecord>> {
+        let inner = self.read()?;
+        let mut recs: Vec<_> = repo_ref(&inner, repo)?
+            .changesets
+            .values()
+            .filter(|r| r.generation <= max_generation)
+            .cloned()
+            .collect();
+        recs.sort_unstable_by(|a, b| b.generation.cmp(&a.generation));
+        recs.truncate(limit);
+        Ok(recs)
+    }
+
+    async fn index_paths(&self, repo: &str, cs: ObjectId, generation: u64, changes: &[PathChange]) -> Result<()> {
+        let mut inner = self.write()?;
+        let data = repo_mut(&mut inner, repo)?;
+        for c in changes {
+            data.paths
+                .entry((c.path.clone(), cs))
+                .or_insert((generation, c.deleted));
+        }
+        Ok(())
+    }
+
+    async fn path_history(
+        &self,
+        repo: &str,
+        path: &str,
+        max_generation: u64,
+        limit: usize,
+    ) -> Result<Vec<PathHistoryEntry>> {
+        let inner = self.read()?;
+        let data = repo_ref(&inner, repo)?;
+        let mut out: Vec<_> = data
+            .paths
+            .range(
+                (
+                    path.to_owned(),
+                    ObjectId::new(
+                        scion_object::HashAlgo::Blake3_256,
+                        scion_object::ObjectKind::Blob,
+                        [0; 32],
+                    ),
+                )..,
+            )
+            .take_while(|((p, _), _)| p.as_str() == path || p.starts_with(path))
+            .filter(|((p, _), (g, _))| path_within(p, path) && *g <= max_generation)
+            .map(|((p, cs), (g, d))| PathHistoryEntry {
+                cs: *cs,
+                generation: *g,
+                path: p.clone(),
+                deleted: *d,
+            })
+            .collect();
+        out.sort_unstable_by(|a, b| b.generation.cmp(&a.generation).then_with(|| a.path.cmp(&b.path)));
+        out.truncate(limit);
+        Ok(out)
+    }
+
     async fn get_derived(&self, repo: &str, kind: &str, version: u32, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let inner = self.read()?;
         Ok(repo_ref(&inner, repo)?
@@ -228,6 +292,11 @@ mod tests {
     #[tokio::test]
     async fn conformance_derived() {
         testsuite::derived(&MemStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_history_index() {
+        testsuite::history_index(&MemStore::new()).await;
     }
 
     #[tokio::test]

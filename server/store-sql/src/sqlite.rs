@@ -5,7 +5,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use scion_object::ObjectId;
-use scion_store::{ChangesetRecord, Error, IndexedObject, MetaStore, RefExpect, RefState, Result, validate_repo_name};
+use scion_store::{
+    ChangesetRecord, Error, IndexedObject, MetaStore, PathChange, PathHistoryEntry, RefExpect, RefState, Result,
+    validate_repo_name,
+};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous};
 
 use crate::common::{
@@ -293,6 +296,94 @@ impl MetaStore for SqliteMetaStore {
         .transpose()
     }
 
+    async fn changesets_below(&self, repo: &str, max_generation: u64, limit: usize) -> Result<Vec<ChangesetRecord>> {
+        let repo_id = self.repo_id(repo).await?;
+        let rows = sqlx::query_as::<_, (Vec<u8>, Vec<u8>, Vec<u8>, i64)>(
+            "SELECT cs_id, root_tree, parents, generation FROM changesets \
+             WHERE repo_id = ? AND generation <= ? ORDER BY generation DESC LIMIT ?",
+        )
+        .bind(repo_id)
+        .bind(version_to_db(max_generation.min(i64::MAX as u64))?)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| backend("changesets below", e))?;
+        rows.into_iter()
+            .map(|(id, root, parents, generation)| {
+                Ok(ChangesetRecord {
+                    id: id_from_db(&id)?,
+                    root_tree: id_from_db(&root)?,
+                    parents: ids_from_db(&parents)?,
+                    generation: version_from_db(generation)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn index_paths(&self, repo: &str, cs: ObjectId, generation: u64, changes: &[PathChange]) -> Result<()> {
+        let repo_id = self.repo_id(repo).await?;
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let generation = version_to_db(generation)?;
+        let cs_bytes = cs.to_bytes().to_vec();
+        let mut tx = self.pool.begin().await.map_err(|e| backend("begin", e))?;
+        for chunk in changes.chunks(MAX_IDS_PER_QUERY) {
+            let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "INSERT INTO path_changes (repo_id, path, cs_id, generation, deleted) ",
+            );
+            qb.push_values(chunk, |mut b, c| {
+                b.push_bind(repo_id)
+                    .push_bind(c.path.clone())
+                    .push_bind(cs_bytes.clone())
+                    .push_bind(generation)
+                    .push_bind(c.deleted);
+            });
+            qb.push(" ON CONFLICT (repo_id, path, cs_id) DO NOTHING");
+            qb.build()
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| backend("index paths", e))?;
+        }
+        tx.commit().await.map_err(|e| backend("commit", e))?;
+        Ok(())
+    }
+
+    async fn path_history(
+        &self,
+        repo: &str,
+        path: &str,
+        max_generation: u64,
+        limit: usize,
+    ) -> Result<Vec<PathHistoryEntry>> {
+        let repo_id = self.repo_id(repo).await?;
+        // 目录下的路径：区间 [path + "/", path + "0")，'0' 是 '/' 的下一个字符
+        let rows = sqlx::query_as::<_, (Vec<u8>, i64, String, bool)>(
+            "SELECT cs_id, generation, path, deleted FROM path_changes \
+             WHERE repo_id = ? AND (path = ? OR (path >= ? AND path < ?)) AND generation <= ? \
+             ORDER BY generation DESC, path LIMIT ?",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .bind(format!("{path}/"))
+        .bind(format!("{path}0"))
+        .bind(version_to_db(max_generation.min(i64::MAX as u64))?)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| backend("path history", e))?;
+        rows.into_iter()
+            .map(|(cs, generation, path, deleted)| {
+                Ok(PathHistoryEntry {
+                    cs: id_from_db(&cs)?,
+                    generation: version_from_db(generation)?,
+                    path,
+                    deleted,
+                })
+            })
+            .collect()
+    }
+
     async fn get_derived(&self, repo: &str, kind: &str, version: u32, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let repo_id = self.repo_id(repo).await?;
         sqlx::query_scalar::<_, Vec<u8>>(
@@ -413,6 +504,12 @@ mod tests {
     async fn conformance_derived() {
         let (_dir, s) = fresh().await;
         testsuite::derived(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_history_index() {
+        let (_dir, s) = fresh().await;
+        testsuite::history_index(&s).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -565,6 +662,42 @@ mod tests {
         assert!(matches!(s.get_changeset("r", &id).await, Err(Error::Backend(_))));
         s.pool.close().await;
         assert!(matches!(s.list_refs("r").await, Err(Error::Backend(_))));
+    }
+
+    #[tokio::test]
+    async fn history_index_backend_errors() {
+        let (_dir, s) = fresh().await;
+        s.create_repo("r").await.expect("create");
+        let id = ObjectId::hash(scion_object::ObjectKind::Changeset, b"c");
+        let ch = [PathChange {
+            path: "a".into(),
+            deleted: false,
+        }];
+        assert!(matches!(
+            s.index_paths("r", id, u64::MAX, &ch).await,
+            Err(Error::Backend(_))
+        ));
+        sqlx::query(
+            "INSERT INTO changesets (repo_id, cs_id, root_tree, generation, parents) VALUES (1, x'00', x'00', 1, x'')",
+        )
+        .execute(&s.pool)
+        .await
+        .expect("corrupt row");
+        assert!(matches!(s.changesets_below("r", 10, 10).await, Err(Error::Backend(_))));
+        sqlx::query(
+            "INSERT INTO path_changes (repo_id, path, cs_id, generation, deleted) VALUES (1, 'p', x'00', 1, 0)",
+        )
+        .execute(&s.pool)
+        .await
+        .expect("corrupt row");
+        assert!(matches!(s.path_history("r", "p", 10, 10).await, Err(Error::Backend(_))));
+        sqlx::query("DROP TABLE path_changes")
+            .execute(&s.pool)
+            .await
+            .expect("drop");
+        assert!(matches!(s.index_paths("r", id, 1, &ch).await, Err(Error::Backend(_))));
+        s.pool.close().await;
+        assert!(matches!(s.changesets_below("r", 10, 10).await, Err(Error::Backend(_))));
     }
 
     #[tokio::test]

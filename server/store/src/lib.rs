@@ -75,6 +75,23 @@ pub trait MetaStore: Send + Sync + 'static {
     /// 按名字字节序列出仓库的全部 ref。
     async fn list_refs(&self, repo: &str) -> Result<Vec<(String, RefState)>>;
 
+    /// 代数不大于 `max_generation` 的提交记录，按代数从高到低，最多 `limit` 条（同代数时顺序不定）。
+    /// 用于沿历史批量预取，避免逐条查询。
+    async fn changesets_below(&self, repo: &str, max_generation: u64, limit: usize) -> Result<Vec<ChangesetRecord>>;
+
+    /// 登记提交改动的路径（PathHistory 索引，相对第一个父提交）。幂等。
+    /// 应在 [`MetaStore::put_changeset`] 之前写入：记录存在即表示索引完整。
+    async fn index_paths(&self, repo: &str, cs: ObjectId, generation: u64, changes: &[PathChange]) -> Result<()>;
+
+    /// 改动了 `path` 或其下任意路径、且代数不大于 `max_generation` 的提交，按代数从高到低，最多 `limit` 条。
+    async fn path_history(
+        &self,
+        repo: &str,
+        path: &str,
+        max_generation: u64,
+        limit: usize,
+    ) -> Result<Vec<PathHistoryEntry>>;
+
     /// 读取派生数据（服务端设计文档 §8）。`kind` 区分种类，`version` 为派生算法版本：
     /// 算法变化时提升版本，旧值自然失效，提交 id 不受影响。
     async fn get_derived(&self, repo: &str, kind: &str, version: u32, key: &[u8]) -> Result<Option<Vec<u8>>>;
@@ -101,6 +118,28 @@ impl ChangesetRecord {
     }
 }
 
+/// 提交对一个路径的改动。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathChange {
+    pub path: String,
+    pub deleted: bool,
+}
+
+/// PathHistory 索引中的一条记录。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathHistoryEntry {
+    pub cs: ObjectId,
+    pub generation: u64,
+    pub path: String,
+    pub deleted: bool,
+}
+
+/// `candidate` 是否等于 `path` 或在 `path` 之下（按路径段）。
+pub fn path_within(candidate: &str, path: &str) -> bool {
+    candidate == path
+        || (candidate.len() > path.len() && candidate.starts_with(path) && candidate.as_bytes()[path.len()] == b'/')
+}
+
 /// 对象索引中的一条记录。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexedObject {
@@ -119,4 +158,31 @@ pub trait BlobStore: Send + Sync + 'static {
     async fn get(&self, id: &ObjectId) -> Result<Option<Bytes>>;
 
     async fn exists(&self, id: &ObjectId) -> Result<bool>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_within_respects_segments() {
+        assert!(path_within("src", "src"));
+        assert!(path_within("src/a.rs", "src"));
+        assert!(path_within("src/b/c", "src/b"));
+        assert!(!path_within("src.txt", "src"));
+        assert!(!path_within("srcx/a", "src"));
+        assert!(!path_within("sr", "src"));
+    }
+
+    #[test]
+    fn first_parent_of_record() {
+        let id = ObjectId::of_blob(b"x");
+        let rec = ChangesetRecord {
+            id,
+            root_tree: id,
+            parents: vec![],
+            generation: 1,
+        };
+        assert_eq!(rec.first_parent(), None);
+    }
 }
