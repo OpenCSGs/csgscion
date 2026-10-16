@@ -620,8 +620,14 @@ mod tests {
         let src = MemSource::default();
         let r1 = build(&src, None, vec![put("a/x", "1")]).await.expect("v1");
         let ghost = ObjectId::hash(scion_object::ObjectKind::Tree, b"ghost");
-        assert!(matches!(diff(&src, Some(r1), Some(ghost), "").await, Err(TreeError::BadTree(..))));
-        assert!(matches!(diff(&src, Some(ghost), Some(r1), "a").await, Err(TreeError::BadTree(..))));
+        assert!(matches!(
+            diff(&src, Some(r1), Some(ghost), "").await,
+            Err(TreeError::BadTree(..))
+        ));
+        assert!(matches!(
+            diff(&src, Some(ghost), Some(r1), "a").await,
+            Err(TreeError::BadTree(..))
+        ));
     }
 
     #[tokio::test]

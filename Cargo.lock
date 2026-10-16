@@ -2444,6 +2444,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "scion-query"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "scion-object",
+ "scion-store",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "scion-store"
 version = "0.1.0"
 dependencies = [
