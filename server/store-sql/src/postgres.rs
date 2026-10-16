@@ -9,8 +9,8 @@ use scion_store::{ChangesetRecord, Error, IndexedObject, MetaStore, RefExpect, R
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 
 use crate::common::{
-    MAX_IDS_PER_QUERY, backend, id_from_db, is_unique_violation, now_ms, size_to_db, subtract_present, version_from_db,
-    version_to_db,
+    MAX_IDS_PER_QUERY, backend, id_from_db, ids_from_db, ids_to_db, is_unique_violation, now_ms, size_to_db,
+    subtract_present, version_from_db, version_to_db,
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
@@ -249,14 +249,15 @@ impl MetaStore for PgMetaStore {
     async fn put_changeset(&self, repo: &str, rec: &ChangesetRecord) -> Result<()> {
         let repo_id = self.repo_id(repo).await?;
         sqlx::query(
-            "INSERT INTO changesets (repo_id, cs_id, root_tree, first_parent, generation) \
-             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (repo_id, cs_id) DO NOTHING",
+            "INSERT INTO changesets (repo_id, cs_id, root_tree, first_parent, generation, parents) \
+             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (repo_id, cs_id) DO NOTHING",
         )
         .bind(repo_id)
         .bind(rec.id.to_bytes().to_vec())
         .bind(rec.root_tree.to_bytes().to_vec())
-        .bind(rec.first_parent.map(|p| p.to_bytes().to_vec()))
+        .bind(rec.first_parent().map(|p| p.to_bytes().to_vec()))
         .bind(version_to_db(rec.generation)?)
+        .bind(ids_to_db(&rec.parents))
         .execute(&self.pool)
         .await
         .map_err(|e| backend("put changeset", e))?;
@@ -265,19 +266,19 @@ impl MetaStore for PgMetaStore {
 
     async fn get_changeset(&self, repo: &str, id: &ObjectId) -> Result<Option<ChangesetRecord>> {
         let repo_id = self.repo_id(repo).await?;
-        let row = sqlx::query_as::<_, (Vec<u8>, Option<Vec<u8>>, i64)>(
-            "SELECT root_tree, first_parent, generation FROM changesets WHERE repo_id = $1 AND cs_id = $2",
+        let row = sqlx::query_as::<_, (Vec<u8>, Vec<u8>, i64)>(
+            "SELECT root_tree, parents, generation FROM changesets WHERE repo_id = $1 AND cs_id = $2",
         )
         .bind(repo_id)
         .bind(id.to_bytes().to_vec())
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| backend("get changeset", e))?;
-        row.map(|(root, parent, generation)| {
+        row.map(|(root, parents, generation)| {
             Ok(ChangesetRecord {
                 id: *id,
                 root_tree: id_from_db(&root)?,
-                first_parent: parent.as_deref().map(id_from_db).transpose()?,
+                parents: ids_from_db(&parents)?,
                 generation: version_from_db(generation)?,
             })
         })

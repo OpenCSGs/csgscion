@@ -61,6 +61,18 @@ pub(crate) fn size_to_db(size: u64) -> Result<i64> {
     i64::try_from(size).map_err(|_| Error::Backend(format!("object size {size} exceeds i64")))
 }
 
+/// 把多个 ObjectId 依次拼接存入一列。
+pub(crate) fn ids_to_db(ids: &[ObjectId]) -> Vec<u8> {
+    ids.iter().flat_map(|id| id.to_bytes()).collect()
+}
+
+pub(crate) fn ids_from_db(b: &[u8]) -> Result<Vec<ObjectId>> {
+    if b.len() % scion_object::ID_LEN != 0 {
+        return Err(Error::Backend(format!("corrupt id list of {} bytes", b.len())));
+    }
+    b.chunks(scion_object::ID_LEN).map(id_from_db).collect()
+}
+
 /// URL 中的密码替换为 `***`，用于错误信息和日志。
 pub(crate) fn redact_url(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
@@ -109,6 +121,14 @@ mod tests {
         let present = std::collections::HashSet::from([b.to_bytes().to_vec()]);
         assert_eq!(subtract_present(&[c, b, a, c], &present), vec![c, a]);
         assert_eq!(subtract_present(&[], &present), vec![]);
+    }
+
+    #[test]
+    fn id_lists_roundtrip() {
+        let ids = vec![ObjectId::of_blob(b"a"), ObjectId::of_blob(b"b")];
+        assert_eq!(ids_from_db(&ids_to_db(&ids)), Ok(ids));
+        assert_eq!(ids_from_db(&[]), Ok(vec![]));
+        assert!(matches!(ids_from_db(&[1, 2, 3]), Err(Error::Backend(_))));
     }
 
     #[test]

@@ -9,8 +9,8 @@ use scion_store::{ChangesetRecord, Error, IndexedObject, MetaStore, RefExpect, R
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous};
 
 use crate::common::{
-    MAX_IDS_PER_QUERY, backend, id_from_db, is_unique_violation, now_ms, size_to_db, subtract_present, version_from_db,
-    version_to_db,
+    MAX_IDS_PER_QUERY, backend, id_from_db, ids_from_db, ids_to_db, is_unique_violation, now_ms, size_to_db,
+    subtract_present, version_from_db, version_to_db,
 };
 
 /// 写锁等待上限；SQLite 同一时刻只有一个写者，其余写者在此期间排队。
@@ -257,14 +257,15 @@ impl MetaStore for SqliteMetaStore {
     async fn put_changeset(&self, repo: &str, rec: &ChangesetRecord) -> Result<()> {
         let repo_id = self.repo_id(repo).await?;
         sqlx::query(
-            "INSERT INTO changesets (repo_id, cs_id, root_tree, first_parent, generation) \
-             VALUES (?, ?, ?, ?, ?) ON CONFLICT (repo_id, cs_id) DO NOTHING",
+            "INSERT INTO changesets (repo_id, cs_id, root_tree, first_parent, generation, parents) \
+             VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (repo_id, cs_id) DO NOTHING",
         )
         .bind(repo_id)
         .bind(rec.id.to_bytes().to_vec())
         .bind(rec.root_tree.to_bytes().to_vec())
-        .bind(rec.first_parent.map(|p| p.to_bytes().to_vec()))
+        .bind(rec.first_parent().map(|p| p.to_bytes().to_vec()))
         .bind(version_to_db(rec.generation)?)
+        .bind(ids_to_db(&rec.parents))
         .execute(&self.pool)
         .await
         .map_err(|e| backend("put changeset", e))?;
@@ -273,19 +274,19 @@ impl MetaStore for SqliteMetaStore {
 
     async fn get_changeset(&self, repo: &str, id: &ObjectId) -> Result<Option<ChangesetRecord>> {
         let repo_id = self.repo_id(repo).await?;
-        let row = sqlx::query_as::<_, (Vec<u8>, Option<Vec<u8>>, i64)>(
-            "SELECT root_tree, first_parent, generation FROM changesets WHERE repo_id = ? AND cs_id = ?",
+        let row = sqlx::query_as::<_, (Vec<u8>, Vec<u8>, i64)>(
+            "SELECT root_tree, parents, generation FROM changesets WHERE repo_id = ? AND cs_id = ?",
         )
         .bind(repo_id)
         .bind(id.to_bytes().to_vec())
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| backend("get changeset", e))?;
-        row.map(|(root, parent, generation)| {
+        row.map(|(root, parents, generation)| {
             Ok(ChangesetRecord {
                 id: *id,
                 root_tree: id_from_db(&root)?,
-                first_parent: parent.as_deref().map(id_from_db).transpose()?,
+                parents: ids_from_db(&parents)?,
                 generation: version_from_db(generation)?,
             })
         })
@@ -500,10 +501,21 @@ mod tests {
             .expect("insert");
         assert!(matches!(s.get_changeset("r", &id).await, Err(Error::Backend(_))));
         assert!(matches!(s.list_refs("r").await, Err(Error::Backend(_))));
+        // parents 列长度不是 34 的整数倍
+        let id2 = ObjectId::hash(scion_object::ObjectKind::Changeset, b"c2");
+        sqlx::query(
+            "INSERT INTO changesets (repo_id, cs_id, root_tree, generation, parents) VALUES (1, ?, ?, 1, x'0102')",
+        )
+        .bind(id2.to_bytes().to_vec())
+        .bind(id2.to_bytes().to_vec())
+        .execute(&s.pool)
+        .await
+        .expect("insert");
+        assert!(matches!(s.get_changeset("r", &id2).await, Err(Error::Backend(_))));
         let rec = ChangesetRecord {
             id,
             root_tree: id,
-            first_parent: None,
+            parents: vec![],
             generation: u64::MAX,
         };
         assert!(matches!(s.put_changeset("r", &rec).await, Err(Error::Backend(_))));

@@ -172,28 +172,31 @@ pub async fn changesets_and_refs<S: MetaStore + ?Sized>(s: &S) {
     let root = ChangesetRecord {
         id: cs(1),
         root_tree: tree,
-        first_parent: None,
+        parents: vec![],
         generation: 1,
     };
+    // 合并提交：多个父提交，顺序必须保留
     let child = ChangesetRecord {
         id: cs(2),
         root_tree: tree,
-        first_parent: Some(cs(1)),
+        parents: vec![cs(1), cs(9), cs(5)],
         generation: u64::from(u32::MAX) + 7,
     };
 
     assert_eq!(s.get_changeset("cs/a", &cs(1)).await, Ok(None));
     s.put_changeset("cs/a", &root).await.expect("put root");
     s.put_changeset("cs/a", &child).await.expect("put child");
-    assert_eq!(s.get_changeset("cs/a", &cs(1)).await, Ok(Some(root)));
-    assert_eq!(s.get_changeset("cs/a", &cs(2)).await, Ok(Some(child)));
+    assert_eq!(s.get_changeset("cs/a", &cs(1)).await, Ok(Some(root.clone())));
+    assert_eq!(s.get_changeset("cs/a", &cs(2)).await, Ok(Some(child.clone())));
+    assert_eq!(child.first_parent(), Some(cs(1)));
+    assert_eq!(root.first_parent(), None);
     // 幂等：保留第一次写入
     let other = ChangesetRecord {
         root_tree: ObjectId::hash(ObjectKind::Tree, b"other"),
-        ..root
+        ..root.clone()
     };
     s.put_changeset("cs/a", &other).await.expect("idempotent put");
-    assert_eq!(s.get_changeset("cs/a", &cs(1)).await, Ok(Some(root)));
+    assert_eq!(s.get_changeset("cs/a", &cs(1)).await, Ok(Some(root.clone())));
     // 仓库隔离
     assert_eq!(s.get_changeset("cs/b", &cs(1)).await, Ok(None));
     assert!(matches!(

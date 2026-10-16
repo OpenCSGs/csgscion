@@ -142,13 +142,16 @@ impl MetaStore for MemStore {
 
     async fn put_changeset(&self, repo: &str, rec: &ChangesetRecord) -> Result<()> {
         let mut inner = self.write()?;
-        repo_mut(&mut inner, repo)?.changesets.entry(rec.id).or_insert(*rec);
+        repo_mut(&mut inner, repo)?
+            .changesets
+            .entry(rec.id)
+            .or_insert_with(|| rec.clone());
         Ok(())
     }
 
     async fn get_changeset(&self, repo: &str, id: &ObjectId) -> Result<Option<ChangesetRecord>> {
         let inner = self.read()?;
-        Ok(repo_ref(&inner, repo)?.changesets.get(id).copied())
+        Ok(repo_ref(&inner, repo)?.changesets.get(id).cloned())
     }
 
     async fn list_refs(&self, repo: &str) -> Result<Vec<(String, RefState)>> {

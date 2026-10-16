@@ -77,14 +77,21 @@ pub trait MetaStore: Send + Sync + 'static {
 }
 
 /// 已创建 changeset 的元数据。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangesetRecord {
     pub id: ObjectId,
     /// 应用 delta 之后的根目录树。
     pub root_tree: ObjectId,
-    pub first_parent: Option<ObjectId>,
+    /// 全部父提交，第一个为 first parent；根提交为空。
+    pub parents: Vec<ObjectId>,
     /// 代数：根提交为 1，其余为所有 parent 中最大代数加 1。用于 log 排序和祖先判断剪枝。
     pub generation: u64,
+}
+
+impl ChangesetRecord {
+    pub fn first_parent(&self) -> Option<ObjectId> {
+        self.parents.first().copied()
+    }
 }
 
 /// 对象索引中的一条记录。

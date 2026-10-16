@@ -104,7 +104,7 @@ impl WriteSvc {
         let rec = ChangesetRecord {
             id: cs_id,
             root_tree: built.root,
-            first_parent: cs.first_parent().copied(),
+            parents: cs.parents.clone(),
             generation: generation.saturating_add(1),
         };
         self.meta.put_changeset(repo, &rec).await.map_err(status::from_store)?;
@@ -532,7 +532,7 @@ pub(crate) mod tests {
             .await
             .expect("root");
         assert_eq!(root.generation, 1);
-        assert_eq!(root.first_parent, None);
+        assert_eq!(root.first_parent(), None);
         // 提交对象和新目录树都已登记，可被 GetObjects 读到
         assert_eq!(
             store.missing_objects(REPO, &[root.id, root.root_tree]).await,
@@ -546,9 +546,9 @@ pub(crate) mod tests {
             .await
             .expect("child");
         assert_eq!(child.generation, 2);
-        assert_eq!(child.first_parent, Some(root.id));
+        assert_eq!(child.first_parent(), Some(root.id));
         assert_eq!(child.root_tree, scion_object::Tree::default().id());
-        assert_eq!(store.get_changeset(REPO, &child.id).await, Ok(Some(child)));
+        assert_eq!(store.get_changeset(REPO, &child.id).await, Ok(Some(child.clone())));
         // 幂等：同样的内容再次创建得到同样的结果
         let again = w
             .create(
@@ -612,6 +612,7 @@ pub(crate) mod tests {
             .expect("c");
         let m = w.create(REPO, &cs(&[c.id, b.id], vec![])).await.expect("merge");
         assert_eq!(m.generation, 3);
-        assert_eq!(m.first_parent, Some(c.id));
+        assert_eq!(m.first_parent(), Some(c.id));
+        assert_eq!(m.parents, vec![c.id, b.id]);
     }
 }

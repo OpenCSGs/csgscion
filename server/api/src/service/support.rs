@@ -76,12 +76,12 @@ mod tests {
         let rec = ChangesetRecord {
             id: cs(1),
             root_tree: tree,
-            first_parent: None,
+            parents: vec![],
             generation: 1,
         };
         s.put_changeset("r", &rec).await.expect("put");
         s.cas_ref("r", "main", RefExpect::Absent, cs(1)).await.expect("ref");
-        assert_eq!(resolve_revision(&s, "r", "main").await.ok(), Some(rec));
+        assert_eq!(resolve_revision(&s, "r", "main").await.ok(), Some(rec.clone()));
         assert_eq!(resolve_revision(&s, "r", &cs(1).to_string()).await.ok(), Some(rec));
         let code = |r: Result<ChangesetRecord, Status>| r.map_err(|s| s.code()).err();
         assert_eq!(code(resolve_revision(&s, "r", "nope").await), Some(Code::NotFound));
