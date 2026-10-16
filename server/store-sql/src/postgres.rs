@@ -285,6 +285,37 @@ impl MetaStore for PgMetaStore {
         .transpose()
     }
 
+    async fn get_derived(&self, repo: &str, kind: &str, version: u32, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let repo_id = self.repo_id(repo).await?;
+        sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT value FROM derived WHERE repo_id = $1 AND kind = $2 AND version = $3 AND key = $4",
+        )
+        .bind(repo_id)
+        .bind(kind)
+        .bind(i64::from(version))
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| backend("get derived", e))
+    }
+
+    async fn put_derived(&self, repo: &str, kind: &str, version: u32, key: &[u8], value: &[u8]) -> Result<()> {
+        let repo_id = self.repo_id(repo).await?;
+        sqlx::query(
+            "INSERT INTO derived (repo_id, kind, version, key, value) VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (repo_id, kind, version, key) DO NOTHING",
+        )
+        .bind(repo_id)
+        .bind(kind)
+        .bind(i64::from(version))
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| backend("put derived", e))?;
+        Ok(())
+    }
+
     async fn list_refs(&self, repo: &str) -> Result<Vec<(String, RefState)>> {
         let repo_id = self.repo_id(repo).await?;
         let rows =
@@ -391,6 +422,12 @@ mod tests {
     async fn conformance_changesets_and_refs() {
         let s = pg_or_skip!();
         testsuite::changesets_and_refs(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_derived() {
+        let s = pg_or_skip!();
+        testsuite::derived(&s).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

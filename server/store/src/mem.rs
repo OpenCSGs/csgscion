@@ -16,6 +16,7 @@ struct RepoData {
     refs: HashMap<String, RefState>,
     objects: HashMap<ObjectId, u64>,
     changesets: HashMap<ObjectId, ChangesetRecord>,
+    derived: HashMap<(String, u32, Vec<u8>), Vec<u8>>,
 }
 
 #[derive(Default)]
@@ -154,6 +155,23 @@ impl MetaStore for MemStore {
         Ok(repo_ref(&inner, repo)?.changesets.get(id).cloned())
     }
 
+    async fn get_derived(&self, repo: &str, kind: &str, version: u32, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let inner = self.read()?;
+        Ok(repo_ref(&inner, repo)?
+            .derived
+            .get(&(kind.to_owned(), version, key.to_vec()))
+            .cloned())
+    }
+
+    async fn put_derived(&self, repo: &str, kind: &str, version: u32, key: &[u8], value: &[u8]) -> Result<()> {
+        let mut inner = self.write()?;
+        repo_mut(&mut inner, repo)?
+            .derived
+            .entry((kind.to_owned(), version, key.to_vec()))
+            .or_insert_with(|| value.to_vec());
+        Ok(())
+    }
+
     async fn list_refs(&self, repo: &str) -> Result<Vec<(String, RefState)>> {
         let inner = self.read()?;
         let mut refs: Vec<_> = repo_ref(&inner, repo)?
@@ -205,6 +223,11 @@ mod tests {
     #[tokio::test]
     async fn conformance_changesets_and_refs() {
         testsuite::changesets_and_refs(&MemStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_derived() {
+        testsuite::derived(&MemStore::new()).await;
     }
 
     #[tokio::test]

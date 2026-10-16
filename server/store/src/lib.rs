@@ -74,6 +74,13 @@ pub trait MetaStore: Send + Sync + 'static {
 
     /// 按名字字节序列出仓库的全部 ref。
     async fn list_refs(&self, repo: &str) -> Result<Vec<(String, RefState)>>;
+
+    /// 读取派生数据（服务端设计文档 §8）。`kind` 区分种类，`version` 为派生算法版本：
+    /// 算法变化时提升版本，旧值自然失效，提交 id 不受影响。
+    async fn get_derived(&self, repo: &str, kind: &str, version: u32, key: &[u8]) -> Result<Option<Vec<u8>>>;
+
+    /// 写入派生数据。派生值由输入唯一决定，重复写入保留第一次的值。
+    async fn put_derived(&self, repo: &str, kind: &str, version: u32, key: &[u8], value: &[u8]) -> Result<()>;
 }
 
 /// 已创建 changeset 的元数据。

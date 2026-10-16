@@ -293,6 +293,37 @@ impl MetaStore for SqliteMetaStore {
         .transpose()
     }
 
+    async fn get_derived(&self, repo: &str, kind: &str, version: u32, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let repo_id = self.repo_id(repo).await?;
+        sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT value FROM derived WHERE repo_id = ? AND kind = ? AND version = ? AND key = ?",
+        )
+        .bind(repo_id)
+        .bind(kind)
+        .bind(i64::from(version))
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| backend("get derived", e))
+    }
+
+    async fn put_derived(&self, repo: &str, kind: &str, version: u32, key: &[u8], value: &[u8]) -> Result<()> {
+        let repo_id = self.repo_id(repo).await?;
+        sqlx::query(
+            "INSERT INTO derived (repo_id, kind, version, key, value) VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT (repo_id, kind, version, key) DO NOTHING",
+        )
+        .bind(repo_id)
+        .bind(kind)
+        .bind(i64::from(version))
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| backend("put derived", e))?;
+        Ok(())
+    }
+
     async fn list_refs(&self, repo: &str) -> Result<Vec<(String, RefState)>> {
         let repo_id = self.repo_id(repo).await?;
         let rows =
@@ -376,6 +407,12 @@ mod tests {
     async fn conformance_changesets_and_refs() {
         let (_dir, s) = fresh().await;
         testsuite::changesets_and_refs(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_derived() {
+        let (_dir, s) = fresh().await;
+        testsuite::derived(&s).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -528,6 +565,18 @@ mod tests {
         assert!(matches!(s.get_changeset("r", &id).await, Err(Error::Backend(_))));
         s.pool.close().await;
         assert!(matches!(s.list_refs("r").await, Err(Error::Backend(_))));
+    }
+
+    #[tokio::test]
+    async fn derived_backend_errors() {
+        let (_dir, s) = fresh().await;
+        s.create_repo("r").await.expect("create");
+        sqlx::query("DROP TABLE derived").execute(&s.pool).await.expect("drop");
+        assert!(matches!(s.get_derived("r", "k", 1, b"x").await, Err(Error::Backend(_))));
+        assert!(matches!(
+            s.put_derived("r", "k", 1, b"x", b"v").await,
+            Err(Error::Backend(_))
+        ));
     }
 
     #[tokio::test]

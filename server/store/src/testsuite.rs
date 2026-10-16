@@ -232,6 +232,37 @@ pub async fn changesets_and_refs<S: MetaStore + ?Sized>(s: &S) {
     assert!(matches!(s.list_refs("nope").await, Err(Error::RepoNotFound(_))));
 }
 
+/// 派生数据：按 (kind, version, key) 存取，幂等，仓库隔离。
+pub async fn derived<S: MetaStore + ?Sized>(s: &S) {
+    s.create_repo("der/a").await.expect("create");
+    s.create_repo("der/b").await.expect("create");
+    let big = vec![7u8; 100_000];
+    assert_eq!(s.get_derived("der/a", "blame", 1, b"k").await, Ok(None));
+    s.put_derived("der/a", "blame", 1, b"k", b"v1").await.expect("put");
+    s.put_derived("der/a", "blame", 1, b"k", b"other")
+        .await
+        .expect("idempotent");
+    assert_eq!(s.get_derived("der/a", "blame", 1, b"k").await, Ok(Some(b"v1".to_vec())));
+    // 版本、种类、键都参与区分
+    assert_eq!(s.get_derived("der/a", "blame", 2, b"k").await, Ok(None));
+    assert_eq!(s.get_derived("der/a", "other", 1, b"k").await, Ok(None));
+    assert_eq!(s.get_derived("der/a", "blame", 1, b"k2").await, Ok(None));
+    assert_eq!(s.get_derived("der/b", "blame", 1, b"k").await, Ok(None));
+    // 空键、空值、大值、二进制键
+    s.put_derived("der/a", "x", 1, b"", b"").await.expect("empty");
+    assert_eq!(s.get_derived("der/a", "x", 1, b"").await, Ok(Some(vec![])));
+    s.put_derived("der/a", "x", 1, &[0, 255, 0], &big).await.expect("big");
+    assert_eq!(s.get_derived("der/a", "x", 1, &[0, 255, 0]).await, Ok(Some(big)));
+    assert!(matches!(
+        s.get_derived("nope", "x", 1, b"k").await,
+        Err(Error::RepoNotFound(_))
+    ));
+    assert!(matches!(
+        s.put_derived("nope", "x", 1, b"k", b"v").await,
+        Err(Error::RepoNotFound(_))
+    ));
+}
+
 /// 并发 CAS：同一版本上的多个竞争者恰好只有一个成功，且版本严格连续。
 pub async fn concurrent_cas<S: MetaStore>(s: Arc<S>) {
     const WRITERS: u8 = 16;
