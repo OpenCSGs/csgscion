@@ -603,7 +603,12 @@ SDK、工作副本、daemon 和 CLI 的完整设计见 [`rust-client-architectur
 > - **第一父提交链跳表**：提交记录带 `fp_depth` 与 `fp_jump`（Myers skew-binary 单指针跳表），O(log n) 找到链上任意深度的祖先；`is_ancestor` 先走这条快速路径，blame 用它判断候选是否在链上。
 > - **提交记录缓存**：记录不可变，服务端用 `CachedMeta` 在进程内缓存并在启动时后台预热（10 万条约 0.5 秒）；遍历历史时按代数批量预取，缓存未命中也不会逐条查库。
 > - **blame 缓存**：派生数据只存最终版本和每 32 个版本一个检查点，再次 blame 只算增量；沿第一父提交链追溯，经由合并进来的改动归到合并提交。
-> - **基准**（`server/query/tests/bench.rs`，10 万提交、SQLite 元数据、对象在内存）：log、diff、ancestry、merge-base、blame 的 p99 均低于 20 ms。对象放在 S3 时 blame / diff 的读对象开销由 M4 的缓存层解决。
+> - **blame 缓存查询批量化**：最新版本单独查一次（重复查询的常见情况），其余版本每 64 个一次 `get_derived_many`，避免远端数据库上逐版本往返。
+> - **GitSha 索引**：导入的提交带扩展字段 `git.sha1`，创建提交时写入派生数据 `git-sha1`；`ResolveRevision` 依次按提交 id、ref、git sha 解析，`GetDerived` 可查询 git sha 与代数。
+> - **查询 RPC**：Log、IsAncestor、MergeBase、Diff（服务端流，每批 500 个条目）、Blame、ResolveRevision、Stat、GetDerived，均在 `GetServerInfo` 中以特性声明。
+> - **旧数据补建**：`scion admin reindex [--repo NAME]` 为迁移前写入的提交补齐跳表指针、PathHistory 与 GitSha，可重复执行。
+> - **基准**（`server/query/tests/bench.rs`，10 万提交、对象在内存）：SQLite 与 PostgreSQL 元数据下，log、diff、ancestry、merge-base、blame 的 p99 均低于 20 ms（PostgreSQL：冷 blame p99 13.6 ms，log --path p99 15.6 ms）。对象放在 S3 时 blame / diff 的读对象开销由 M4 的缓存层解决。
+> - **推迟到后续里程碑**：通用 Deriver 框架与独立的 deriver 进程（M3/M4）；PathIndex。blame 只沿第一父提交链追溯，按路径过滤的 log 不跟踪重命名。
 | **M2 派生与查询** | 3 周 | 派生框架、Gen/SkipList/PathHistory/Blame、Log/Blame/Diff/MergeBase、deriver 进程 | 在 10 万提交的仓库上，查询 p99 小于 100 毫秒 |
 | **M3 高并发** | 3 周 | LandCoordinator 批处理和租约、幂等表、限流与过载丢弃、lincheck | 单 ref 每秒 200 次以上 land；leader 被杀时没有重复或丢失的合入 |
 | **M4 缓存层** | 3 周 | `scion cache`(foyer + rendezvous + singleflight + 对冲)、WatchRefs、预热 | L2 命中率不低于 99%；单节点 20 万对象读/秒以上 |

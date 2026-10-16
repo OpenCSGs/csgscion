@@ -20,7 +20,7 @@ A server-first source control system: history, merges and rebases are computed o
 
 ## Status
 
-**M1 (minimal end-to-end loop) is complete**: write path, Lite mode, the `scn` working copy, and git import. Next is M2: derived data and queries (log / blame / diff).
+**M2 (derived data and queries) is complete**: log, blame, diff, merge-base, ancestry and revision resolution (by changeset id, ref or imported git sha), backed by a path-history index and a first-parent skip list. On a 100k-commit repository every query has p99 under 20 ms with both SQLite and PostgreSQL. M1 delivered the write path, Lite mode, the `scn` working copy and git import. Next is M3: server-side rebase and merge.
 
 ## Quick start
 
@@ -52,6 +52,9 @@ scn blame src/lib.rs                # the commit that last changed each line
 # Import an existing git repository with its history, authors and timestamps
 # (see docs/guide/git-import.md)
 scn import git ~/src/my-repo --repo mono
+
+# After upgrading a server that already has data: backfill derived indexes (idempotent)
+cargo run -p scion -- admin reindex --lite --data-dir ./.scion-data
 ```
 
 ## Repository layout
@@ -70,6 +73,7 @@ server/              server side (may depend on common and lower server crates)
   store-sql/         scion-store-sql   SQLite / PostgreSQL metadata store
   store-blob/        scion-store-blob  local directory / S3-compatible object store
   tree/              scion-tree        incremental tree building
+  query/             scion-query       history queries (log / diff / blame / merge-base) and reindexing
   api/               scion-api         gRPC services and server bootstrap
   scion/             scion             server binary (scion server --lite / --meta / --blobs)
 

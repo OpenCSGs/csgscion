@@ -18,7 +18,7 @@
 - 对象格式规范：[`SPEC.md`](SPEC.md)，golden 测试向量在 [`testdata/vectors/`](testdata/vectors/)
 - 协议：[`proto/scion/v1/`](proto/scion/v1/)
 
-当前进度：**M1 最小闭环**已完成（写入路径、Lite 模式、`scn` 工作副本、git 导入）。下一步 M2：派生数据与查询（log / blame / diff）。
+当前进度：**M2 派生数据与查询**已完成：log、blame、diff、merge-base、祖先判断和版本解析（提交 id、ref 或导入的 git sha），由 PathHistory 索引和第一父提交链跳表支撑。10 万提交的仓库上，SQLite 与 PostgreSQL 下所有查询 p99 均低于 20 ms。M1 已完成写入路径、Lite 模式、`scn` 工作副本和 git 导入。下一步 M3：服务端 rebase 与合并。
 
 ## 目录结构
 
@@ -36,6 +36,7 @@ server/              服务端（可依赖 common 与更低层的 server crate�
   store-sql/         scion-store-sql   SQLite / PostgreSQL 元数据存储
   store-blob/        scion-store-blob  本地目录 / S3 兼容对象存储
   tree/              scion-tree        增量建树
+  query/             scion-query       历史查询（log / diff / blame / merge-base）与重建索引
   api/               scion-api         gRPC 服务实现与启动入口
   scion/             scion             服务端二进制（scion server --lite / --meta / --blobs）
 
@@ -82,6 +83,9 @@ scn blame src/lib.rs                # 每一行最后被哪个提交改动
 
 # 导入已有的 git 仓库（保留全部历史、作者与时间），详见 docs/guide/git-import.md
 scn import git ~/src/my-repo --repo mono
+
+# 升级已有数据的服务端后：补建派生索引（可重复执行）
+cargo run -p scion -- admin reindex --lite --data-dir ./.scion-data
 ```
 
 ## 开发
