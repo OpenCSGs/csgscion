@@ -39,6 +39,9 @@ pub mod features {
     pub const QUERY_ANCESTRY: &str = "query.ancestry";
     pub const QUERY_DIFF: &str = "query.diff";
     pub const QUERY_BLAME: &str = "query.blame";
+    pub const QUERY_RESOLVE: &str = "query.resolve_revision";
+    pub const QUERY_STAT: &str = "query.stat";
+    pub const QUERY_DERIVED: &str = "query.derived";
 }
 
 #[cfg(test)]

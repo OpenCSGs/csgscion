@@ -17,10 +17,16 @@ service QueryService {
   rpc IsAncestor(IsAncestorRequest) returns (IsAncestorResponse);
   // 最佳公共祖先（互不为祖先），按代数从高到低。
   rpc MergeBase(MergeBaseRequest) returns (MergeBaseResponse);
-  // 两个版本之间的文件级差异。
-  rpc Diff(DiffRequest) returns (DiffResponse);
+  // 两个版本之间的文件级差异，按路径排序分批流式返回。
+  rpc Diff(DiffRequest) returns (stream DiffResponse);
   // 文件每一行最后被改动的提交。沿第一父提交链追溯：经由合并进来的改动归到合并提交上。
   rpc Blame(BlameRequest) returns (BlameResponse);
+  // 把 revision（ref 名、提交 id 文本或 40 位 git sha）解析为提交。
+  rpc ResolveRevision(ResolveRevisionRequest) returns (ResolveRevisionResponse);
+  // 单个路径的条目；path 为空时返回根目录。
+  rpc Stat(StatRequest) returns (StatResponse);
+  // 按种类读取派生数据（公开的结构化格式，不暴露内部存储格式）。
+  rpc GetDerived(GetDerivedRequest) returns (GetDerivedResponse);
 }
 
 message ReadFileRequest {
@@ -117,8 +123,8 @@ message FileDiff {
   TreeEntry new = 3;
 }
 
+// 一批文件差异；各批按路径首尾相接。
 message DiffResponse {
-  // 按路径排序。
   repeated FileDiff files = 1;
 }
 
@@ -149,4 +155,57 @@ message BlameResponse {
   repeated BlameCommit commits = 2;
   // 按行号排序、首尾相接，覆盖文件的全部行。
   repeated BlameRange ranges = 3;
+}
+
+message ResolveRevisionRequest {
+  string repo = 1;
+  string revision = 2;
+}
+
+message ResolveRevisionResponse {
+  bytes changeset_id = 1;
+  bytes root_tree = 2;
+  uint64 generation = 3;
+  repeated bytes parents = 4;
+}
+
+message StatRequest {
+  string repo = 1;
+  string revision = 2;
+  string path = 3;
+}
+
+message StatResponse {
+  bytes changeset_id = 1;
+  // 根目录时 name 为空、mode 为 TREE。
+  TreeEntry entry = 2;
+}
+
+enum DerivedKind {
+  DERIVED_KIND_UNSPECIFIED = 0;
+  // 提交对应的 git sha（仅从 git 导入的提交有）。
+  DERIVED_KIND_GIT_SHA1 = 1;
+  // 代数与第一父提交链深度。
+  DERIVED_KIND_GENERATION = 2;
+}
+
+message GetDerivedRequest {
+  string repo = 1;
+  string revision = 2;
+  DerivedKind kind = 3;
+}
+
+message Generation {
+  uint64 generation = 1;
+  // 0 表示未知（跳表建立之前写入的提交）。
+  uint64 first_parent_depth = 2;
+}
+
+message GetDerivedResponse {
+  bytes changeset_id = 1;
+  // 该提交没有这种派生数据时不设置（例如非 git 导入的提交没有 git sha）。
+  oneof value {
+    bytes git_sha1 = 2;
+    Generation generation = 3;
+  }
 }

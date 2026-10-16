@@ -3,8 +3,9 @@
 use bytes::Bytes;
 use scion_object::{ObjectId, ObjectKind, Signature};
 use scion_proto::v1::{
-    self, BlameRequest, BlameResponse, DiffRequest, DiffResponse, IsAncestorRequest, IsAncestorResponse, LogRequest,
-    LogResponse, MergeBaseRequest, MergeBaseResponse,
+    self, BlameRequest, BlameResponse, DerivedKind, DiffRequest, DiffResponse, GetDerivedRequest, GetDerivedResponse,
+    IsAncestorRequest, IsAncestorResponse, LogRequest, LogResponse, MergeBaseRequest, MergeBaseResponse,
+    ResolveRevisionRequest, ResolveRevisionResponse, StatRequest, StatResponse,
 };
 use scion_query::{LogEntry, QueryError};
 use scion_store::{BlobStore, MetaStore};
@@ -148,6 +149,88 @@ pub(crate) async fn diff(
                 new: d.new.as_ref().map(proto_entry),
             })
             .collect(),
+    })
+}
+
+/// Diff 流式返回时每批的文件数。
+pub(crate) const DIFF_BATCH: usize = 500;
+
+/// 把差异切成若干批；没有差异时也返回一批（空），让客户端收到明确的结束。
+pub(crate) fn diff_batches(resp: DiffResponse, batch: usize) -> Vec<DiffResponse> {
+    if resp.files.is_empty() {
+        return vec![resp];
+    }
+    resp.files
+        .chunks(batch.max(1))
+        .map(|c| DiffResponse { files: c.to_vec() })
+        .collect()
+}
+
+pub(crate) async fn resolve(
+    meta: &dyn MetaStore,
+    req: ResolveRevisionRequest,
+) -> Result<ResolveRevisionResponse, Status> {
+    let rec = resolve_revision(meta, &req.repo, &req.revision).await?;
+    Ok(ResolveRevisionResponse {
+        changeset_id: id_bytes(&rec.id),
+        root_tree: id_bytes(&rec.root_tree),
+        generation: rec.generation,
+        parents: rec.parents.iter().map(id_bytes).collect(),
+    })
+}
+
+pub(crate) async fn stat(
+    meta: &dyn MetaStore,
+    blobs: std::sync::Arc<dyn BlobStore>,
+    req: StatRequest,
+) -> Result<StatResponse, Status> {
+    check_path(&req.path)?;
+    let rec = resolve_revision(meta, &req.repo, &req.revision).await?;
+    let entry = if req.path.is_empty() {
+        scion_object::TreeEntry {
+            name: String::new(),
+            mode: scion_object::EntryMode::Tree,
+            id: rec.root_tree,
+            size: 0,
+        }
+    } else {
+        scion_tree::lookup(&BlobTreeSource(blobs), rec.root_tree, &req.path)
+            .await
+            .map_err(status::from_tree)?
+            .ok_or_else(|| status::path_not_found(&req.path))?
+    };
+    Ok(StatResponse {
+        changeset_id: id_bytes(&rec.id),
+        entry: Some(proto_entry(&entry)),
+    })
+}
+
+pub(crate) async fn get_derived(
+    meta: &dyn MetaStore,
+    blobs: &dyn BlobStore,
+    req: GetDerivedRequest,
+) -> Result<GetDerivedResponse, Status> {
+    let rec = resolve_revision(meta, &req.repo, &req.revision).await?;
+    let value = match DerivedKind::try_from(req.kind) {
+        Ok(DerivedKind::GitSha1) => {
+            let cs = scion_query::load_changeset(blobs, rec.id).await.map_err(from_query)?;
+            scion_query::git_sha_of(&cs)
+                .map(|sha| v1::get_derived_response::Value::GitSha1(Bytes::copy_from_slice(&sha)))
+        }
+        Ok(DerivedKind::Generation) => Some(v1::get_derived_response::Value::Generation(v1::Generation {
+            generation: rec.generation,
+            first_parent_depth: rec.fp_depth,
+        })),
+        _ => {
+            return Err(Status::invalid_argument(format!(
+                "unsupported derived kind {}",
+                req.kind
+            )));
+        }
+    };
+    Ok(GetDerivedResponse {
+        changeset_id: id_bytes(&rec.id),
+        value,
     })
 }
 
@@ -424,6 +507,146 @@ mod tests {
         assert_eq!(
             code(diff(store.as_ref(), blobs, req("", "a//b")).await),
             Err(Code::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn diff_batches_split_and_keep_empty() {
+        let f = |p: &str| v1::FileDiff {
+            path: p.into(),
+            old: None,
+            new: None,
+        };
+        let batches = diff_batches(
+            DiffResponse {
+                files: vec![f("a"), f("b"), f("c")],
+            },
+            2,
+        );
+        assert_eq!(batches.iter().map(|b| b.files.len()).collect::<Vec<_>>(), vec![2, 1]);
+        assert_eq!(diff_batches(DiffResponse { files: vec![] }, 2).len(), 1);
+        assert_eq!(
+            diff_batches(DiffResponse { files: vec![f("a")] }, 0).len(),
+            1,
+            "batch clamped to 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_stat_and_derived() {
+        let (store, [a, b, _c, _d]) = setup().await;
+        let blobs: Arc<dyn BlobStore> = store.clone();
+        let r = resolve(
+            store.as_ref(),
+            ResolveRevisionRequest {
+                repo: REPO.into(),
+                revision: "main".into(),
+            },
+        )
+        .await
+        .expect("resolve");
+        assert_eq!(r.generation, 3);
+        assert_eq!(r.parents.len(), 1);
+        let r = resolve(
+            store.as_ref(),
+            ResolveRevisionRequest {
+                repo: REPO.into(),
+                revision: a.id.to_string(),
+            },
+        )
+        .await
+        .expect("by id");
+        assert!(r.parents.is_empty());
+
+        let st = |path: &str| StatRequest {
+            repo: REPO.into(),
+            revision: "main".into(),
+            path: path.into(),
+        };
+        let root = stat(store.as_ref(), blobs.clone(), st(""))
+            .await
+            .expect("root")
+            .entry
+            .expect("entry");
+        assert_eq!((root.name.as_str(), root.mode()), ("", v1::EntryMode::Tree));
+        let file = stat(store.as_ref(), blobs.clone(), st("src/x.rs"))
+            .await
+            .expect("file")
+            .entry
+            .expect("entry");
+        assert_eq!((file.mode(), file.size), (v1::EntryMode::File, 1));
+        let code = |r: Result<StatResponse, Status>| r.map(|_| ()).map_err(|s| s.code());
+        assert_eq!(
+            code(stat(store.as_ref(), blobs.clone(), st("nope")).await),
+            Err(Code::NotFound)
+        );
+        assert_eq!(
+            code(stat(store.as_ref(), blobs.clone(), st("/bad")).await),
+            Err(Code::InvalidArgument)
+        );
+
+        let gd = |kind: DerivedKind, rev: &str| GetDerivedRequest {
+            repo: REPO.into(),
+            revision: rev.into(),
+            kind: kind.into(),
+        };
+        let g = get_derived(
+            store.as_ref(),
+            store.as_ref(),
+            gd(DerivedKind::Generation, &b.id.to_string()),
+        )
+        .await
+        .expect("gen");
+        assert_eq!(
+            g.value,
+            Some(v1::get_derived_response::Value::Generation(v1::Generation {
+                generation: 2,
+                first_parent_depth: 2
+            }))
+        );
+        let g = get_derived(store.as_ref(), store.as_ref(), gd(DerivedKind::GitSha1, "main"))
+            .await
+            .expect("sha");
+        assert_eq!(g.value, None, "not imported from git");
+        let r = get_derived(store.as_ref(), store.as_ref(), gd(DerivedKind::Unspecified, "main")).await;
+        assert_eq!(r.map(|_| ()).map_err(|s| s.code()), Err(Code::InvalidArgument));
+        let r = resolve(
+            store.as_ref(),
+            ResolveRevisionRequest {
+                repo: REPO.into(),
+                revision: "nope".into(),
+            },
+        )
+        .await;
+        assert_eq!(r.map(|_| ()).map_err(|s| s.code()), Err(Code::NotFound));
+    }
+
+    #[tokio::test]
+    async fn get_derived_git_sha_of_imported_commit() {
+        let (store, w) = svc().await;
+        let mut sp = spec(&[], vec![]);
+        sp.extensions
+            .insert(scion_query::GIT_SHA1_EXTENSION.into(), Bytes::from_static(&[0xab; 20]));
+        let cs = w
+            .create(REPO, &spec_to_changeset(sp, 10).expect("spec"))
+            .await
+            .expect("create");
+        let req = GetDerivedRequest {
+            repo: REPO.into(),
+            revision: hex::encode([0xab; 20]),
+            kind: DerivedKind::GitSha1.into(),
+        };
+        let g = get_derived(store.as_ref(), store.as_ref(), req).await.expect("derived");
+        assert_eq!(
+            ObjectId::from_bytes(&g.changeset_id).ok(),
+            Some(cs.id),
+            "resolved by git sha"
+        );
+        assert_eq!(
+            g.value,
+            Some(v1::get_derived_response::Value::GitSha1(Bytes::from_static(
+                &[0xab; 20]
+            )))
         );
     }
 

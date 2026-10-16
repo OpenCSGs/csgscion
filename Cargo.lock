@@ -2447,6 +2447,7 @@ name = "scion-client"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "hex",
  "scion-api",
  "scion-object",
  "scion-proto",

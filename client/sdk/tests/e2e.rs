@@ -387,6 +387,21 @@ async fn history_queries_end_to_end() {
     }
     assert_eq!(seen.len(), 4);
     assert_eq!(seen[0], m.id);
+    // 大量文件的 diff 分多批流式返回
+    let mut big = c.changeset(Some(m.id));
+    for i in 0..1203 {
+        big = big.put(format!("many/f{i:04}"), format!("{i}"));
+    }
+    let big = big.create().await.expect("many files");
+    let changes = c
+        .diff(Some(&m.id.to_string()), &big.id.to_string(), None)
+        .await
+        .expect("big diff");
+    assert_eq!(changes.len(), 1203);
+    assert!(
+        changes.windows(2).all(|w| w[0].path < w[1].path),
+        "batches arrive in path order"
+    );
     let first = c.log("main", None, 1, None).await.expect("log");
     assert_eq!(first.entries[0].parents, vec![b.id, d.id]);
     assert_eq!(first.entries[0].message, "merge");
@@ -421,6 +436,19 @@ async fn history_queries_end_to_end() {
     assert_eq!(blame.commits[0].summary, "merge");
     let err = c.blame("main", "nope").await.expect_err("missing path");
     assert_eq!(err.reason(), Some(ErrorReason::PathNotFound));
+    let rev = c.resolve_revision("main").await.expect("resolve");
+    assert_eq!((rev.id, rev.parents.clone()), (m.id, vec![b.id, d.id]));
+    assert_eq!(
+        c.stat("main", "").await.expect("root").mode,
+        scion_client::EntryMode::Tree
+    );
+    assert_eq!(c.stat("main", "src/x.rs").await.expect("file").size, 1);
+    assert_eq!(
+        c.stat("main", "nope").await.expect_err("missing").reason(),
+        Some(ErrorReason::PathNotFound)
+    );
+    assert_eq!(c.git_sha("main").await.expect("sha"), None);
+    assert_eq!(c.generation("main").await.expect("gen"), (3, 3));
     let err = c.diff(Some("nope"), "main", None).await.expect_err("bad revision");
     assert_eq!(err.reason(), Some(ErrorReason::RefNotFound));
 }

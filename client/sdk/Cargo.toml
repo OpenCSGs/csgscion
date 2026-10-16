@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 bytes.workspace = true
+hex.workspace = true
 scion-object.workspace = true
 scion-proto.workspace = true
 thiserror.workspace = true

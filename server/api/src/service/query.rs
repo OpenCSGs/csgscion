@@ -7,9 +7,10 @@ use bytes::Bytes;
 use scion_object::{EntryMode, ObjectId, TreeEntry};
 use scion_proto::v1::query_service_server::QueryService;
 use scion_proto::v1::{
-    self, BlameRequest, BlameResponse, DiffRequest, DiffResponse, IsAncestorRequest, IsAncestorResponse,
-    ListDirRequest, ListDirResponse, LogRequest, LogResponse, MergeBaseRequest, MergeBaseResponse, ReadFileRequest,
-    ReadFileResponse,
+    self, BlameRequest, BlameResponse, DiffRequest, DiffResponse, GetDerivedRequest, GetDerivedResponse,
+    IsAncestorRequest, IsAncestorResponse, ListDirRequest, ListDirResponse, LogRequest, LogResponse, MergeBaseRequest,
+    MergeBaseResponse, ReadFileRequest, ReadFileResponse, ResolveRevisionRequest, ResolveRevisionResponse, StatRequest,
+    StatResponse,
 };
 use scion_store::{BlobStore, MetaStore};
 use scion_tree::{BlobTreeSource, TreeSource, lookup};
@@ -22,6 +23,7 @@ use crate::service::support::resolve_revision;
 use crate::status;
 
 pub type ReadFileStream = Pin<Box<dyn Stream<Item = Result<ReadFileResponse, Status>> + Send>>;
+pub type DiffStream = Pin<Box<dyn Stream<Item = Result<DiffResponse, Status>> + Send>>;
 
 pub struct QuerySvc {
     config: Arc<ServerConfig>,
@@ -186,9 +188,32 @@ impl QueryService for QuerySvc {
         ))
     }
 
-    async fn diff(&self, request: Request<DiffRequest>) -> Result<Response<DiffResponse>, Status> {
+    type DiffStream = DiffStream;
+
+    async fn diff(&self, request: Request<DiffRequest>) -> Result<Response<Self::DiffStream>, Status> {
+        let resp = history::diff(self.meta.as_ref(), self.blobs.clone(), request.into_inner()).await?;
+        let batches = history::diff_batches(resp, history::DIFF_BATCH);
+        Ok(Response::new(Box::pin(tokio_stream::iter(batches.into_iter().map(Ok)))))
+    }
+
+    async fn resolve_revision(
+        &self,
+        request: Request<ResolveRevisionRequest>,
+    ) -> Result<Response<ResolveRevisionResponse>, Status> {
         Ok(Response::new(
-            history::diff(self.meta.as_ref(), self.blobs.clone(), request.into_inner()).await?,
+            history::resolve(self.meta.as_ref(), request.into_inner()).await?,
+        ))
+    }
+
+    async fn stat(&self, request: Request<StatRequest>) -> Result<Response<StatResponse>, Status> {
+        Ok(Response::new(
+            history::stat(self.meta.as_ref(), self.blobs.clone(), request.into_inner()).await?,
+        ))
+    }
+
+    async fn get_derived(&self, request: Request<GetDerivedRequest>) -> Result<Response<GetDerivedResponse>, Status> {
+        Ok(Response::new(
+            history::get_derived(self.meta.as_ref(), self.blobs.as_ref(), request.into_inner()).await?,
         ))
     }
 }

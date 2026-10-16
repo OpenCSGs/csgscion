@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use bytes::Bytes;
 use scion_object::ObjectId;
 use scion_proto::v1::{
-    self, BlameRequest, DiffRequest, IsAncestorRequest, LogRequest, MergeBaseRequest,
-    query_service_client::QueryServiceClient,
+    self, BlameRequest, DerivedKind, DiffRequest, GetDerivedRequest, IsAncestorRequest, LogRequest, MergeBaseRequest,
+    ResolveRevisionRequest, StatRequest, query_service_client::QueryServiceClient,
 };
 
 use crate::client::Client;
@@ -39,6 +39,15 @@ pub struct FileChangeInfo {
     pub path: String,
     pub old: Option<DirEntry>,
     pub new: Option<DirEntry>,
+}
+
+/// `resolve_revision` 的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Revision {
+    pub id: ObjectId,
+    pub root_tree: ObjectId,
+    pub generation: u64,
+    pub parents: Vec<ObjectId>,
 }
 
 /// Blame 中出现的一个提交。
@@ -188,6 +197,63 @@ impl Client {
         })
     }
 
+    /// 解析版本号：ref 名、提交 id 文本或 40 位 git sha。
+    pub async fn resolve_revision(&self, revision: &str) -> Result<Revision> {
+        let req = ResolveRevisionRequest {
+            repo: self.repo()?,
+            revision: revision.to_owned(),
+        };
+        let r = self.query().resolve_revision(self.request(req)?).await?.into_inner();
+        Ok(Revision {
+            id: id_from(&r.changeset_id, "changeset id")?,
+            root_tree: id_from(&r.root_tree, "root tree")?,
+            generation: r.generation,
+            parents: r
+                .parents
+                .iter()
+                .map(|p| id_from(p, "parent id"))
+                .collect::<Result<_>>()?,
+        })
+    }
+
+    /// 单个路径的条目；`path` 为空时返回根目录（名字为空、类型为目录）。
+    pub async fn stat(&self, revision: &str, path: &str) -> Result<DirEntry> {
+        let req = StatRequest {
+            repo: self.repo()?,
+            revision: revision.to_owned(),
+            path: path.to_owned(),
+        };
+        let r = self.query().stat(self.request(req)?).await?.into_inner();
+        entry(r.entry)?.ok_or_else(|| Error::Protocol("Stat returned no entry".into()))
+    }
+
+    /// 提交对应的 git sha（40 位十六进制）；不是从 git 导入的提交返回 None。
+    pub async fn git_sha(&self, revision: &str) -> Result<Option<String>> {
+        let req = GetDerivedRequest {
+            repo: self.repo()?,
+            revision: revision.to_owned(),
+            kind: DerivedKind::GitSha1.into(),
+        };
+        match self.query().get_derived(self.request(req)?).await?.into_inner().value {
+            Some(v1::get_derived_response::Value::GitSha1(sha)) => Ok(Some(hex::encode(sha))),
+            None => Ok(None),
+            Some(_) => Err(Error::Protocol("GetDerived returned another kind".into())),
+        }
+    }
+
+    /// 代数与第一父提交链深度（深度 0 表示未知）。
+    pub async fn generation(&self, revision: &str) -> Result<(u64, u64)> {
+        let req = GetDerivedRequest {
+            repo: self.repo()?,
+            revision: revision.to_owned(),
+            kind: DerivedKind::Generation.into(),
+        };
+        match self.query().get_derived(self.request(req)?).await?.into_inner().value {
+            Some(v1::get_derived_response::Value::Generation(g)) => Ok((g.generation, g.first_parent_depth)),
+            _ => Err(Error::Protocol("GetDerived returned no generation".into())),
+        }
+    }
+
     /// 两个版本之间的文件差异；`from` 为 None 时相对空树。
     pub async fn diff(&self, from: Option<&str>, to: &str, path: Option<&str>) -> Result<Vec<FileChangeInfo>> {
         let req = DiffRequest {
@@ -196,8 +262,12 @@ impl Client {
             to: to.to_owned(),
             path: path.unwrap_or_default().to_owned(),
         };
-        let resp = self.query().diff(self.request(req)?).await?.into_inner();
-        resp.files
+        let mut stream = self.query().diff(self.request(req)?).await?.into_inner();
+        let mut files = Vec::new();
+        while let Some(batch) = stream.message().await? {
+            files.extend(batch.files);
+        }
+        files
             .into_iter()
             .map(|f| {
                 Ok(FileChangeInfo {
