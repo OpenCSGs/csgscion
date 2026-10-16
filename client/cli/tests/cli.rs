@@ -343,6 +343,19 @@ async fn log_and_diff_commands() {
         assert_eq!(names, ["a.txt", "b.bin"]);
         let text = String::from_utf8_lossy(&scn_in(&wc, &["diff", &first_id, "main"]).stdout).to_string();
         assert!(text.contains("+three"), "{text}");
+        // blame：a.txt 第 1 行来自 first，第 2 行来自 second
+        let v = json_of(&scn_in(&wc, &["blame", "a.txt", "--json"]));
+        let commits: Vec<_> = v["lines"]
+            .as_array()
+            .expect("lines")
+            .iter()
+            .map(|l| l["commit"].as_str().expect("c").to_owned())
+            .collect();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0], first_id);
+        assert_ne!(commits[1], first_id);
+        let text = String::from_utf8_lossy(&scn_in(&wc, &["blame", "main:a.txt"]).stdout).to_string();
+        assert!(text.contains("| three"), "{text}");
         let out = scn_in(&wc, &["diff", "a", "b", "c"]);
         assert_eq!(out.status.code(), Some(2));
     })

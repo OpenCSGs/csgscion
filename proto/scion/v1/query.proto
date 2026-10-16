@@ -19,6 +19,8 @@ service QueryService {
   rpc MergeBase(MergeBaseRequest) returns (MergeBaseResponse);
   // 两个版本之间的文件级差异。
   rpc Diff(DiffRequest) returns (DiffResponse);
+  // 文件每一行最后被改动的提交。沿第一父提交链追溯：经由合并进来的改动归到合并提交上。
+  rpc Blame(BlameRequest) returns (BlameResponse);
 }
 
 message ReadFileRequest {
@@ -118,4 +120,33 @@ message FileDiff {
 message DiffResponse {
   // 按路径排序。
   repeated FileDiff files = 1;
+}
+
+message BlameRequest {
+  string repo = 1;
+  string revision = 2;
+  string path = 3;
+}
+
+message BlameCommit {
+  bytes changeset_id = 1;
+  Signature author = 2;
+  // 提交说明的第一行。
+  string summary = 3;
+}
+
+// 连续若干行归属同一个提交。
+message BlameRange {
+  // 从 1 开始。
+  uint32 start_line = 1;
+  uint32 line_count = 2;
+  // commits 中的下标。
+  uint32 commit_index = 3;
+}
+
+message BlameResponse {
+  bytes blob_id = 1;
+  repeated BlameCommit commits = 2;
+  // 按行号排序、首尾相接，覆盖文件的全部行。
+  repeated BlameRange ranges = 3;
 }

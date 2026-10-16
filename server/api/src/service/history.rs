@@ -3,8 +3,8 @@
 use bytes::Bytes;
 use scion_object::{ObjectId, ObjectKind, Signature};
 use scion_proto::v1::{
-    self, DiffRequest, DiffResponse, IsAncestorRequest, IsAncestorResponse, LogRequest, LogResponse, MergeBaseRequest,
-    MergeBaseResponse,
+    self, BlameRequest, BlameResponse, DiffRequest, DiffResponse, IsAncestorRequest, IsAncestorResponse, LogRequest,
+    LogResponse, MergeBaseRequest, MergeBaseResponse,
 };
 use scion_query::{LogEntry, QueryError};
 use scion_store::{BlobStore, MetaStore};
@@ -47,6 +47,9 @@ pub(crate) fn from_query(e: QueryError) -> Status {
             Status::internal(format!("changeset {id} is missing or corrupt"))
         }
         QueryError::Store(e) => status::from_store(e),
+        QueryError::PathNotFound(p) => status::path_not_found(&p),
+        QueryError::NotAFile(p) => Status::failed_precondition(format!("{p:?} is a directory")),
+        QueryError::Tree(e) => status::from_tree(e),
     }
 }
 
@@ -148,6 +151,56 @@ pub(crate) async fn diff(
     })
 }
 
+pub(crate) async fn blame(
+    meta: &dyn MetaStore,
+    blobs: &dyn BlobStore,
+    req: BlameRequest,
+) -> Result<BlameResponse, Status> {
+    check_path(&req.path)?;
+    if req.path.is_empty() {
+        return Err(Status::invalid_argument("path is required"));
+    }
+    let cs = resolve_revision(meta, &req.repo, &req.revision).await?.id;
+    let res = scion_query::blame(meta, blobs, &req.repo, cs, &req.path)
+        .await
+        .map_err(from_query)?;
+
+    // 提交按首次出现的顺序编号；连续同一提交的行合并为一个区间
+    let mut commits: Vec<ObjectId> = Vec::new();
+    let mut ranges: Vec<v1::BlameRange> = Vec::new();
+    for (i, id) in res.lines.iter().enumerate() {
+        let idx = match commits.iter().position(|c| c == id) {
+            Some(p) => p,
+            None => {
+                commits.push(*id);
+                commits.len() - 1
+            }
+        } as u32;
+        match ranges.last_mut() {
+            Some(r) if r.commit_index == idx => r.line_count += 1,
+            _ => ranges.push(v1::BlameRange {
+                start_line: i as u32 + 1,
+                line_count: 1,
+                commit_index: idx,
+            }),
+        }
+    }
+    let mut out = Vec::with_capacity(commits.len());
+    for id in &commits {
+        let cs = scion_query::load_changeset(blobs, *id).await.map_err(from_query)?;
+        out.push(v1::BlameCommit {
+            changeset_id: id_bytes(id),
+            author: Some(proto_sig(&cs.author)),
+            summary: cs.message.lines().next().unwrap_or_default().to_owned(),
+        });
+    }
+    Ok(BlameResponse {
+        blob_id: id_bytes(&res.blob),
+        commits: out,
+        ranges,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,6 +229,15 @@ mod tests {
 
     #[test]
     fn from_query_maps_every_variant() {
+        assert_eq!(from_query(QueryError::PathNotFound("p".into())).code(), Code::NotFound);
+        assert_eq!(
+            from_query(QueryError::NotAFile("d".into())).code(),
+            Code::FailedPrecondition
+        );
+        assert_eq!(
+            from_query(QueryError::Tree(scion_tree::TreeError::Storage("x".into()))).code(),
+            Code::Unavailable
+        );
         assert_eq!(from_query(QueryError::NotFound(cs(1))).code(), Code::NotFound);
         assert_eq!(
             from_query(QueryError::Corrupt(cs(1), "x".into())).code(),
@@ -361,6 +423,48 @@ mod tests {
         );
         assert_eq!(
             code(diff(store.as_ref(), blobs, req("", "a//b")).await),
+            Err(Code::InvalidArgument)
+        );
+    }
+
+    #[tokio::test]
+    async fn blame_ranges_and_commits() {
+        let (store, w) = svc().await;
+        for c in [&b"a\nb\n"[..], b"a\nB\nc\n"] {
+            upload(&w, c).await;
+        }
+        let mk = |p: &[ObjectId], d| spec_to_changeset(spec(p, d), 10).expect("spec");
+        let one = w.create(REPO, &mk(&[], vec![put("f", b"a\nb\n")])).await.expect("one");
+        let two = w
+            .create(REPO, &mk(&[one.id], vec![put("f", b"a\nB\nc\n")]))
+            .await
+            .expect("two");
+        let req = |path: &str| BlameRequest {
+            repo: REPO.into(),
+            revision: two.id.to_string(),
+            path: path.into(),
+        };
+        let r = blame(store.as_ref(), store.as_ref(), req("f")).await.expect("blame");
+        assert_eq!(r.commits.len(), 2);
+        assert_eq!(ObjectId::from_bytes(&r.commits[0].changeset_id).ok(), Some(one.id));
+        assert_eq!(r.commits[0].summary, "m");
+        let ranges: Vec<_> = r
+            .ranges
+            .iter()
+            .map(|x| (x.start_line, x.line_count, x.commit_index))
+            .collect();
+        assert_eq!(ranges, vec![(1, 1, 0), (2, 2, 1)]);
+        let code = |r: Result<BlameResponse, Status>| r.map(|_| ()).map_err(|s| s.code());
+        assert_eq!(
+            code(blame(store.as_ref(), store.as_ref(), req("")).await),
+            Err(Code::InvalidArgument)
+        );
+        assert_eq!(
+            code(blame(store.as_ref(), store.as_ref(), req("nope")).await),
+            Err(Code::NotFound)
+        );
+        assert_eq!(
+            code(blame(store.as_ref(), store.as_ref(), req("/x")).await),
             Err(Code::InvalidArgument)
         );
     }

@@ -78,6 +78,7 @@ scn ls main:                        # 列目录；所有命令都支持 --json
 scn log --path src -n 10            # 历史，从新到旧，可按路径过滤
 scn diff                            # 本地未提交的改动（unified diff）
 scn diff main                       # main 最新提交引入的改动；`scn diff A B` 比较两个版本
+scn blame src/lib.rs                # 每一行最后被哪个提交改动
 
 # 导入已有的 git 仓库（保留全部历史、作者与时间），详见 docs/guide/git-import.md
 scn import git ~/src/my-repo --repo mono

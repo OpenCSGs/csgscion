@@ -5,7 +5,7 @@ use scion_client::{Client, FileChangeInfo, LogItem, ObjectId};
 use scion_wc::{Mode, WorkingCopy};
 use serde::Serialize;
 
-use crate::commands::{Ctx, query_client};
+use crate::commands::{Ctx, query_client, split_spec};
 use crate::output::{CliError, Render};
 
 /// Unix 毫秒 + 时区分钟 → `YYYY-MM-DD HH:MM +HHMM`（提交者所在时区的本地时间）。
@@ -120,6 +120,89 @@ pub async fn log(ctx: &Ctx, revision: Option<&str>, path: Option<&str>, limit: u
         revision,
         path: path.map(str::to_owned),
         entries,
+    })
+}
+
+// ---------- blame ----------
+
+#[derive(Debug, Serialize)]
+pub struct BlameLineOut {
+    pub line: usize,
+    pub commit: String,
+    pub author: String,
+    pub time_ms: i64,
+    pub tz_offset_minutes: i32,
+    pub content: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BlameOut {
+    pub schema: &'static str,
+    pub revision: String,
+    pub path: String,
+    pub lines: Vec<BlameLineOut>,
+}
+
+impl Render for BlameOut {
+    fn text(&self) -> String {
+        let width = self.lines.last().map_or(1, |l| l.line.to_string().len());
+        self.lines
+            .iter()
+            .map(|l| {
+                let date = &format_time(l.time_ms, l.tz_offset_minutes)[..10];
+                let author: String = l.author.chars().take(16).collect();
+                format!(
+                    "{} ({author:<16} {date}) {:>width$}| {}",
+                    &l.commit[..12],
+                    l.line,
+                    l.content
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// 按行切分，与服务端一致：保留换行符，末尾没有换行的最后一行也算一行。
+fn split_lines(data: &[u8]) -> Vec<&[u8]> {
+    data.split_inclusive(|b| *b == b'\n').collect()
+}
+
+pub async fn blame(ctx: &Ctx, spec: &str) -> Result<BlameOut, CliError> {
+    let (client, default_rev) = query_client(ctx).await?;
+    let (rev, path) = split_spec(spec, &default_rev);
+    let info = client.blame(rev, path).await?;
+    let data = client.get_object(&info.blob).await?;
+    let raw = split_lines(&data);
+    if raw.len() != info.lines.len() {
+        return Err(CliError::Client(scion_client::Error::Protocol(format!(
+            "blame covers {} lines but the file has {}",
+            info.lines.len(),
+            raw.len()
+        ))));
+    }
+    let lines = raw
+        .iter()
+        .zip(&info.lines)
+        .enumerate()
+        .map(|(i, (text, idx))| {
+            let c = &info.commits[*idx];
+            let content = String::from_utf8_lossy(text);
+            BlameLineOut {
+                line: i + 1,
+                commit: c.id.to_string(),
+                author: c.author.name.clone(),
+                time_ms: c.author.time_ms,
+                tz_offset_minutes: c.author.tz_offset_minutes,
+                content: content.trim_end_matches(['\n', '\r']).to_owned(),
+            }
+        })
+        .collect();
+    Ok(BlameOut {
+        schema: "scion.cli.blame/v1",
+        revision: rev.to_owned(),
+        path: path.to_owned(),
+        lines,
     })
 }
 
@@ -427,6 +510,37 @@ mod tests {
         assert!(t.contains("Binary files a/p and b/p differ"));
         let names = DiffOut { name_only: true, ..out };
         assert_eq!(names.text(), "A p\nD p\nM p\nM p");
+    }
+
+    #[test]
+    fn split_lines_matches_server() {
+        assert_eq!(split_lines(b"a\nb"), vec![&b"a\n"[..], b"b"]);
+        assert_eq!(split_lines(b"a\n"), vec![&b"a\n"[..]]);
+        assert!(split_lines(b"").is_empty());
+    }
+
+    #[test]
+    fn blame_render_text() {
+        let l = |n, author: &str| BlameLineOut {
+            line: n,
+            commit: "c1abcdefabcdef0".into(),
+            author: author.into(),
+            time_ms: 0,
+            tz_offset_minutes: 0,
+            content: "code".into(),
+        };
+        let out = BlameOut {
+            schema: "s",
+            revision: "main".into(),
+            path: "f".into(),
+            lines: vec![l(1, "Ada"), l(10, "A very long author name")],
+        };
+        let t = out.text();
+        assert!(
+            t.starts_with("c1abcdefabcd (Ada              1970-01-01)  1| code"),
+            "{t}"
+        );
+        assert!(t.contains("(A very long auth 1970-01-01) 10| code"), "{t}");
     }
 
     #[test]

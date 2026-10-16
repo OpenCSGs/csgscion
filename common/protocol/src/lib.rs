@@ -38,6 +38,7 @@ pub mod features {
     /// IsAncestor 与 MergeBase。
     pub const QUERY_ANCESTRY: &str = "query.ancestry";
     pub const QUERY_DIFF: &str = "query.diff";
+    pub const QUERY_BLAME: &str = "query.blame";
 }
 
 #[cfg(test)]

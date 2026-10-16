@@ -73,6 +73,8 @@ enum Command {
         #[arg(short = 'n', long = "max-count", default_value_t = 20)]
         max_count: usize,
     },
+    /// 逐行显示最后改动的提交：[REV:]PATH。
+    Blame { spec: String },
     /// 差异：不带参数为本地未提交的改动；一个 REV 为该提交引入的改动；两个 REV 为两者之间的差异。
     Diff {
         revisions: Vec<String>,
@@ -161,6 +163,7 @@ async fn run(cli: Cli) -> ExitCode {
             history::log(&ctx, revision.as_deref(), path.as_deref(), max_count).await,
             json,
         ),
+        Command::Blame { spec } => emit(history::blame(&ctx, &spec).await, json),
         Command::Diff {
             revisions,
             path,

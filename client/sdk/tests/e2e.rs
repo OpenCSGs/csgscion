@@ -415,6 +415,12 @@ async fn history_queries_end_to_end() {
     assert_eq!(paths, ["README", "other", "src/x.rs"]);
     assert!(changes[1].old.is_none() && changes[1].new.is_some());
     assert_eq!(c.diff(None, "main", Some("src")).await.expect("diff").len(), 1);
+    let blame = c.blame("main", "README").await.expect("blame");
+    assert_eq!(blame.lines.len(), 1);
+    assert_eq!(blame.commits[blame.lines[0]].id, m.id);
+    assert_eq!(blame.commits[0].summary, "merge");
+    let err = c.blame("main", "nope").await.expect_err("missing path");
+    assert_eq!(err.reason(), Some(ErrorReason::PathNotFound));
     let err = c.diff(Some("nope"), "main", None).await.expect_err("bad revision");
     assert_eq!(err.reason(), Some(ErrorReason::RefNotFound));
 }

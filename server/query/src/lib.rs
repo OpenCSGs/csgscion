@@ -178,7 +178,7 @@ fn touches(cs: &Changeset, path: &str) -> bool {
 }
 
 /// 读取并解码提交对象。
-async fn load_changeset(blobs: &dyn BlobStore, id: ObjectId) -> Result<Changeset> {
+pub async fn load_changeset(blobs: &dyn BlobStore, id: ObjectId) -> Result<Changeset> {
     let bytes = blobs
         .get(&id)
         .await?

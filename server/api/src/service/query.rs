@@ -7,8 +7,9 @@ use bytes::Bytes;
 use scion_object::{EntryMode, ObjectId, TreeEntry};
 use scion_proto::v1::query_service_server::QueryService;
 use scion_proto::v1::{
-    self, DiffRequest, DiffResponse, IsAncestorRequest, IsAncestorResponse, ListDirRequest, ListDirResponse,
-    LogRequest, LogResponse, MergeBaseRequest, MergeBaseResponse, ReadFileRequest, ReadFileResponse,
+    self, BlameRequest, BlameResponse, DiffRequest, DiffResponse, IsAncestorRequest, IsAncestorResponse,
+    ListDirRequest, ListDirResponse, LogRequest, LogResponse, MergeBaseRequest, MergeBaseResponse, ReadFileRequest,
+    ReadFileResponse,
 };
 use scion_store::{BlobStore, MetaStore};
 use scion_tree::{BlobTreeSource, TreeSource, lookup};
@@ -176,6 +177,12 @@ impl QueryService for QuerySvc {
     async fn merge_base(&self, request: Request<MergeBaseRequest>) -> Result<Response<MergeBaseResponse>, Status> {
         Ok(Response::new(
             history::merge_base(self.meta.as_ref(), request.into_inner()).await?,
+        ))
+    }
+
+    async fn blame(&self, request: Request<BlameRequest>) -> Result<Response<BlameResponse>, Status> {
+        Ok(Response::new(
+            history::blame(self.meta.as_ref(), self.blobs.as_ref(), request.into_inner()).await?,
         ))
     }
 

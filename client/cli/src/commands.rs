@@ -342,7 +342,7 @@ pub async fn import_git(ctx: &Ctx, git_dir: &Path, git_ref: &str, target_ref: &s
 // ---------- cat / ls（不需要工作副本） ----------
 
 /// 拆分 `rev:path`；没有 `:` 时整个视为路径，rev 用默认值。
-pub fn split_spec<'a>(spec: &'a str, default_rev: &'a str) -> (&'a str, &'a str) {
+pub(crate) fn split_spec<'a>(spec: &'a str, default_rev: &'a str) -> (&'a str, &'a str) {
     match spec.split_once(':') {
         Some((rev, path)) if !rev.is_empty() => (rev, path),
         Some((_, path)) => (default_rev, path),

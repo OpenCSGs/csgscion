@@ -32,6 +32,7 @@ impl ServerInfoSvc {
             features::QUERY_LOG,
             features::QUERY_ANCESTRY,
             features::QUERY_DIFF,
+            features::QUERY_BLAME,
         ]
         .map(String::from)
         .to_vec()

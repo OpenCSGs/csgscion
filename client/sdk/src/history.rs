@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 use bytes::Bytes;
 use scion_object::ObjectId;
 use scion_proto::v1::{
-    self, DiffRequest, IsAncestorRequest, LogRequest, MergeBaseRequest, query_service_client::QueryServiceClient,
+    self, BlameRequest, DiffRequest, IsAncestorRequest, LogRequest, MergeBaseRequest,
+    query_service_client::QueryServiceClient,
 };
 
 use crate::client::Client;
@@ -38,6 +39,35 @@ pub struct FileChangeInfo {
     pub path: String,
     pub old: Option<DirEntry>,
     pub new: Option<DirEntry>,
+}
+
+/// Blame 中出现的一个提交。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlameCommitInfo {
+    pub id: ObjectId,
+    pub author: Signature,
+    pub summary: String,
+}
+
+/// 逐行归属：`lines[i]` 是第 i 行（从 0 开始）在 `commits` 中的下标。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlameInfo {
+    pub blob: ObjectId,
+    pub commits: Vec<BlameCommitInfo>,
+    pub lines: Vec<usize>,
+}
+
+/// 把区间展开为逐行下标，并校验区间首尾相接、下标有效。
+fn expand(ranges: &[v1::BlameRange], commits: usize) -> Result<Vec<usize>> {
+    let mut lines = Vec::new();
+    for r in ranges {
+        let idx = r.commit_index as usize;
+        if r.start_line as usize != lines.len() + 1 || idx >= commits {
+            return Err(Error::Protocol("malformed blame ranges".into()));
+        }
+        lines.extend(std::iter::repeat_n(idx, r.line_count as usize));
+    }
+    Ok(lines)
 }
 
 fn signature(s: Option<v1::Signature>) -> Result<Signature> {
@@ -131,6 +161,33 @@ impl Client {
         resp.bases.iter().map(|b| id_from(b, "merge base")).collect()
     }
 
+    /// 文件每一行最后被改动的提交（沿第一父提交链追溯）。
+    pub async fn blame(&self, revision: &str, path: &str) -> Result<BlameInfo> {
+        let req = BlameRequest {
+            repo: self.repo()?,
+            revision: revision.to_owned(),
+            path: path.to_owned(),
+        };
+        let resp = self.query().blame(self.request(req)?).await?.into_inner();
+        let commits = resp
+            .commits
+            .into_iter()
+            .map(|c| {
+                Ok(BlameCommitInfo {
+                    id: id_from(&c.changeset_id, "changeset id")?,
+                    author: signature(c.author)?,
+                    summary: c.summary,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let lines = expand(&resp.ranges, commits.len())?;
+        Ok(BlameInfo {
+            blob: id_from(&resp.blob_id, "blob id")?,
+            commits,
+            lines,
+        })
+    }
+
     /// 两个版本之间的文件差异；`from` 为 None 时相对空树。
     pub async fn diff(&self, from: Option<&str>, to: &str, path: Option<&str>) -> Result<Vec<FileChangeInfo>> {
         let req = DiffRequest {
@@ -207,6 +264,19 @@ mod tests {
             }),
             Err(Error::Protocol(_))
         ));
+    }
+
+    #[test]
+    fn expand_validates_ranges() {
+        let r = |start, count, idx| v1::BlameRange {
+            start_line: start,
+            line_count: count,
+            commit_index: idx,
+        };
+        assert_eq!(expand(&[r(1, 2, 0), r(3, 1, 1)], 2).expect("ok"), vec![0, 0, 1]);
+        assert_eq!(expand(&[], 0).expect("empty"), Vec::<usize>::new());
+        assert!(matches!(expand(&[r(2, 1, 0)], 1), Err(Error::Protocol(_))), "gap");
+        assert!(matches!(expand(&[r(1, 1, 3)], 1), Err(Error::Protocol(_))), "bad index");
     }
 
     #[test]

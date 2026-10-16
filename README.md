@@ -47,6 +47,7 @@ scn ls main:                        # list a directory; every command supports -
 scn log --path src -n 10            # history, newest first, optionally limited to a path
 scn diff                            # uncommitted local changes (unified diff)
 scn diff main                       # what the tip of main changed; `scn diff A B` compares two revisions
+scn blame src/lib.rs                # the commit that last changed each line
 
 # Import an existing git repository with its history, authors and timestamps
 # (see docs/guide/git-import.md)
