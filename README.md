@@ -2,7 +2,13 @@
 
 服务端优先的源码管理系统：历史、合并、rebase 都在服务端完成，客户端始终在线、按需取数。协议与语言无关，官方提供 Rust 服务端 `scion` 和 Rust 客户端 `scn`。
 
-- 设计文档：[`docs/design/`](docs/design/)（[服务端](docs/design/rust-server-architecture.md) · [客户端](docs/design/rust-client-architecture.md) · [接入 starhub / CSGLite](docs/design/starhub-integration.md)）
+## 文档
+
+**使用指南**
+- [从 git 导入](docs/guide/git-import.md)：把已有的 git 仓库连同全部历史导入 Scion
+
+**设计与规范**
+- 设计文档：[服务端](docs/design/rust-server-architecture.md) · [客户端](docs/design/rust-client-architecture.md) · [接入 starhub / CSGLite](docs/design/starhub-integration.md)
 - 对象格式规范：[`SPEC.md`](SPEC.md)，golden 测试向量在 [`testdata/vectors/`](testdata/vectors/)
 - 协议：[`proto/scion/v1/`](proto/scion/v1/)
 
@@ -35,6 +41,7 @@ client/              客户端（只能依赖 common 与 client，禁止依赖 s
 
 xtask/               仓库维护任务（cargo xtask layers：依赖方向检查）
 deploy/dev/          本地开发依赖（SeaweedFS、PostgreSQL）
+docs/guide/          使用指南
 docs/design/         设计文档与架构图
 ```
 
@@ -63,7 +70,7 @@ scn sync                            # 拉取别人合入的改动；有未合入
 scn cat main:README.md              # 不需要工作副本也能读文件（工作副本外加 --repo）
 scn ls main:                        # 列目录；所有命令都支持 --json
 
-# 导入已有的 git 仓库（保留全部历史、作者与时间）
+# 导入已有的 git 仓库（保留全部历史、作者与时间），详见 docs/guide/git-import.md
 scn import git ~/src/my-repo --repo mono
 ```
 
