@@ -150,6 +150,16 @@ impl MetaStore for CachedMeta {
         self.inner.get_derived(repo, kind, version, key).await
     }
 
+    async fn get_derived_many(
+        &self,
+        repo: &str,
+        kind: &str,
+        version: u32,
+        keys: &[Vec<u8>],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        self.inner.get_derived_many(repo, kind, version, keys).await
+    }
+
     async fn put_derived(&self, repo: &str, kind: &str, version: u32, key: &[u8], value: &[u8]) -> Result<()> {
         self.inner.put_derived(repo, kind, version, key, value).await
     }

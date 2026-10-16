@@ -227,6 +227,8 @@ async fn versions_by_index(
     }
 
     let mut versions = Vec::new();
+    // versions[..probed] 已查过缓存
+    let mut probed = 0;
     let mut blob = blob;
     let mut idx = match next_on_chain(g, &candidates, 0, cs).await? {
         Some(Some(i)) => i,
@@ -238,23 +240,26 @@ async fn versions_by_index(
         if deleted {
             return Ok(None);
         }
-        if let Some(lines) = cached(meta, repo, &intro, path).await? {
-            versions.push((intro, blob));
-            return Ok(Some((versions, Some(lines))));
-        }
         versions.push((intro, blob));
+        // 最新版本单独查一次（重复查询的常见情况），之后每 PROBE_BATCH 个版本批量查一次：
+        // 远端数据库上逐版本查询的往返会主导冷启动耗时
+        if versions.len() - probed >= if probed == 0 { 1 } else { PROBE_BATCH } {
+            if let Some(lines) = probe(meta, repo, path, &mut versions, &mut probed).await? {
+                return Ok(Some((versions, Some(lines))));
+            }
+        }
         let Some(parent) = first_parent(g, intro).await? else {
-            return Ok(Some((versions, None)));
+            break;
         };
         let older = match next_on_chain(g, &candidates, idx + 1, parent).await? {
             Some(Some(i)) => i,
             // 链上更早没有改动：文件在 intro 之前不存在
-            Some(None) => return Ok(Some((versions, None))),
+            Some(None) => break,
             None => return Ok(None),
         };
         let (y, y_deleted) = candidates[older];
         if y_deleted {
-            return Ok(Some((versions, None)));
+            break;
         }
         match file_at(g, trees, y, path).await? {
             Some(b) => blob = b,
@@ -262,6 +267,37 @@ async fn versions_by_index(
         }
         idx = older;
     }
+    let base = probe(meta, repo, path, &mut versions, &mut probed).await?;
+    Ok(Some((versions, base)))
+}
+
+/// 每批查询缓存的版本数。
+const PROBE_BATCH: usize = 64;
+
+/// 批量查 `versions[probed..]`（新到旧）的缓存；命中时把更老的版本截掉并返回命中的结果。
+async fn probe(
+    meta: &dyn MetaStore,
+    repo: &str,
+    path: &str,
+    versions: &mut Vec<(ObjectId, ObjectId)>,
+    probed: &mut usize,
+) -> Result<Option<Vec<ObjectId>>> {
+    let keys: Vec<Vec<u8>> = versions[*probed..].iter().map(|(cs, _)| cache_key(cs, path)).collect();
+    if keys.is_empty() {
+        return Ok(None);
+    }
+    let found = meta.get_derived_many(repo, BLAME_KIND, BLAME_VERSION, &keys).await?;
+    // 缓存损坏（无法解码）时当作未命中
+    if let Some((i, lines)) = found
+        .iter()
+        .enumerate()
+        .find_map(|(i, raw)| raw.as_deref().and_then(decode).map(|l| (i, l)))
+    {
+        versions.truncate(*probed + i + 1);
+        return Ok(Some(lines));
+    }
+    *probed = versions.len();
+    Ok(None)
 }
 
 /// 不依赖索引：沿第一父提交链逐个比较目录树中的文件。
@@ -653,6 +689,28 @@ mod tests {
         // 中间版本：从检查点或最早版本重新计算，结果正确
         assert_eq!(r.blame(ids[20], "f").await.expect("blame").lines, ids[..21].to_vec());
         assert_eq!(r.blame(ids[35], "f").await.expect("blame").lines, ids[..36].to_vec());
+    }
+
+    /// 缓存批量探测：命中落在第二批或更后时，截断版本列表后结果仍正确。
+    #[tokio::test]
+    async fn checkpoint_found_in_later_probe_batch() {
+        let mut r = Repo::new().await;
+        let mut ids = Vec::new();
+        let mut content = String::new();
+        for i in 0..200 {
+            content.push_str(&format!("line {i}\n"));
+            let parents: Vec<_> = ids.last().copied().into_iter().collect();
+            ids.push(r.commit(&parents, &[("f", Some(content.as_str()))]).await);
+        }
+        assert_eq!(r.blame(ids[199], "f").await.expect("blame").lines, ids);
+        // ids[180] 往下：第一批只有自己，第二批 179..116 中命中检查点 160 与 128，取最新的 160
+        for at in [180, 129, 64, 0] {
+            assert_eq!(
+                r.blame(ids[at], "f").await.expect("blame").lines,
+                ids[..=at].to_vec(),
+                "at {at}"
+            );
+        }
     }
 
     /// 先写索引后写记录：中途崩溃留下的孤立索引行被忽略。

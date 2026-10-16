@@ -1,5 +1,6 @@
 //! Standard / Distributed 档：PostgreSQL，YugabyteDB（YSQL）走同一实现。
 
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -391,6 +392,38 @@ impl MetaStore for PgMetaStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| backend("get derived", e))
+    }
+
+    async fn get_derived_many(
+        &self,
+        repo: &str,
+        kind: &str,
+        version: u32,
+        keys: &[Vec<u8>],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        let repo_id = self.repo_id(repo).await?;
+        let mut found: HashMap<Vec<u8>, Vec<u8>> = HashMap::with_capacity(keys.len());
+        for chunk in keys.chunks(MAX_IDS_PER_QUERY) {
+            let mut qb = sqlx::QueryBuilder::<sqlx::Postgres>::new("SELECT key, value FROM derived WHERE repo_id = ");
+            qb.push_bind(repo_id)
+                .push(" AND kind = ")
+                .push_bind(kind)
+                .push(" AND version = ")
+                .push_bind(i64::from(version))
+                .push(" AND key IN (");
+            let mut sep = qb.separated(", ");
+            for key in chunk {
+                sep.push_bind(key.as_slice());
+            }
+            qb.push(")");
+            let rows: Vec<(Vec<u8>, Vec<u8>)> = qb
+                .build_query_as()
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| backend("get derived", e))?;
+            found.extend(rows);
+        }
+        Ok(keys.iter().map(|k| found.get(k).cloned()).collect())
     }
 
     async fn put_derived(&self, repo: &str, kind: &str, version: u32, key: &[u8], value: &[u8]) -> Result<()> {

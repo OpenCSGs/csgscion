@@ -259,6 +259,25 @@ pub async fn derived<S: MetaStore + ?Sized>(s: &S) {
     assert_eq!(s.get_derived("der/a", "x", 1, b"").await, Ok(Some(vec![])));
     s.put_derived("der/a", "x", 1, &[0, 255, 0], &big).await.expect("big");
     assert_eq!(s.get_derived("der/a", "x", 1, &[0, 255, 0]).await, Ok(Some(big)));
+    // 批量读取：顺序与输入一致，缺失为 None，重复键各自返回
+    let keys = vec![b"k2".to_vec(), b"k".to_vec(), vec![], b"k".to_vec()];
+    assert_eq!(
+        s.get_derived_many("der/a", "blame", 1, &keys).await,
+        Ok(vec![None, Some(b"v1".to_vec()), None, Some(b"v1".to_vec())])
+    );
+    assert_eq!(s.get_derived_many("der/a", "blame", 1, &[]).await, Ok(vec![]));
+    let many: Vec<Vec<u8>> = (0..2000u32).map(|i| i.to_be_bytes().to_vec()).collect();
+    for k in many.iter().step_by(7) {
+        s.put_derived("der/a", "many", 1, k, k).await.expect("put");
+    }
+    let got = s.get_derived_many("der/a", "many", 1, &many).await.expect("many");
+    for (i, (k, v)) in many.iter().zip(&got).enumerate() {
+        assert_eq!(v.as_ref(), (i % 7 == 0).then_some(k), "key {i}");
+    }
+    assert!(matches!(
+        s.get_derived_many("nope", "x", 1, &keys).await,
+        Err(Error::RepoNotFound(_))
+    ));
     assert!(matches!(
         s.get_derived("nope", "x", 1, b"k").await,
         Err(Error::RepoNotFound(_))

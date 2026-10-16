@@ -45,7 +45,8 @@ impl Rng {
 struct History {
     /// 对象字节（内存）。
     store: MemStore,
-    /// 提交记录：内存或 SQLite（SCION_BENCH_META=sqlite）。
+    /// 提交记录：内存、SQLite（SCION_BENCH_META=sqlite）或 PostgreSQL（SCION_BENCH_META=postgres，
+    /// 连接串取 SCION_BENCH_PG_URL）。
     meta: Box<dyn MetaStore>,
     /// 主线提交，按时间顺序。
     main: Vec<ObjectId>,
@@ -230,6 +231,11 @@ async fn history_queries_on_large_repo() {
         "sqlite" => {
             let url = format!("sqlite://{}", _dir.path().join("meta.db").display());
             Box::new(scion_store_sql::SqliteMetaStore::connect(&url).await.expect("sqlite"))
+        }
+        // 需要一个空数据库（仓库名固定为 bench）
+        "postgres" => {
+            let url = std::env::var("SCION_BENCH_PG_URL").expect("SCION_BENCH_PG_URL");
+            Box::new(scion_store_sql::PgMetaStore::connect(&url).await.expect("postgres"))
         }
         _ => Box::new(MemStore::new()),
     };

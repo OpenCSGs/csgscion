@@ -108,6 +108,21 @@ pub trait MetaStore: Send + Sync + 'static {
     /// 算法变化时提升版本，旧值自然失效，提交 id 不受影响。
     async fn get_derived(&self, repo: &str, kind: &str, version: u32, key: &[u8]) -> Result<Option<Vec<u8>>>;
 
+    /// 批量读取派生数据，结果与 `keys` 一一对应。远端数据库应覆盖默认实现，用一次往返完成。
+    async fn get_derived_many(
+        &self,
+        repo: &str,
+        kind: &str,
+        version: u32,
+        keys: &[Vec<u8>],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            out.push(self.get_derived(repo, kind, version, key).await?);
+        }
+        Ok(out)
+    }
+
     /// 写入派生数据。派生值由输入唯一决定，重复写入保留第一次的值。
     async fn put_derived(&self, repo: &str, kind: &str, version: u32, key: &[u8], value: &[u8]) -> Result<()>;
 }
