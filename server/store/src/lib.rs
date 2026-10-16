@@ -60,6 +60,26 @@ pub trait MetaStore: Send + Sync + 'static {
     /// 返回 `ids` 中**该仓库**索引里没有的对象，保持输入中的相对顺序，重复的 id 只返回一次。
     /// 对象字节全局只存一份，但仓库之间互相看不到对方有哪些对象。
     async fn missing_objects(&self, repo: &str, ids: &[ObjectId]) -> Result<Vec<ObjectId>>;
+
+    /// 记录一个已创建的 changeset 及其根目录树（服务端设计文档 §4.3 的 `cs_tree`）。
+    /// 幂等：同一 id 重复写入时保留第一次的记录（相同 changeset 建出的树必然相同）。
+    async fn put_changeset(&self, repo: &str, rec: &ChangesetRecord) -> Result<()>;
+
+    async fn get_changeset(&self, repo: &str, id: &ObjectId) -> Result<Option<ChangesetRecord>>;
+
+    /// 按名字字节序列出仓库的全部 ref。
+    async fn list_refs(&self, repo: &str) -> Result<Vec<(String, RefState)>>;
+}
+
+/// 已创建 changeset 的元数据。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChangesetRecord {
+    pub id: ObjectId,
+    /// 应用 delta 之后的根目录树。
+    pub root_tree: ObjectId,
+    pub first_parent: Option<ObjectId>,
+    /// 代数：根提交为 1，其余为所有 parent 中最大代数加 1。用于 log 排序和祖先判断剪枝。
+    pub generation: u64,
 }
 
 /// 对象索引中的一条记录。

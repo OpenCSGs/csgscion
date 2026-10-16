@@ -8,7 +8,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use scion_object::{ObjectId, ObjectKind};
 
-use crate::{BlobStore, Error, IndexedObject, MetaStore, RefExpect, RefState};
+use crate::{BlobStore, ChangesetRecord, Error, IndexedObject, MetaStore, RefExpect, RefState};
 
 fn cs(n: u8) -> ObjectId {
     ObjectId::hash(ObjectKind::Changeset, &[n])
@@ -154,6 +154,71 @@ pub async fn object_index<S: MetaStore + ?Sized>(s: &S) {
         s.missing_objects("nope", &[x.id]).await,
         Err(Error::RepoNotFound(_))
     ));
+}
+
+/// changeset 记录与 ref 列表的语义。
+pub async fn changesets_and_refs<S: MetaStore + ?Sized>(s: &S) {
+    s.create_repo("cs/a").await.expect("create");
+    s.create_repo("cs/b").await.expect("create");
+    let tree = ObjectId::hash(ObjectKind::Tree, b"t");
+    let root = ChangesetRecord {
+        id: cs(1),
+        root_tree: tree,
+        first_parent: None,
+        generation: 1,
+    };
+    let child = ChangesetRecord {
+        id: cs(2),
+        root_tree: tree,
+        first_parent: Some(cs(1)),
+        generation: u64::from(u32::MAX) + 7,
+    };
+
+    assert_eq!(s.get_changeset("cs/a", &cs(1)).await, Ok(None));
+    s.put_changeset("cs/a", &root).await.expect("put root");
+    s.put_changeset("cs/a", &child).await.expect("put child");
+    assert_eq!(s.get_changeset("cs/a", &cs(1)).await, Ok(Some(root)));
+    assert_eq!(s.get_changeset("cs/a", &cs(2)).await, Ok(Some(child)));
+    // 幂等：保留第一次写入
+    let other = ChangesetRecord {
+        root_tree: ObjectId::hash(ObjectKind::Tree, b"other"),
+        ..root
+    };
+    s.put_changeset("cs/a", &other).await.expect("idempotent put");
+    assert_eq!(s.get_changeset("cs/a", &cs(1)).await, Ok(Some(root)));
+    // 仓库隔离
+    assert_eq!(s.get_changeset("cs/b", &cs(1)).await, Ok(None));
+    assert!(matches!(
+        s.put_changeset("nope", &root).await,
+        Err(Error::RepoNotFound(_))
+    ));
+    assert!(matches!(
+        s.get_changeset("nope", &cs(1)).await,
+        Err(Error::RepoNotFound(_))
+    ));
+
+    // ref 列表：字节序
+    assert_eq!(s.list_refs("cs/a").await, Ok(vec![]));
+    for name in ["main", "Zeta", "feature/x"] {
+        s.cas_ref("cs/a", name, RefExpect::Absent, cs(1))
+            .await
+            .expect("create ref");
+    }
+    s.cas_ref("cs/a", "main", RefExpect::Version(1), cs(2))
+        .await
+        .expect("update");
+    let refs = s.list_refs("cs/a").await.expect("list");
+    let names: Vec<_> = refs.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["Zeta", "feature/x", "main"]);
+    assert_eq!(
+        refs[2].1,
+        RefState {
+            target: cs(2),
+            version: 2
+        }
+    );
+    assert_eq!(s.list_refs("cs/b").await, Ok(vec![]));
+    assert!(matches!(s.list_refs("nope").await, Err(Error::RepoNotFound(_))));
 }
 
 /// 并发 CAS：同一版本上的多个竞争者恰好只有一个成功，且版本严格连续。

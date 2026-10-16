@@ -8,6 +8,7 @@ members = [
     "server/store",
     "server/store-sql",
     "server/store-blob",
+    "server/tree",
     "server/api",
     "server/scion",
     # 客户端
@@ -29,6 +30,7 @@ scion-object = { path = "common/object" }
 scion-store = { path = "server/store" }
 scion-store-sql = { path = "server/store-sql" }
 scion-store-blob = { path = "server/store-blob" }
+scion-tree = { path = "server/tree" }
 scion-api = { path = "server/api" }
 scion-client = { path = "client/sdk" }
 

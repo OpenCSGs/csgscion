@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use scion_object::ObjectId;
-use scion_store::{Error, IndexedObject, MetaStore, RefExpect, RefState, Result, validate_repo_name};
+use scion_store::{ChangesetRecord, Error, IndexedObject, MetaStore, RefExpect, RefState, Result, validate_repo_name};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 
 use crate::common::{
@@ -221,6 +221,69 @@ impl MetaStore for PgMetaStore {
         }
         Ok(subtract_present(ids, &present))
     }
+
+    async fn put_changeset(&self, repo: &str, rec: &ChangesetRecord) -> Result<()> {
+        let repo_id = self.repo_id(repo).await?;
+        sqlx::query(
+            "INSERT INTO changesets (repo_id, cs_id, root_tree, first_parent, generation) \
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (repo_id, cs_id) DO NOTHING",
+        )
+        .bind(repo_id)
+        .bind(rec.id.to_bytes().to_vec())
+        .bind(rec.root_tree.to_bytes().to_vec())
+        .bind(rec.first_parent.map(|p| p.to_bytes().to_vec()))
+        .bind(version_to_db(rec.generation)?)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| backend("put changeset", e))?;
+        Ok(())
+    }
+
+    async fn get_changeset(&self, repo: &str, id: &ObjectId) -> Result<Option<ChangesetRecord>> {
+        let repo_id = self.repo_id(repo).await?;
+        let row = sqlx::query_as::<_, (Vec<u8>, Option<Vec<u8>>, i64)>(
+            "SELECT root_tree, first_parent, generation FROM changesets WHERE repo_id = $1 AND cs_id = $2",
+        )
+        .bind(repo_id)
+        .bind(id.to_bytes().to_vec())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| backend("get changeset", e))?;
+        row.map(|(root, parent, generation)| {
+            Ok(ChangesetRecord {
+                id: *id,
+                root_tree: id_from_db(&root)?,
+                first_parent: parent.as_deref().map(id_from_db).transpose()?,
+                generation: version_from_db(generation)?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn list_refs(&self, repo: &str) -> Result<Vec<(String, RefState)>> {
+        let repo_id = self.repo_id(repo).await?;
+        let rows =
+            sqlx::query_as::<_, (String, Vec<u8>, i64)>("SELECT name, target, version FROM refs WHERE repo_id = $1")
+                .bind(repo_id)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| backend("list refs", e))?;
+        let mut refs = rows
+            .into_iter()
+            .map(|(name, target, version)| {
+                Ok((
+                    name,
+                    RefState {
+                        target: id_from_db(&target)?,
+                        version: version_from_db(version)?,
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // 按字节序排序，不受数据库 collation 影响
+        refs.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        Ok(refs)
+    }
 }
 
 /// PG 测试：需要环境变量 `SCION_TEST_PG_URL`（CI 中由 PostgreSQL 服务容器提供）；
@@ -297,6 +360,12 @@ mod tests {
             size: u64::MAX,
         };
         assert!(matches!(s.index_objects("r", &[o]).await, Err(Error::Backend(_))));
+    }
+
+    #[tokio::test]
+    async fn conformance_changesets_and_refs() {
+        let s = pg_or_skip!();
+        testsuite::changesets_and_refs(&s).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

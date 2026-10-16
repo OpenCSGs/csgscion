@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use scion_object::ObjectId;
-use scion_store::{Error, IndexedObject, MetaStore, RefExpect, RefState, Result, validate_repo_name};
+use scion_store::{ChangesetRecord, Error, IndexedObject, MetaStore, RefExpect, RefState, Result, validate_repo_name};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous};
 
 use crate::common::{
@@ -230,6 +230,69 @@ impl MetaStore for SqliteMetaStore {
         }
         Ok(subtract_present(ids, &present))
     }
+
+    async fn put_changeset(&self, repo: &str, rec: &ChangesetRecord) -> Result<()> {
+        let repo_id = self.repo_id(repo).await?;
+        sqlx::query(
+            "INSERT INTO changesets (repo_id, cs_id, root_tree, first_parent, generation) \
+             VALUES (?, ?, ?, ?, ?) ON CONFLICT (repo_id, cs_id) DO NOTHING",
+        )
+        .bind(repo_id)
+        .bind(rec.id.to_bytes().to_vec())
+        .bind(rec.root_tree.to_bytes().to_vec())
+        .bind(rec.first_parent.map(|p| p.to_bytes().to_vec()))
+        .bind(version_to_db(rec.generation)?)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| backend("put changeset", e))?;
+        Ok(())
+    }
+
+    async fn get_changeset(&self, repo: &str, id: &ObjectId) -> Result<Option<ChangesetRecord>> {
+        let repo_id = self.repo_id(repo).await?;
+        let row = sqlx::query_as::<_, (Vec<u8>, Option<Vec<u8>>, i64)>(
+            "SELECT root_tree, first_parent, generation FROM changesets WHERE repo_id = ? AND cs_id = ?",
+        )
+        .bind(repo_id)
+        .bind(id.to_bytes().to_vec())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| backend("get changeset", e))?;
+        row.map(|(root, parent, generation)| {
+            Ok(ChangesetRecord {
+                id: *id,
+                root_tree: id_from_db(&root)?,
+                first_parent: parent.as_deref().map(id_from_db).transpose()?,
+                generation: version_from_db(generation)?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn list_refs(&self, repo: &str) -> Result<Vec<(String, RefState)>> {
+        let repo_id = self.repo_id(repo).await?;
+        let rows =
+            sqlx::query_as::<_, (String, Vec<u8>, i64)>("SELECT name, target, version FROM refs WHERE repo_id = ?")
+                .bind(repo_id)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| backend("list refs", e))?;
+        let mut refs = rows
+            .into_iter()
+            .map(|(name, target, version)| {
+                Ok((
+                    name,
+                    RefState {
+                        target: id_from_db(&target)?,
+                        version: version_from_db(version)?,
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // 按字节序排序，不受数据库 collation 影响
+        refs.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        Ok(refs)
+    }
 }
 
 #[cfg(test)]
@@ -283,6 +346,12 @@ mod tests {
             size: u64::MAX,
         };
         assert!(matches!(s.index_objects("r", &[o]).await, Err(Error::Backend(_))));
+    }
+
+    #[tokio::test]
+    async fn conformance_changesets_and_refs() {
+        let (_dir, s) = fresh().await;
+        testsuite::changesets_and_refs(&s).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -389,6 +458,40 @@ mod tests {
         assert!(matches!(s.missing_objects("r", &[o.id]).await, Err(Error::Backend(_))));
         s.pool.close().await;
         assert!(matches!(s.index_objects("r", &[o]).await, Err(Error::Backend(_))));
+    }
+
+    #[tokio::test]
+    async fn changeset_corrupt_rows_and_backend_errors() {
+        let (_dir, s) = fresh().await;
+        s.create_repo("r").await.expect("create");
+        let id = ObjectId::hash(scion_object::ObjectKind::Changeset, b"c");
+        sqlx::query("INSERT INTO changesets (repo_id, cs_id, root_tree, first_parent, generation) VALUES (1, ?, x'00', NULL, 1)")
+            .bind(id.to_bytes().to_vec())
+            .execute(&s.pool)
+            .await
+            .expect("insert");
+        sqlx::query("INSERT INTO refs (repo_id, name, target, version) VALUES (1, 'bad', x'00', 1)")
+            .execute(&s.pool)
+            .await
+            .expect("insert");
+        assert!(matches!(s.get_changeset("r", &id).await, Err(Error::Backend(_))));
+        assert!(matches!(s.list_refs("r").await, Err(Error::Backend(_))));
+        let rec = ChangesetRecord {
+            id,
+            root_tree: id,
+            first_parent: None,
+            generation: u64::MAX,
+        };
+        assert!(matches!(s.put_changeset("r", &rec).await, Err(Error::Backend(_))));
+        sqlx::query("DROP TABLE changesets")
+            .execute(&s.pool)
+            .await
+            .expect("drop");
+        let rec = ChangesetRecord { generation: 1, ..rec };
+        assert!(matches!(s.put_changeset("r", &rec).await, Err(Error::Backend(_))));
+        assert!(matches!(s.get_changeset("r", &id).await, Err(Error::Backend(_))));
+        s.pool.close().await;
+        assert!(matches!(s.list_refs("r").await, Err(Error::Backend(_))));
     }
 
     #[tokio::test]

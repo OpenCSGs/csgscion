@@ -9,12 +9,13 @@ use scion_object::ObjectId;
 
 use crate::error::{Error, Result};
 use crate::repo::validate_repo_name;
-use crate::{BlobStore, IndexedObject, MetaStore, RefExpect, RefState};
+use crate::{BlobStore, ChangesetRecord, IndexedObject, MetaStore, RefExpect, RefState};
 
 #[derive(Default)]
 struct RepoData {
     refs: HashMap<String, RefState>,
     objects: HashMap<ObjectId, u64>,
+    changesets: HashMap<ObjectId, ChangesetRecord>,
 }
 
 #[derive(Default)]
@@ -129,6 +130,28 @@ impl MetaStore for MemStore {
             .copied()
             .collect())
     }
+
+    async fn put_changeset(&self, repo: &str, rec: &ChangesetRecord) -> Result<()> {
+        let mut inner = self.write()?;
+        repo_mut(&mut inner, repo)?.changesets.entry(rec.id).or_insert(*rec);
+        Ok(())
+    }
+
+    async fn get_changeset(&self, repo: &str, id: &ObjectId) -> Result<Option<ChangesetRecord>> {
+        let inner = self.read()?;
+        Ok(repo_ref(&inner, repo)?.changesets.get(id).copied())
+    }
+
+    async fn list_refs(&self, repo: &str) -> Result<Vec<(String, RefState)>> {
+        let inner = self.read()?;
+        let mut refs: Vec<_> = repo_ref(&inner, repo)?
+            .refs
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        refs.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        Ok(refs)
+    }
 }
 
 #[async_trait]
@@ -160,6 +183,11 @@ mod tests {
     #[tokio::test]
     async fn conformance_object_index() {
         testsuite::object_index(&MemStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_changesets_and_refs() {
+        testsuite::changesets_and_refs(&MemStore::new()).await;
     }
 
     #[tokio::test]
