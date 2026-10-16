@@ -13,7 +13,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -26,7 +26,7 @@ jobs:
   proto:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - uses: bufbuild/buf-action@v1
@@ -43,18 +43,51 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
       # golden 向量必须与构造逻辑一致（不允许手改 JSON）
       - run: git diff --exit-code testdata/
 
+  # PostgreSQL 后端的一致性测试（macOS runner 不支持服务容器，单独成 job）
+  test-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: scion
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U scion" --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      SCION_TEST_PG_URL: postgres://scion:scion@localhost:5432/scion
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p scion-store-sql
+
   # 函数级测试要求（服务端设计文档 §12.1）
   coverage:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: scion
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U scion" --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      SCION_TEST_PG_URL: postgres://scion:scion@localhost:5432/scion
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       # 分支覆盖率需要 nightly
@@ -67,7 +100,7 @@ jobs:
         run: cargo llvm-cov --workspace --branch --no-report
       - name: Core crates (lines >= 90%, branches >= 80%)
         run: |
-          cargo llvm-cov report --package scion-object --package scion-store \
+          cargo llvm-cov report --package scion-object --package scion-store --package scion-store-sql \
             --ignore-filename-regex '(xtask|testsuite)' --json --summary-only > core.json
           jq -e '.data[0].totals.lines.percent >= 90' core.json
           jq -e '(.data[0].totals.branches.count == 0) or (.data[0].totals.branches.percent >= 80)' core.json

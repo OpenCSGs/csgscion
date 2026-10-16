@@ -6,6 +6,7 @@ members = [
     "common/object",
     # 服务端
     "server/store",
+    "server/store-sql",
     "server/api",
     "server/scion",
     # 客户端
@@ -25,6 +26,7 @@ license = "Apache-2.0"
 scion-proto = { path = "common/protocol" }
 scion-object = { path = "common/object" }
 scion-store = { path = "server/store" }
+scion-store-sql = { path = "server/store-sql" }
 scion-api = { path = "server/api" }
 scion-client = { path = "client/sdk" }
 
@@ -50,6 +52,8 @@ protox = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 cargo_metadata = "0.23"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "postgres", "migrate", "macros"] }
+tempfile = "3"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

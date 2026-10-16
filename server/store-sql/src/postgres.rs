@@ -1,0 +1,268 @@
+//! Standard / Distributed 档：PostgreSQL，YugabyteDB（YSQL）走同一实现。
+
+use std::str::FromStr;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use scion_object::ObjectId;
+use scion_store::{Error, MetaStore, RefExpect, RefState, Result, validate_repo_name};
+use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
+
+use crate::common::{backend, id_from_db, is_unique_violation, now_ms, version_from_db, version_to_db};
+
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
+
+pub struct PgMetaStore {
+    pool: PgPool,
+}
+
+impl PgMetaStore {
+    /// 连接并执行迁移。URL 形如 `postgres://scion:***@db:5432/scion`。
+    pub async fn connect(url: &str) -> Result<Self> {
+        let opts = PgConnectOptions::from_str(url).map_err(|e| backend("parse postgres url", e))?;
+        Self::connect_with(opts).await
+    }
+
+    pub async fn connect_with(opts: PgConnectOptions) -> Result<Self> {
+        let pool = PgPoolOptions::new()
+            .max_connections(32)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect_with(opts)
+            .await
+            .map_err(|e| backend("connect postgres", e))?;
+        MIGRATOR
+            .run(&pool)
+            .await
+            .map_err(|e| backend("migrate postgres", e.into()))?;
+        Ok(Self { pool })
+    }
+
+    async fn repo_id(&self, repo: &str) -> Result<i64> {
+        sqlx::query_scalar::<_, i64>("SELECT repo_id FROM repos WHERE name = $1")
+            .bind(repo)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| backend("lookup repo", e))?
+            .ok_or_else(|| Error::RepoNotFound(repo.to_owned()))
+    }
+
+    async fn current_version(&self, repo_id: i64, name: &str) -> Result<Option<u64>> {
+        sqlx::query_scalar::<_, i64>("SELECT version FROM refs WHERE repo_id = $1 AND name = $2")
+            .bind(repo_id)
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| backend("read ref version", e))?
+            .map(version_from_db)
+            .transpose()
+    }
+}
+
+#[async_trait]
+impl MetaStore for PgMetaStore {
+    async fn create_repo(&self, repo: &str) -> Result<()> {
+        validate_repo_name(repo)?;
+        sqlx::query("INSERT INTO repos (name, created_at_ms) VALUES ($1, $2)")
+            .bind(repo)
+            .bind(now_ms())
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                if is_unique_violation(&e) {
+                    Error::RepoAlreadyExists(repo.to_owned())
+                } else {
+                    backend("create repo", e)
+                }
+            })?;
+        Ok(())
+    }
+
+    async fn repo_exists(&self, repo: &str) -> Result<bool> {
+        match self.repo_id(repo).await {
+            Ok(_) => Ok(true),
+            Err(Error::RepoNotFound(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn list_repos(&self) -> Result<Vec<String>> {
+        // COLLATE "C"：按字节序，与其它后端一致，不受数据库 locale 影响
+        sqlx::query_scalar::<_, String>(r#"SELECT name FROM repos ORDER BY name COLLATE "C""#)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| backend("list repos", e))
+    }
+
+    async fn get_ref(&self, repo: &str, name: &str) -> Result<Option<RefState>> {
+        let repo_id = self.repo_id(repo).await?;
+        let row =
+            sqlx::query_as::<_, (Vec<u8>, i64)>("SELECT target, version FROM refs WHERE repo_id = $1 AND name = $2")
+                .bind(repo_id)
+                .bind(name)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| backend("get ref", e))?;
+        row.map(|(target, version)| {
+            Ok(RefState {
+                target: id_from_db(&target)?,
+                version: version_from_db(version)?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn cas_ref(&self, repo: &str, name: &str, expect: RefExpect, target: ObjectId) -> Result<RefState> {
+        let repo_id = self.repo_id(repo).await?;
+        let target_bytes = target.to_bytes().to_vec();
+        let mut tx = self.pool.begin().await.map_err(|e| backend("begin", e))?;
+        // 单行条件写：UPDATE 持有行锁，并发写者在行锁上排队，之后条件不再满足而失败，
+        // 在 READ COMMITTED 下即可保证线性一致，不需要 SERIALIZABLE
+        let (affected, new_version) = match expect {
+            RefExpect::Absent => {
+                let r = sqlx::query(
+                    "INSERT INTO refs (repo_id, name, target, version) VALUES ($1, $2, $3, 1) \
+                     ON CONFLICT (repo_id, name) DO NOTHING",
+                )
+                .bind(repo_id)
+                .bind(name)
+                .bind(&target_bytes)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| backend("create ref", e))?;
+                (r.rows_affected(), 1)
+            }
+            RefExpect::Version(v) => {
+                let next = v
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Backend("ref version overflow".into()))?;
+                let r = sqlx::query(
+                    "UPDATE refs SET target = $1, version = version + 1 \
+                     WHERE repo_id = $2 AND name = $3 AND version = $4",
+                )
+                .bind(&target_bytes)
+                .bind(repo_id)
+                .bind(name)
+                .bind(version_to_db(v)?)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| backend("update ref", e))?;
+                (r.rows_affected(), next)
+            }
+        };
+        if affected != 1 {
+            tx.rollback().await.map_err(|e| backend("rollback", e))?;
+            let current = self.current_version(repo_id, name).await?;
+            return Err(Error::RefVersionMismatch {
+                name: name.to_owned(),
+                current,
+            });
+        }
+        sqlx::query("INSERT INTO ref_log (repo_id, name, version, target, updated_at_ms) VALUES ($1, $2, $3, $4, $5)")
+            .bind(repo_id)
+            .bind(name)
+            .bind(version_to_db(new_version)?)
+            .bind(&target_bytes)
+            .bind(now_ms())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| backend("append ref log", e))?;
+        tx.commit().await.map_err(|e| backend("commit", e))?;
+        Ok(RefState {
+            target,
+            version: new_version,
+        })
+    }
+}
+
+/// PG 测试：需要环境变量 `SCION_TEST_PG_URL`（CI 中由 PostgreSQL 服务容器提供）；
+/// 未设置时跳过。每个测试使用独立的 schema，互不干扰。
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scion_store::testsuite;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    async fn fresh() -> Option<PgMetaStore> {
+        let url = std::env::var("SCION_TEST_PG_URL").ok()?;
+        static N: AtomicU32 = AtomicU32::new(0);
+        let schema = format!("t{}_{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed));
+        let admin = PgPool::connect(&url).await.expect("connect admin");
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&admin)
+            .await
+            .expect("create schema");
+        let opts = PgConnectOptions::from_str(&url)
+            .expect("url")
+            .options([("search_path", schema.as_str())]);
+        Some(PgMetaStore::connect_with(opts).await.expect("connect"))
+    }
+
+    macro_rules! pg_or_skip {
+        () => {
+            match fresh().await {
+                Some(s) => s,
+                None => {
+                    eprintln!("SCION_TEST_PG_URL not set; skipping");
+                    return;
+                }
+            }
+        };
+    }
+
+    #[tokio::test]
+    async fn conformance_meta() {
+        let s = pg_or_skip!();
+        testsuite::meta_store(&s).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_concurrent_cas() {
+        let s = pg_or_skip!();
+        testsuite::concurrent_cas(Arc::new(s)).await;
+    }
+
+    #[tokio::test]
+    async fn cas_appends_ref_log_and_rejects_overflow() {
+        let s = pg_or_skip!();
+        s.create_repo("r").await.expect("create");
+        let a = ObjectId::hash(scion_object::ObjectKind::Changeset, b"a");
+        s.cas_ref("r", "main", RefExpect::Absent, a).await.expect("v1");
+        let _ = s
+            .cas_ref("r", "main", RefExpect::Version(9), a)
+            .await
+            .expect_err("stale");
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM ref_log")
+            .fetch_one(&s.pool)
+            .await
+            .expect("q");
+        assert_eq!(n, 1);
+        assert!(matches!(
+            s.cas_ref("r", "main", RefExpect::Version(u64::MAX), a).await,
+            Err(Error::Backend(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn closed_pool_reports_backend_errors() {
+        let s = pg_or_skip!();
+        s.create_repo("r").await.expect("create");
+        s.pool.close().await;
+        let id = ObjectId::hash(scion_object::ObjectKind::Changeset, b"a");
+        assert!(matches!(s.create_repo("x").await, Err(Error::Backend(_))));
+        assert!(matches!(s.repo_exists("r").await, Err(Error::Backend(_))));
+        assert!(matches!(s.list_repos().await, Err(Error::Backend(_))));
+        assert!(matches!(
+            s.cas_ref("r", "m", RefExpect::Absent, id).await,
+            Err(Error::Backend(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn connect_bad_url_fails() {
+        assert!(matches!(
+            PgMetaStore::connect("postgres://[bad").await.map(|_| ()),
+            Err(Error::Backend(_))
+        ));
+    }
+}
