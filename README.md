@@ -6,7 +6,7 @@
 - 对象格式规范：[`SPEC.md`](SPEC.md)，golden 测试向量在 [`testdata/vectors/`](testdata/vectors/)
 - 协议：[`proto/scion/v1/`](proto/scion/v1/)
 
-当前进度：**M1 最小闭环**进行中（写入路径、Lite 模式已可用；`scn` 的 clone / commit / land 和 git 导入尚未完成）。
+当前进度：**M1 最小闭环**进行中（写入路径、Lite 模式、`scn` 工作副本已可用；git 导入尚未完成）。
 
 ## 目录结构
 
@@ -29,6 +29,7 @@ server/              服务端（可依赖 common 与更低层的 server crate�
 
 client/              客户端（只能依赖 common 与 client，禁止依赖 server）
   sdk/               scion-client  Rust SDK
+  wc/                scion-wc      工作副本（clone / status / commit / land / sync）
   cli/               scion-cli     命令行二进制 scn
 
 xtask/               仓库维护任务（cargo xtask layers：依赖方向检查）
@@ -47,9 +48,19 @@ cargo run -p scion -- server --lite --data-dir ./.scion-data --repo mono
 # 其它后端：--meta mem|sqlite://PATH|postgres://…  --blobs mem|DIR|s3://bucket/prefix
 # S3 连接参数：SCION_S3_ENDPOINT、SCION_S3_ACCESS_KEY_ID、SCION_S3_SECRET_ACCESS_KEY、SCION_S3_REGION
 
-# 另一个终端：检查连接与能力协商
-cargo run -p scion-cli -- doctor
-cargo run -p scion-cli -- doctor --json
+# 另一个终端：安装 scn 并检查连接
+cargo install --path client/cli
+scn doctor
+
+# 日常流程
+scn clone mono && cd mono          # 检出（默认 ref main，空仓库也可以）
+echo 'hello' > README.md
+scn status                          # A README.md
+scn commit -m "add readme" --author "Ada <ada@example.com>"
+scn land                            # 快进合入 main
+scn sync                            # 拉取别人合入的改动；有未合入的提交时自动做文件级 rebase
+scn cat main:README.md              # 不需要工作副本也能读文件（工作副本外加 --repo）
+scn ls main:                        # 列目录；所有命令都支持 --json
 ```
 
 ## 开发

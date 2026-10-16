@@ -241,6 +241,11 @@ async fn write_land_and_query_end_to_end() {
             .as_ref(),
         b"#!/bin/sh\n"
     );
+    assert_eq!(
+        c.root_tree(&root.id.to_string()).await.expect("root tree"),
+        root.root_tree
+    );
+    assert_eq!(c.root_tree("main").await.expect("root tree"), child.root_tree);
     let refs = c.list_refs().await.expect("list refs");
     assert_eq!(refs, vec![("main".to_string(), child.id, 2)]);
 

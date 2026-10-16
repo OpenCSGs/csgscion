@@ -250,6 +250,20 @@ impl Client {
         )))
     }
 
+    /// `revision`（ref 名或提交 id）的根目录树。
+    pub async fn root_tree(&self, revision: &str) -> Result<ObjectId> {
+        let req = ListDirRequest {
+            repo: self.repo()?,
+            revision: revision.to_owned(),
+            path: String::new(),
+        };
+        let resp = QueryServiceClient::new(self.channel.clone())
+            .list_dir(self.request(req)?)
+            .await?
+            .into_inner();
+        id_from(&resp.tree_id, "tree id")
+    }
+
     /// 列出 `revision` 下的目录（`""` 为根目录）。
     pub async fn list_dir(&self, revision: &str, path: &str) -> Result<Vec<DirEntry>> {
         let req = ListDirRequest {

@@ -2374,13 +2374,16 @@ dependencies = [
 name = "scion-cli"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "clap",
  "scion-api",
  "scion-client",
  "scion-proto",
  "scion-store",
+ "scion-wc",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -2471,6 +2474,23 @@ dependencies = [
  "proptest",
  "scion-object",
  "scion-store",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "scion-wc"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "scion-api",
+ "scion-client",
+ "scion-object",
+ "scion-proto",
+ "scion-store",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
 ]
