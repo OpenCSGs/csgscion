@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # 在任意分支上手动运行：gh workflow run ci --ref <branch>
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
