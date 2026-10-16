@@ -28,7 +28,14 @@ pub(crate) async fn resolve_revision(
         Ok(id) if id.kind() == ObjectKind::Changeset => id,
         _ => match meta.get_ref(repo, revision).await.map_err(status::from_store)? {
             Some(r) => r.target,
-            None => return Err(status::ref_not_found(revision)),
+            // 40 位 git sha（从 git 导入的提交）
+            None => match scion_query::parse_git_sha(revision) {
+                Some(sha) => scion_query::lookup_git_sha(meta, repo, &sha)
+                    .await
+                    .map_err(crate::service::history::from_query)?
+                    .ok_or_else(|| status::ref_not_found(revision))?,
+                None => return Err(status::ref_not_found(revision)),
+            },
         },
     };
     meta.get_changeset(repo, &cs_id)
@@ -95,6 +102,25 @@ mod tests {
         // 指向未记录提交的 ref（不应出现，但要报错而不是崩溃）
         s.cas_ref("r", "dangling", RefExpect::Absent, cs(7)).await.expect("ref");
         assert_eq!(code(resolve_revision(&s, "r", "dangling").await), Some(Code::NotFound));
+        // 40 位 git sha
+        let sha = [5u8; 20];
+        s.put_derived(
+            "r",
+            scion_query::GITSHA_KIND,
+            scion_query::GITSHA_VERSION,
+            &sha,
+            &cs(1).to_bytes(),
+        )
+        .await
+        .expect("map");
+        assert_eq!(
+            resolve_revision(&s, "r", &hex::encode(sha)).await.ok().map(|r| r.id),
+            Some(cs(1))
+        );
+        assert_eq!(
+            code(resolve_revision(&s, "r", &hex::encode([6u8; 20])).await),
+            Some(Code::NotFound)
+        );
         // 不是提交 id 的 ObjectId 文本按 ref 名处理
         let blob = ObjectId::of_blob(b"x").to_string();
         assert_eq!(code(resolve_revision(&s, "r", &blob).await), Some(Code::NotFound));

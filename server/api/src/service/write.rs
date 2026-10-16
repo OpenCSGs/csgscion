@@ -125,6 +125,9 @@ impl WriteSvc {
             .index_paths(repo, cs_id, rec.generation, &changes)
             .await
             .map_err(status::from_store)?;
+        scion_query::index_git_sha(self.meta.as_ref(), repo, cs_id, cs)
+            .await
+            .map_err(crate::service::history::from_query)?;
         self.meta.put_changeset(repo, &rec).await.map_err(status::from_store)?;
         Ok(rec)
     }

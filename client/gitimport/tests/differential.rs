@@ -226,6 +226,11 @@ async fn import_matches_git_commit_by_commit() {
         assert_eq!(scion.extensions[GIT_SHA1_EXTENSION], hex::decode(sha).expect("hex"));
         let parents: Vec<ObjectId> = git_commit.parents.iter().map(|p| summary.mapping[p]).collect();
         assert_eq!(scion.parents, parents, "parents at {sha}");
+        // 40 位 git sha 可以直接当作版本号使用
+        assert_eq!(
+            c.root_tree(sha).await.expect("resolve by git sha"),
+            c.root_tree(&cs.to_string()).await.expect("by id")
+        );
     }
 
     let tip = c.resolve_ref("main").await.expect("resolve").expect("main exists");

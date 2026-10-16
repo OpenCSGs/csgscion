@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+hex.workspace = true
 async-trait.workspace = true
 scion-tree.workspace = true
 similar = { version = "3", features = ["bytes"] }
