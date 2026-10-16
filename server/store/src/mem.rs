@@ -168,7 +168,7 @@ impl MetaStore for MemStore {
             .filter(|r| r.generation <= max_generation)
             .cloned()
             .collect();
-        recs.sort_unstable_by(|a, b| b.generation.cmp(&a.generation));
+        recs.sort_unstable_by_key(|r| std::cmp::Reverse(r.generation));
         recs.truncate(limit);
         Ok(recs)
     }
