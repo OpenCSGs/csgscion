@@ -2358,8 +2358,10 @@ name = "scion-api"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "hex",
  "scion-object",
  "scion-proto",
+ "scion-query",
  "scion-store",
  "scion-tree",
  "tokio",

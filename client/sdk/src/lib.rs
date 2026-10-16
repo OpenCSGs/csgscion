@@ -18,11 +18,13 @@
 
 mod client;
 mod error;
+mod history;
 mod info;
 mod ops;
 
 pub use client::{Auth, Client, ClientBuilder};
 pub use error::{Error, Result};
+pub use history::{FileChangeInfo, LogItem, LogPage};
 pub use info::{Limits, ProtocolVersion, ReadEndpoint, Role, ServerInfo};
 pub use ops::{ChangesetBuilder, CreatedChangeset, DirEntry, Landed, Person, RefTip, Signature};
 pub use scion_object::{EntryMode, ObjectId, ObjectKind};

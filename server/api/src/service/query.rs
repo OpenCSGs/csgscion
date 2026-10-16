@@ -6,13 +6,17 @@ use std::sync::Arc;
 use bytes::Bytes;
 use scion_object::{EntryMode, ObjectId, TreeEntry};
 use scion_proto::v1::query_service_server::QueryService;
-use scion_proto::v1::{self, ListDirRequest, ListDirResponse, ReadFileRequest, ReadFileResponse};
+use scion_proto::v1::{
+    self, DiffRequest, DiffResponse, IsAncestorRequest, IsAncestorResponse, ListDirRequest, ListDirResponse,
+    LogRequest, LogResponse, MergeBaseRequest, MergeBaseResponse, ReadFileRequest, ReadFileResponse,
+};
 use scion_store::{BlobStore, MetaStore};
 use scion_tree::{BlobTreeSource, TreeSource, lookup};
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
 use crate::config::ServerConfig;
+use crate::service::history;
 use crate::service::support::resolve_revision;
 use crate::status;
 
@@ -33,7 +37,7 @@ pub(crate) fn proto_mode(m: EntryMode) -> v1::EntryMode {
     }
 }
 
-fn proto_entry(e: &TreeEntry) -> v1::TreeEntry {
+pub(crate) fn proto_entry(e: &TreeEntry) -> v1::TreeEntry {
     v1::TreeEntry {
         name: e.name.clone(),
         mode: proto_mode(e.mode).into(),
@@ -42,7 +46,7 @@ fn proto_entry(e: &TreeEntry) -> v1::TreeEntry {
     }
 }
 
-fn check_path(path: &str) -> Result<(), Status> {
+pub(crate) fn check_path(path: &str) -> Result<(), Status> {
     if path.is_empty() {
         return Ok(());
     }
@@ -154,6 +158,30 @@ impl QueryService for QuerySvc {
         let req = request.into_inner();
         Ok(Response::new(
             QuerySvc::list_dir(self, &req.repo, &req.revision, &req.path).await?,
+        ))
+    }
+
+    async fn log(&self, request: Request<LogRequest>) -> Result<Response<LogResponse>, Status> {
+        Ok(Response::new(
+            history::log(self.meta.as_ref(), self.blobs.as_ref(), request.into_inner()).await?,
+        ))
+    }
+
+    async fn is_ancestor(&self, request: Request<IsAncestorRequest>) -> Result<Response<IsAncestorResponse>, Status> {
+        Ok(Response::new(
+            history::is_ancestor(self.meta.as_ref(), request.into_inner()).await?,
+        ))
+    }
+
+    async fn merge_base(&self, request: Request<MergeBaseRequest>) -> Result<Response<MergeBaseResponse>, Status> {
+        Ok(Response::new(
+            history::merge_base(self.meta.as_ref(), request.into_inner()).await?,
+        ))
+    }
+
+    async fn diff(&self, request: Request<DiffRequest>) -> Result<Response<DiffResponse>, Status> {
+        Ok(Response::new(
+            history::diff(self.meta.as_ref(), self.blobs.clone(), request.into_inner()).await?,
         ))
     }
 }

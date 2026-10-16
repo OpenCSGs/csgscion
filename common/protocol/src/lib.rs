@@ -34,6 +34,10 @@ pub mod features {
     pub const REFS: &str = "refs";
     pub const QUERY_READ_FILE: &str = "query.read_file";
     pub const QUERY_LIST_DIR: &str = "query.list_dir";
+    pub const QUERY_LOG: &str = "query.log";
+    /// IsAncestor 与 MergeBase。
+    pub const QUERY_ANCESTRY: &str = "query.ancestry";
+    pub const QUERY_DIFF: &str = "query.diff";
 }
 
 #[cfg(test)]

@@ -29,6 +29,9 @@ impl ServerInfoSvc {
             features::REFS,
             features::QUERY_READ_FILE,
             features::QUERY_LIST_DIR,
+            features::QUERY_LOG,
+            features::QUERY_ANCESTRY,
+            features::QUERY_DIFF,
         ]
         .map(String::from)
         .to_vec()

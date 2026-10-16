@@ -3,6 +3,7 @@ syntax = "proto3";
 package scion.v1;
 
 import "scion/v1/common.proto";
+import "scion/v1/write.proto";
 
 // 不需要本地仓库的查询（「源码管理即 API」）。revision 为 ref 名或提交 id 的文本形式（c1…）。
 service QueryService {
@@ -10,6 +11,14 @@ service QueryService {
   rpc ReadFile(ReadFileRequest) returns (stream ReadFileResponse);
   // 列出目录，path 为空表示根目录。
   rpc ListDir(ListDirRequest) returns (ListDirResponse);
+  // 历史：从 revision 开始按代数从新到旧，覆盖所有父提交；可按路径过滤（相对第一个父提交）。
+  rpc Log(LogRequest) returns (LogResponse);
+  // ancestor 是否为 descendant 的祖先（含相等）。
+  rpc IsAncestor(IsAncestorRequest) returns (IsAncestorResponse);
+  // 最佳公共祖先（互不为祖先），按代数从高到低。
+  rpc MergeBase(MergeBaseRequest) returns (MergeBaseResponse);
+  // 两个版本之间的文件级差异。
+  rpc Diff(DiffRequest) returns (DiffResponse);
 }
 
 message ReadFileRequest {
@@ -39,4 +48,74 @@ message ListDirResponse {
   bytes changeset_id = 1;
   bytes tree_id = 2;
   repeated TreeEntry entries = 3;
+}
+
+message LogRequest {
+  string repo = 1;
+  string revision = 2;
+  // 只返回改动了该路径（文件或目录）的提交；为空表示不过滤。
+  string path = 3;
+  // 每页条数，默认 50，上限 1000。
+  uint32 page_size = 4;
+  // 上一页返回的 next_page_token；非空时忽略 revision。
+  string page_token = 5;
+}
+
+message LogEntry {
+  bytes changeset_id = 1;
+  repeated bytes parents = 2;
+  Signature author = 3;
+  Signature committer = 4;
+  string message = 5;
+  uint64 generation = 6;
+  bytes root_tree = 7;
+  map<string, bytes> extensions = 8;
+}
+
+message LogResponse {
+  repeated LogEntry entries = 1;
+  // 为空表示没有更多。按路径过滤时，一页可能少于 page_size 甚至为空，但仍可继续。
+  string next_page_token = 2;
+}
+
+message IsAncestorRequest {
+  string repo = 1;
+  string ancestor = 2;
+  string descendant = 3;
+}
+
+message IsAncestorResponse {
+  bool is_ancestor = 1;
+}
+
+message MergeBaseRequest {
+  string repo = 1;
+  string a = 2;
+  string b = 3;
+}
+
+message MergeBaseResponse {
+  // 没有公共祖先时为空。
+  repeated bytes bases = 1;
+}
+
+message DiffRequest {
+  string repo = 1;
+  // 为空表示空树（即列出 to 中的全部文件）。
+  string from = 2;
+  string to = 3;
+  // 只比较该路径（文件或目录）；为空表示整个仓库。
+  string path = 4;
+}
+
+// 一个文件的变化：没有 old 为新增，没有 new 为删除。
+message FileDiff {
+  string path = 1;
+  TreeEntry old = 2;
+  TreeEntry new = 3;
+}
+
+message DiffResponse {
+  // 按路径排序。
+  repeated FileDiff files = 1;
 }
