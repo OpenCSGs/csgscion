@@ -12,6 +12,7 @@ use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
 use crate::config::ServerConfig;
+use crate::service::support::{check_repo, parse_id};
 use crate::status;
 
 pub type GetObjectsStream = Pin<Box<dyn Stream<Item = Result<GetObjectsResponse, Status>> + Send>>;
@@ -27,13 +28,6 @@ impl ObjectSvc {
         Self { config, meta, blobs }
     }
 
-    async fn check_repo(&self, repo: &str) -> Result<(), Status> {
-        match self.meta.repo_exists(repo).await.map_err(status::from_store)? {
-            true => Ok(()),
-            false => Err(status::repo_not_found(repo)),
-        }
-    }
-
     fn check_batch(&self, n: usize) -> Result<(), Status> {
         let max = self.config.limits.max_batch_objects as usize;
         if n > max {
@@ -41,10 +35,6 @@ impl ObjectSvc {
         }
         Ok(())
     }
-}
-
-fn parse_id(raw: &[u8]) -> Result<ObjectId, Status> {
-    ObjectId::from_bytes(raw).map_err(|e| status::invalid_object_id(raw, &e))
 }
 
 /// 选择传输编码。目前只实现 IDENTITY；未知的枚举值忽略。
@@ -90,7 +80,7 @@ impl ObjectService for ObjectSvc {
         request: Request<GetObjectsRequest>,
     ) -> Result<Response<Self::GetObjectsStream>, Status> {
         let req = request.into_inner();
-        self.check_repo(&req.repo).await?;
+        check_repo(self.meta.as_ref(), &req.repo).await?;
         self.check_batch(req.wants.len())?;
         negotiate_encoding(&req.accept_encodings)?;
 
@@ -144,7 +134,7 @@ impl ObjectService for ObjectSvc {
 
     async fn has_objects(&self, request: Request<HasObjectsRequest>) -> Result<Response<HasObjectsResponse>, Status> {
         let req = request.into_inner();
-        self.check_repo(&req.repo).await?;
+        check_repo(self.meta.as_ref(), &req.repo).await?;
         self.check_batch(req.ids.len())?;
         let ids = req.ids.iter().map(|b| parse_id(b)).collect::<Result<Vec<_>, _>>()?;
         let missing = self
@@ -265,13 +255,6 @@ mod tests {
             negotiate_encoding(&[99]).map_err(|s| s.code()),
             Err(Code::FailedPrecondition)
         );
-    }
-
-    #[test]
-    fn parse_id_rejects_bad_bytes() {
-        assert_eq!(parse_id(&[1, 2]).map_err(|s| s.code()), Err(Code::InvalidArgument));
-        let id = ObjectId::of_blob(b"x");
-        assert_eq!(parse_id(&id.to_bytes()).ok(), Some(id));
     }
 
     #[tokio::test]

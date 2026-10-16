@@ -6,7 +6,7 @@
 - 对象格式规范：[`SPEC.md`](SPEC.md)，golden 测试向量在 [`testdata/vectors/`](testdata/vectors/)
 - 协议：[`proto/scion/v1/`](proto/scion/v1/)
 
-当前进度：**M0 协议与骨架**（内存存储，重启即丢失数据）。
+当前进度：**M1 最小闭环**进行中（写入路径、Lite 模式已可用；`scn` 的 clone / commit / land 和 git 导入尚未完成）。
 
 ## 目录结构
 
@@ -20,8 +20,11 @@ common/              服务端和客户端共用（只能依赖 common）
   object/            scion-object  ObjectId、规范编码、Tree / Changeset（纯计算，无 IO）
 
 server/              服务端（可依赖 common 与更低层的 server crate）
-  store/             scion-store   MetaStore / BlobStore trait、内存实现、后端一致性测试套件
-  api/               scion-api     gRPC 服务实现与启动入口
+  store/             scion-store       MetaStore / BlobStore trait、内存实现、后端一致性测试套件
+  store-sql/         scion-store-sql   SQLite / PostgreSQL 元数据存储
+  store-blob/        scion-store-blob  本地目录 / S3 兼容对象存储
+  tree/              scion-tree        增量建树
+  api/               scion-api         gRPC 服务实现与启动入口
   scion/             scion         服务端二进制
 
 client/              客户端（只能依赖 common 与 client，禁止依赖 server）
@@ -38,8 +41,11 @@ docs/design/         设计文档与架构图
 ## 快速开始
 
 ```sh
-# 启动服务端（内存存储），预建仓库 mono
-cargo run -p scion -- server --listen 127.0.0.1:7080 --repo mono
+# 启动服务端（Lite 档：SQLite + 本地目录，数据落盘），预建仓库 mono
+cargo run -p scion -- server --lite --data-dir ./.scion-data --repo mono
+
+# 其它后端：--meta mem|sqlite://PATH|postgres://…  --blobs mem|DIR|s3://bucket/prefix
+# S3 连接参数：SCION_S3_ENDPOINT、SCION_S3_ACCESS_KEY_ID、SCION_S3_SECRET_ACCESS_KEY、SCION_S3_REGION
 
 # 另一个终端：检查连接与能力协商
 cargo run -p scion-cli -- doctor
@@ -54,7 +60,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo xtask layers                              # 依赖方向检查
 cargo llvm-cov --workspace                      # 覆盖率（需 cargo install cargo-llvm-cov）
 SCION_BLESS=1 cargo test -p scion-object --test vectors   # 新增 golden 向量后重新生成
-docker compose -f deploy/dev/docker-compose.yml up -d     # MinIO + PostgreSQL（M1 起使用）
+docker compose -f deploy/dev/docker-compose.yml up -d     # SeaweedFS（S3）+ PostgreSQL
 ```
 
 **测试要求**（[服务端设计文档 §12.1](docs/design/rust-server-architecture.md)）：每个含逻辑的函数都要有单元测试，覆盖正常路径、边界条件和每一个错误分支。核心 crate 行覆盖率不低于 90%，PR 新增代码不低于 90%，由 CI 强制执行。

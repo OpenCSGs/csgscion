@@ -8,6 +8,8 @@ pub struct Limits {
     pub max_chunk_bytes: u64,
     pub max_changes_per_changeset: u32,
     pub max_inline_bytes: u64,
+    /// UploadBlobs 单个对象上限。M1 在内存中整体校验后写入；更大的文件在分块存储加入后支持。
+    pub max_upload_object_bytes: u64,
 }
 
 impl Default for Limits {
@@ -17,6 +19,7 @@ impl Default for Limits {
             max_chunk_bytes: 1 << 20,
             max_changes_per_changeset: 100_000,
             max_inline_bytes: 1 << 20,
+            max_upload_object_bytes: 256 << 20,
         }
     }
 }
@@ -28,6 +31,7 @@ impl From<&Limits> for v1::Limits {
             max_chunk_bytes: l.max_chunk_bytes,
             max_changes_per_changeset: l.max_changes_per_changeset,
             max_inline_bytes: l.max_inline_bytes,
+            max_upload_object_bytes: l.max_upload_object_bytes,
         }
     }
 }
@@ -74,6 +78,7 @@ mod tests {
             max_chunk_bytes: 2,
             max_changes_per_changeset: 3,
             max_inline_bytes: 4,
+            max_upload_object_bytes: 5,
         };
         let p: v1::Limits = (&l).into();
         assert_eq!(
@@ -81,9 +86,10 @@ mod tests {
                 p.max_batch_objects,
                 p.max_chunk_bytes,
                 p.max_changes_per_changeset,
-                p.max_inline_bytes
+                p.max_inline_bytes,
+                p.max_upload_object_bytes
             ),
-            (1, 2, 3, 4)
+            (1, 2, 3, 4, 5)
         );
     }
 

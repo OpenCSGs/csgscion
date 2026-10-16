@@ -11,6 +11,7 @@ bytes.workspace = true
 scion-object.workspace = true
 scion-proto.workspace = true
 scion-store.workspace = true
+scion-tree.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true

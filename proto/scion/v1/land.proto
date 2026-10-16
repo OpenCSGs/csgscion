@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package scion.v1;
+
+// 合入：把 ref 移到指定提交。
+service LandService {
+  // M1：直接 CAS。ref 不存在时创建；存在时提交的 first parent 必须等于 ref 当前提交，否则返回
+  // NOT_FAST_FORWARD。提交已经是 ref 当前提交时直接成功（重试安全）。服务端 rebase 在后续版本加入。
+  rpc Land(LandRequest) returns (LandResponse);
+}
+
+message LandRequest {
+  string repo = 1;
+  // 客户端生成的 UUIDv7，用于幂等。
+  string request_id = 2;
+  string ref = 3;
+  bytes changeset_id = 4;
+}
+
+message LandResponse {
+  // 合入后 ref 指向的提交。
+  bytes tip = 1;
+  uint64 ref_version = 2;
+}

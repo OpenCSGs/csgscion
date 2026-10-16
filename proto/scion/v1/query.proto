@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package scion.v1;
+
+import "scion/v1/common.proto";
+
+// 不需要本地仓库的查询（「源码管理即 API」）。revision 为 ref 名或提交 id 的文本形式（c1…）。
+service QueryService {
+  // 读取文件内容，分块流式返回；断开后用 offset 续传。
+  rpc ReadFile(ReadFileRequest) returns (stream ReadFileResponse);
+  // 列出目录，path 为空表示根目录。
+  rpc ListDir(ListDirRequest) returns (ListDirResponse);
+}
+
+message ReadFileRequest {
+  string repo = 1;
+  string revision = 2;
+  string path = 3;
+  uint64 offset = 4;
+}
+
+message ReadFileResponse {
+  bytes blob_id = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+  bool last = 4;
+  uint64 total_size = 5;
+  EntryMode mode = 6;
+}
+
+message ListDirRequest {
+  string repo = 1;
+  string revision = 2;
+  string path = 3;
+}
+
+message ListDirResponse {
+  // revision 解析得到的提交。
+  bytes changeset_id = 1;
+  bytes tree_id = 2;
+  repeated TreeEntry entries = 3;
+}

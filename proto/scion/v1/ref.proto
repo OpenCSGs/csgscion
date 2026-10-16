@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package scion.v1;
+
+// ref 查询。ref 是唯一的可变状态，结果永远不缓存。
+service RefService {
+  rpc ResolveRef(ResolveRefRequest) returns (ResolveRefResponse);
+  rpc ListRefs(ListRefsRequest) returns (ListRefsResponse);
+}
+
+message ResolveRefRequest {
+  string repo = 1;
+  string ref = 2;
+}
+
+message ResolveRefResponse {
+  bytes changeset_id = 1;
+  bytes root_tree = 2;
+  uint64 version = 3;
+}
+
+message ListRefsRequest {
+  string repo = 1;
+}
+
+message RefInfo {
+  string name = 1;
+  bytes changeset_id = 2;
+  uint64 version = 3;
+}
+
+message ListRefsResponse {
+  // 按名字字节序。
+  repeated RefInfo refs = 1;
+}

@@ -104,3 +104,70 @@ async fn serve_end_to_end_and_shutdown() {
     tx.send(()).expect("signal shutdown");
     server.await.expect("join").expect("server exited cleanly");
 }
+
+#[tokio::test]
+async fn upload_blobs_stream_errors() {
+    use scion_proto::v1::UploadBlobsRequest;
+    use scion_proto::v1::write_service_client::WriteServiceClient;
+
+    let store = Arc::new(MemStore::new());
+    store.create_repo("mono").await.expect("repo");
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let (tx, rx) = oneshot::channel::<()>();
+    let app = App {
+        config: Arc::new(ServerConfig::default()),
+        meta: store.clone(),
+        blobs: store,
+    };
+    let server = tokio::spawn(serve(listener, app, async {
+        let _ = rx.await;
+    }));
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .expect("url")
+        .connect()
+        .await
+        .expect("connect");
+    let mut w = WriteServiceClient::new(channel);
+    let id = ObjectId::of_blob(b"hello");
+    let msg = |repo: &str, data: &'static [u8], offset, last| UploadBlobsRequest {
+        repo: repo.into(),
+        id: Bytes::copy_from_slice(&id.to_bytes()),
+        offset,
+        data: Bytes::from_static(data),
+        last,
+    };
+    let code = |r: Result<tonic::Response<_>, tonic::Status>| r.map(|_| ()).map_err(|s| s.code());
+
+    // 正常：两块
+    let ok = w
+        .upload_blobs(tokio_stream::iter(vec![
+            msg("mono", b"hel", 0, false),
+            msg("", b"lo", 3, true),
+        ]))
+        .await;
+    assert_eq!(ok.expect("upload").into_inner().stored_ids.len(), 1);
+    // 空流：成功，什么都不写
+    let empty = w
+        .upload_blobs(tokio_stream::iter(Vec::<UploadBlobsRequest>::new()))
+        .await;
+    assert!(empty.expect("empty").into_inner().stored_ids.is_empty());
+    // 仓库不存在
+    let r = w
+        .upload_blobs(tokio_stream::iter(vec![msg("nope", b"hello", 0, true)]))
+        .await;
+    assert_eq!(code(r), Err(tonic::Code::NotFound));
+    // 流在对象中途结束
+    let r = w
+        .upload_blobs(tokio_stream::iter(vec![msg("mono", b"hel", 0, false)]))
+        .await;
+    assert_eq!(code(r), Err(tonic::Code::InvalidArgument));
+    // 内容与 id 不符
+    let r = w
+        .upload_blobs(tokio_stream::iter(vec![msg("mono", b"jello", 0, true)]))
+        .await;
+    assert_eq!(code(r), Err(tonic::Code::InvalidArgument));
+
+    tx.send(()).expect("shutdown");
+    server.await.expect("join").expect("clean exit");
+}

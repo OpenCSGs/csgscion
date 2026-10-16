@@ -66,6 +66,76 @@ pub fn object_missing(ids: &[ObjectId]) -> Status {
     )
 }
 
+/// 写入时引用了尚未上传的对象：FAILED_PRECONDITION，客户端应先上传再重试（§3.5）。
+pub fn objects_not_uploaded(ids: &[ObjectId]) -> Status {
+    let listed: Vec<String> = ids.iter().take(MAX_IDS_IN_ERROR).map(ToString::to_string).collect();
+    with_reason(
+        Code::FailedPrecondition,
+        ErrorReason::ObjectMissing,
+        format!("{} object(s) must be uploaded first", ids.len()),
+        HashMap::from([
+            ("ids".to_string(), listed.join(",")),
+            ("count".to_string(), ids.len().to_string()),
+        ]),
+    )
+}
+
+pub fn invalid_changeset(path: &str, message: impl Into<String>) -> Status {
+    with_reason(
+        Code::InvalidArgument,
+        ErrorReason::InvalidChangeset,
+        message,
+        HashMap::from([("path".to_string(), path.to_string())]),
+    )
+}
+
+/// 合入的提交不是 ref 当前提交的直接后继。
+pub fn not_fast_forward(reference: &str, tip: &ObjectId) -> Status {
+    with_reason(
+        Code::Aborted,
+        ErrorReason::NotFastForward,
+        format!("ref {reference:?} has moved to {tip}; rebase onto it and land again"),
+        HashMap::from([
+            ("ref".to_string(), reference.to_string()),
+            ("tip".to_string(), tip.to_string()),
+        ]),
+    )
+}
+
+pub fn ref_not_found(reference: &str) -> Status {
+    with_reason(
+        Code::NotFound,
+        ErrorReason::RefNotFound,
+        format!("revision {reference:?} not found"),
+        HashMap::from([("ref".to_string(), reference.to_string())]),
+    )
+}
+
+pub fn path_not_found(path: &str) -> Status {
+    with_reason(
+        Code::NotFound,
+        ErrorReason::PathNotFound,
+        format!("path {path:?} not found"),
+        HashMap::from([("path".to_string(), path.to_string())]),
+    )
+}
+
+/// 建树错误的映射：delta 本身的问题是 INVALID_CHANGESET，存储损坏是 INTERNAL，存储故障可重试。
+pub fn from_tree(err: scion_tree::TreeError) -> Status {
+    use scion_tree::TreeError as E;
+    match &err {
+        E::DeleteMissing(p) | E::DeleteDirectory(p) | E::PathConflict(p) => invalid_changeset(p, err.to_string()),
+        E::BadTree(id, msg) => {
+            tracing::error!(%id, error = %msg, "corrupt or missing tree");
+            Status::internal(format!("tree {id} is missing or corrupt"))
+        }
+        E::Storage(msg) => {
+            tracing::error!(error = %msg, "storage error while building tree");
+            Status::unavailable("storage backend unavailable")
+        }
+    }
+}
+
 /// 存储层错误到 Status 的映射。
 pub fn from_store(err: scion_store::Error) -> Status {
     use scion_store::Error as E;
@@ -145,6 +215,53 @@ mod tests {
         let id = ObjectId::of_blob(b"x");
         let (_, _, md) = info(&object_missing(&[id]));
         assert_eq!(md["ids"], id.to_string());
+    }
+
+    #[test]
+    fn objects_not_uploaded_is_failed_precondition() {
+        let id = ObjectId::of_blob(b"x");
+        let s = objects_not_uploaded(&[id]);
+        assert_eq!(s.code(), Code::FailedPrecondition);
+        let (reason, _, md) = info(&s);
+        assert_eq!(reason, "OBJECT_MISSING");
+        assert_eq!(md["ids"], id.to_string());
+    }
+
+    #[test]
+    fn write_and_query_reasons() {
+        let s = invalid_changeset("a/b", "bad");
+        assert_eq!(
+            (s.code(), info(&s).0.as_str(), info(&s).2["path"].as_str()),
+            (Code::InvalidArgument, "INVALID_CHANGESET", "a/b")
+        );
+        let tip = ObjectId::hash(scion_object::ObjectKind::Changeset, b"t");
+        let s = not_fast_forward("main", &tip);
+        assert_eq!(s.code(), Code::Aborted);
+        assert_eq!(info(&s).0, "NOT_FAST_FORWARD");
+        assert_eq!(info(&s).2["tip"], tip.to_string());
+        let s = ref_not_found("main");
+        assert_eq!((s.code(), info(&s).0.as_str()), (Code::NotFound, "REF_NOT_FOUND"));
+        let s = path_not_found("x");
+        assert_eq!((s.code(), info(&s).0.as_str()), (Code::NotFound, "PATH_NOT_FOUND"));
+    }
+
+    #[test]
+    fn from_tree_maps_every_variant() {
+        use scion_tree::TreeError as E;
+        for e in [
+            E::DeleteMissing("a".into()),
+            E::DeleteDirectory("a".into()),
+            E::PathConflict("a".into()),
+        ] {
+            let s = from_tree(e);
+            assert_eq!(s.code(), Code::InvalidArgument);
+            assert_eq!(info(&s).2["path"], "a");
+        }
+        let id = ObjectId::hash(scion_object::ObjectKind::Tree, b"t");
+        assert_eq!(from_tree(E::BadTree(id, "x".into())).code(), Code::Internal);
+        let s = from_tree(E::Storage("secret".into()));
+        assert_eq!(s.code(), Code::Unavailable);
+        assert!(!s.message().contains("secret"));
     }
 
     #[test]

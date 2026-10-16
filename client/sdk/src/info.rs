@@ -64,6 +64,8 @@ pub struct Limits {
     pub max_chunk_bytes: u64,
     pub max_changes_per_changeset: u32,
     pub max_inline_bytes: u64,
+    /// UploadBlobs 单个对象上限；0 表示服务端未声明。
+    pub max_upload_object_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +125,7 @@ impl ServerInfo {
                 max_chunk_bytes: l.max_chunk_bytes,
                 max_changes_per_changeset: l.max_changes_per_changeset,
                 max_inline_bytes: l.max_inline_bytes,
+                max_upload_object_bytes: l.max_upload_object_bytes,
             },
             read_endpoints: info
                 .read_endpoints
@@ -151,6 +154,7 @@ mod tests {
                 max_chunk_bytes: 20,
                 max_changes_per_changeset: 30,
                 max_inline_bytes: 40,
+                max_upload_object_bytes: 50,
             }),
             read_endpoints: vec![v1::Endpoint {
                 url: "u".into(),
@@ -194,6 +198,7 @@ mod tests {
         assert!(info.has_feature("objects.get"));
         assert!(!info.has_feature("land.batch"));
         assert_eq!(info.limits.max_inline_bytes, 40);
+        assert_eq!(info.limits.max_upload_object_bytes, 50);
         assert_eq!(
             info.read_endpoints,
             vec![ReadEndpoint {

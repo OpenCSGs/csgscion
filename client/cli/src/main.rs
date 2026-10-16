@@ -243,6 +243,7 @@ mod tests {
                 max_chunk_bytes: 1024,
                 max_changes_per_changeset: 1,
                 max_inline_bytes: 1,
+                max_upload_object_bytes: 1,
             },
             read_endpoints: vec![ReadEndpoint {
                 url: "http://cache".into(),

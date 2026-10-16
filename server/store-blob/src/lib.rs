@@ -31,6 +31,8 @@ pub struct S3Config {
     pub virtual_hosted_style: bool,
     /// key 前缀，多个部署共用一个 bucket 时用来隔离，如 `scion/`。
     pub prefix: String,
+    /// 单个请求的最大重试次数；`None` 使用默认值（10 次，指数退避）。
+    pub max_retries: Option<usize>,
 }
 
 impl std::fmt::Debug for S3Config {
@@ -43,6 +45,7 @@ impl std::fmt::Debug for S3Config {
             .field("secret_access_key", &"<redacted>")
             .field("virtual_hosted_style", &self.virtual_hosted_style)
             .field("prefix", &self.prefix)
+            .field("max_retries", &self.max_retries)
             .finish()
     }
 }
@@ -66,7 +69,11 @@ impl ObjectBlobStore {
 
     /// S3 兼容存储。只构造客户端，不发起网络请求；用 [`ObjectBlobStore::self_test`] 检查连通性。
     pub fn s3(cfg: &S3Config) -> Result<Self> {
-        Self::s3_with_retry(cfg, RetryConfig::default())
+        let mut retry = RetryConfig::default();
+        if let Some(n) = cfg.max_retries {
+            retry.max_retries = n;
+        }
+        Self::s3_with_retry(cfg, retry)
     }
 
     fn s3_with_retry(cfg: &S3Config, retry: RetryConfig) -> Result<Self> {
@@ -315,6 +322,16 @@ mod tests {
     }
 
     #[test]
+    fn s3_max_retries_override_accepted() {
+        let cfg = S3Config {
+            bucket: "b".into(),
+            max_retries: Some(0),
+            ..Default::default()
+        };
+        assert!(ObjectBlobStore::s3(&cfg).is_ok());
+    }
+
+    #[test]
     fn s3_missing_bucket_rejected() {
         let cfg = S3Config {
             endpoint: Some("http://127.0.0.1:1".into()),
@@ -333,6 +350,7 @@ mod tests {
             access_key_id: std::env::var("SCION_TEST_S3_ACCESS_KEY").unwrap_or_default(),
             secret_access_key: std::env::var("SCION_TEST_S3_SECRET_KEY").unwrap_or_default(),
             virtual_hosted_style: false,
+            max_retries: None,
             // 每次运行用独立前缀，互不干扰
             prefix: format!(
                 "t{}-{}",
