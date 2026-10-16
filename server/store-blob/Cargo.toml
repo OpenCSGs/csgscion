@@ -1,0 +1,23 @@
+[package]
+name = "scion-store-blob"
+description = "Scion BlobStore on object storage: local filesystem and S3-compatible services"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+object_store.workspace = true
+scion-object.workspace = true
+scion-store.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+scion-store = { workspace = true, features = ["testsuite"] }
+tempfile.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

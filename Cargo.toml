@@ -6,10 +6,15 @@ members = [
     "common/object",
     # 服务端
     "server/store",
+    "server/store-sql",
+    "server/store-blob",
+    "server/tree",
     "server/api",
     "server/scion",
     # 客户端
     "client/sdk",
+    "client/wc",
+    "client/gitimport",
     "client/cli",
     # 开发工具（依赖分层检查等）
     "xtask",
@@ -25,8 +30,13 @@ license = "Apache-2.0"
 scion-proto = { path = "common/protocol" }
 scion-object = { path = "common/object" }
 scion-store = { path = "server/store" }
+scion-store-sql = { path = "server/store-sql" }
+scion-store-blob = { path = "server/store-blob" }
+scion-tree = { path = "server/tree" }
 scion-api = { path = "server/api" }
 scion-client = { path = "client/sdk" }
+scion-wc = { path = "client/wc" }
+scion-gitimport = { path = "client/gitimport" }
 
 anyhow = "1"
 async-trait = "0.1"
@@ -50,6 +60,9 @@ protox = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 cargo_metadata = "0.23"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "postgres", "migrate", "macros"] }
+tempfile = "3"
+object_store = { version = "0.14", default-features = false, features = ["aws", "fs"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

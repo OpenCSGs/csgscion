@@ -1,0 +1,23 @@
+[package]
+name = "scion-gitimport"
+description = "Import git history into Scion through the public protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes.workspace = true
+hex.workspace = true
+scion-client.workspace = true
+scion-object.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+scion-api.workspace = true
+scion-store.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

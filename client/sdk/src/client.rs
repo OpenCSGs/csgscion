@@ -177,7 +177,7 @@ fn source_chain(e: &dyn std::error::Error) -> String {
 /// Scion 客户端。克隆开销很小，可在多个任务间共享。
 #[derive(Debug, Clone)]
 pub struct Client {
-    channel: Channel,
+    pub(crate) channel: Channel,
     auth: Auth,
     repo: Option<String>,
     info: ServerInfo,
@@ -197,11 +197,11 @@ impl Client {
         self.server_info().has_feature(feature)
     }
 
-    fn repo(&self) -> Result<String> {
+    pub(crate) fn repo(&self) -> Result<String> {
         self.repo.clone().ok_or(Error::MissingRepo)
     }
 
-    fn request<T>(&self, msg: T) -> Result<tonic::Request<T>> {
+    pub(crate) fn request<T>(&self, msg: T) -> Result<tonic::Request<T>> {
         make_request(&self.auth, msg)
     }
 

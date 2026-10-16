@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # 在任意分支上手动运行：gh workflow run ci --ref <branch>
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,7 +15,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -26,7 +28,7 @@ jobs:
   proto:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - uses: bufbuild/buf-action@v1
@@ -36,6 +38,8 @@ jobs:
           # 已发布的 v1 协议不允许出现破坏性变更
           breaking: ${{ github.event_name == 'pull_request' }}
           breaking_against: ${{ github.event.repository.clone_url }}#branch=${{ github.base_ref }}
+          # 结果看 CI 日志即可；发 PR 评论需要额外的写权限
+          pr_comment: false
 
   test:
     strategy:
@@ -43,21 +47,84 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
       # golden 向量必须与构造逻辑一致（不允许手改 JSON）
       - run: git diff --exit-code testdata/
 
+  # 真实存储后端（PostgreSQL、S3）的一致性测试；macOS runner 不支持服务容器，单独成 job
+  test-backends:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: scion
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U scion" --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      SCION_TEST_PG_URL: postgres://scion:scion@localhost:5432/scion
+      SCION_TEST_S3_ENDPOINT: http://localhost:8333
+      SCION_TEST_S3_BUCKET: scion-test
+      SCION_TEST_S3_ACCESS_KEY: scion
+      SCION_TEST_S3_SECRET_KEY: scion-dev-secret
+    steps:
+      - uses: actions/checkout@v5
+      # S3 兼容存储（SeaweedFS）；服务容器不支持自定义命令，所以在步骤里启动
+      - name: Start S3 (SeaweedFS)
+        run: |
+          docker run -d --name s3 -p 8333:8333 -v "$PWD/deploy/dev/s3.json:/etc/s3.json:ro" \
+            chrislusf/seaweedfs:4.48 server -s3 -s3.config=/etc/s3.json
+          for i in $(seq 1 60); do
+            docker exec s3 sh -c "echo 's3.bucket.create -name scion-test' | weed shell" 2>/dev/null \
+              | grep -q "created bucket" && exit 0
+            sleep 2
+          done
+          docker logs s3; exit 1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p scion-store-sql -p scion-store-blob
+
   # 函数级测试要求（服务端设计文档 §12.1）
   coverage:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: scion
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U scion" --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      SCION_TEST_PG_URL: postgres://scion:scion@localhost:5432/scion
+      SCION_TEST_S3_ENDPOINT: http://localhost:8333
+      SCION_TEST_S3_BUCKET: scion-test
+      SCION_TEST_S3_ACCESS_KEY: scion
+      SCION_TEST_S3_SECRET_KEY: scion-dev-secret
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       # 分支覆盖率需要 nightly
+      # S3 兼容存储（SeaweedFS）；服务容器不支持自定义命令，所以在步骤里启动
+      - name: Start S3 (SeaweedFS)
+        run: |
+          docker run -d --name s3 -p 8333:8333 -v "$PWD/deploy/dev/s3.json:/etc/s3.json:ro" \
+            chrislusf/seaweedfs:4.48 server -s3 -s3.config=/etc/s3.json
+          for i in $(seq 1 60); do
+            docker exec s3 sh -c "echo 's3.bucket.create -name scion-test' | weed shell" 2>/dev/null \
+              | grep -q "created bucket" && exit 0
+            sleep 2
+          done
+          docker logs s3; exit 1
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: llvm-tools-preview
@@ -67,14 +134,53 @@ jobs:
         run: cargo llvm-cov --workspace --branch --no-report
       - name: Core crates (lines >= 90%, branches >= 80%)
         run: |
-          cargo llvm-cov report --package scion-object --package scion-store \
+          cargo llvm-cov report --package scion-object --package scion-store --package scion-store-sql --package scion-store-blob \
             --ignore-filename-regex '(xtask|testsuite)' --json --summary-only > core.json
           jq -e '.data[0].totals.lines.percent >= 90' core.json
           jq -e '(.data[0].totals.branches.count == 0) or (.data[0].totals.branches.percent >= 80)' core.json
       - name: Whole workspace (lines >= 80%)
         run: cargo llvm-cov report --ignore-filename-regex 'xtask' --fail-under-lines 80
-      - name: Diff coverage (>= 90% of changed lines)
-        if: github.event_name == 'pull_request'
+
+  # PR 新增或修改的代码覆盖率 >= 90%。用 stable 且不收集分支信息：
+  # nightly llvm-cov 导出带分支数据的 lcov 时会崩溃（LLVM 自身的 bug）
+  diff-coverage:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: scion
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U scion" --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      SCION_TEST_PG_URL: postgres://scion:scion@localhost:5432/scion
+      SCION_TEST_S3_ENDPOINT: http://localhost:8333
+      SCION_TEST_S3_BUCKET: scion-test
+      SCION_TEST_S3_ACCESS_KEY: scion
+      SCION_TEST_S3_SECRET_KEY: scion-dev-secret
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      # S3 兼容存储（SeaweedFS）；服务容器不支持自定义命令，所以在步骤里启动
+      - name: Start S3 (SeaweedFS)
         run: |
-          cargo llvm-cov report --ignore-filename-regex 'xtask' --lcov --output-path lcov.info
-          pipx run diff-cover lcov.info --compare-branch=origin/${{ github.base_ref }} --fail-under=90
+          docker run -d --name s3 -p 8333:8333 -v "$PWD/deploy/dev/s3.json:/etc/s3.json:ro" \
+            chrislusf/seaweedfs:4.48 server -s3 -s3.config=/etc/s3.json
+          for i in $(seq 1 60); do
+            docker exec s3 sh -c "echo 's3.bucket.create -name scion-test' | weed shell" 2>/dev/null \
+              | grep -q "created bucket" && exit 0
+            sleep 2
+          done
+          docker logs s3; exit 1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo llvm-cov --workspace --ignore-filename-regex 'xtask' --lcov --output-path lcov.info
+      - run: pipx run diff-cover lcov.info --compare-branch=origin/${{ github.base_ref }} --fail-under=90

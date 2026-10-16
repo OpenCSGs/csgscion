@@ -19,10 +19,12 @@
 mod client;
 mod error;
 mod info;
+mod ops;
 
 pub use client::{Auth, Client, ClientBuilder};
 pub use error::{Error, Result};
 pub use info::{Limits, ProtocolVersion, ReadEndpoint, Role, ServerInfo};
-pub use scion_object::{ObjectId, ObjectKind};
+pub use ops::{ChangesetBuilder, CreatedChangeset, DirEntry, Landed, Person, RefTip, Signature};
+pub use scion_object::{EntryMode, ObjectId, ObjectKind};
 /// gRPC 状态码，出现在 [`Error::Rpc`] 中。
 pub use tonic::Code;

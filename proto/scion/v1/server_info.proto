@@ -55,6 +55,8 @@ message Limits {
   uint32 max_changes_per_changeset = 3;
   // 可以随请求内联上传的最大对象字节数。
   uint64 max_inline_bytes = 4;
+  // UploadBlobs 单个对象的最大字节数。
+  uint64 max_upload_object_bytes = 5;
 }
 
 message Endpoint {

@@ -1,0 +1,22 @@
+[package]
+name = "scion-store-sql"
+description = "Scion MetaStore on SQL: SQLite (Lite) and PostgreSQL / YugabyteDB (Standard / Distributed)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+scion-object.workspace = true
+scion-store.workspace = true
+sqlx.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+scion-store = { workspace = true, features = ["testsuite"] }
+tempfile.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

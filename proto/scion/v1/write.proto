@@ -1,0 +1,81 @@
+syntax = "proto3";
+
+package scion.v1;
+
+import "scion/v1/common.proto";
+
+// 写入：上传文件内容、创建提交。客户端只发结构化数据，规范编码与 id 由服务端计算。
+service WriteService {
+  // 客户端流式上传 Blob。一个对象由一条或多条消息组成：同一 id 的分块按 offset 连续发送，
+  // 最后一块 last=true。服务端校验 BLAKE3 后才写入。只接受 Blob，目录树与提交由服务端生成。
+  rpc UploadBlobs(stream UploadBlobsRequest) returns (UploadBlobsResponse);
+  // 由父提交和 delta 创建提交：服务端建出新的根目录树并返回。相同内容重复创建得到相同 id，天然幂等。
+  rpc CreateChangeset(CreateChangesetRequest) returns (CreateChangesetResponse);
+}
+
+message UploadBlobsRequest {
+  // 仓库，第一条消息必填；后续消息留空或与第一条相同。
+  string repo = 1;
+  bytes id = 2;
+  uint64 offset = 3;
+  bytes data = 4;
+  bool last = 5;
+}
+
+message UploadBlobsResponse {
+  // 成功写入（或早已存在）的对象，按上传顺序。
+  repeated bytes stored_ids = 1;
+}
+
+message Signature {
+  string name = 1;
+  string email = 2;
+  // Unix 毫秒。
+  int64 time_ms = 3;
+  // 相对 UTC 的分钟数，范围 [-1440, 1440]。
+  int32 tz_offset_minutes = 4;
+}
+
+message PutFile {
+  // 只能是文件、可执行文件或符号链接。
+  EntryMode mode = 1;
+  // Blob 的 ObjectId，必须已上传到该仓库。
+  bytes id = 2;
+  uint64 size = 3;
+}
+
+message DeleteFile {}
+
+message FileChange {
+  string path = 1;
+  oneof op {
+    PutFile put = 2;
+    DeleteFile delete = 3;
+  }
+}
+
+message ChangesetSpec {
+  // 父提交，第一个为 first parent；为空表示根提交。
+  repeated bytes parents = 1;
+  Signature author = 2;
+  Signature committer = 3;
+  string message = 4;
+  // 16 字节，跨 rebase 保持不变，用于识别「同一个改动」。
+  bytes change_id = 5;
+  // 顺序不限，服务端按路径排序。
+  repeated FileChange delta = 6;
+  map<string, bytes> extensions = 7;
+}
+
+message CreateChangesetRequest {
+  string repo = 1;
+  // 客户端生成的 UUIDv7，用于幂等。
+  string request_id = 2;
+  ChangesetSpec changeset = 3;
+}
+
+message CreateChangesetResponse {
+  bytes changeset_id = 1;
+  bytes root_tree = 2;
+  uint64 generation = 3;
+}

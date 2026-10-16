@@ -8,10 +8,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use scion_object::{ObjectId, ObjectKind};
 
-use crate::{BlobStore, Error, MetaStore, RefExpect, RefState};
-
-/// [`blob_store`] 使用的仓库名，调用方需事先创建。
-pub const REPO: &str = "conformance/repo";
+use crate::{BlobStore, ChangesetRecord, Error, IndexedObject, MetaStore, RefExpect, RefState};
 
 fn cs(n: u8) -> ObjectId {
     ObjectId::hash(ObjectKind::Changeset, &[n])
@@ -98,34 +95,138 @@ pub async fn meta_store<S: MetaStore + ?Sized>(s: &S) {
     assert_eq!(s.get_ref("a", "Main").await, Ok(None));
 }
 
-/// BlobStore 的语义：幂等写入、读取、FindMissing。
+/// BlobStore 的语义：全局、幂等写入、读取、存在性。
 pub async fn blob_store<S: BlobStore + ?Sized>(s: &S) {
     let a = Bytes::from_static(b"alpha");
     let b = Bytes::from_static(b"");
     let ida = ObjectId::of_blob(&a);
     let idb = ObjectId::of_blob(&b);
-    let idc = ObjectId::of_blob(b"never stored");
 
-    assert_eq!(s.get(REPO, &ida).await, Ok(None));
-    assert_eq!(s.missing(REPO, &[]).await, Ok(vec![]));
-    assert_eq!(s.missing(REPO, &[ida, idb]).await, Ok(vec![ida, idb]));
+    assert_eq!(s.get(&ida).await, Ok(None));
+    assert_eq!(s.exists(&ida).await, Ok(false));
 
-    s.put(REPO, ida, a.clone()).await.expect("put a");
-    s.put(REPO, ida, a.clone()).await.expect("put a again is idempotent");
-    s.put(REPO, idb, b.clone()).await.expect("put empty blob");
+    s.put(ida, a.clone()).await.expect("put a");
+    s.put(ida, a.clone()).await.expect("put a again is idempotent");
+    s.put(idb, b.clone()).await.expect("put empty blob");
 
-    assert_eq!(s.get(REPO, &ida).await, Ok(Some(a)));
-    assert_eq!(s.get(REPO, &idb).await, Ok(Some(b)));
-    // 保持顺序、去重
-    assert_eq!(s.missing(REPO, &[idc, ida, idc, idb]).await, Ok(vec![idc]));
+    assert_eq!(s.get(&ida).await, Ok(Some(a)));
+    assert_eq!(s.get(&idb).await, Ok(Some(b)));
+    assert_eq!(s.exists(&ida).await, Ok(true));
 
-    // 不存在的仓库
-    assert!(matches!(s.get("nope", &ida).await, Err(Error::RepoNotFound(_))));
+    // 字节与 id 不符：拒绝，且不留下任何对象
+    let idc = ObjectId::of_blob(b"claimed");
     assert!(matches!(
-        s.put("nope", ida, Bytes::new()).await,
+        s.put(idc, Bytes::from_static(b"actual")).await,
+        Err(Error::Backend(_))
+    ));
+    assert_eq!(s.exists(&idc).await, Ok(false));
+
+    // 大对象（跨越常见缓冲区边界）
+    let big = Bytes::from(vec![0x5a; 3 << 20]);
+    let idbig = ObjectId::of_blob(&big);
+    s.put(idbig, big.clone()).await.expect("put big");
+    assert_eq!(s.get(&idbig).await, Ok(Some(big)));
+}
+
+/// 对象索引的语义：按仓库隔离、幂等登记、FindMissing。
+pub async fn object_index<S: MetaStore + ?Sized>(s: &S) {
+    s.create_repo("idx/a").await.expect("create");
+    s.create_repo("idx/b").await.expect("create");
+    let o = |d: &[u8]| IndexedObject {
+        id: ObjectId::of_blob(d),
+        size: d.len() as u64,
+    };
+    let (x, y, z) = (o(b"x"), o(b"y"), o(b"z"));
+
+    assert_eq!(s.missing_objects("idx/a", &[]).await, Ok(vec![]));
+    assert_eq!(s.missing_objects("idx/a", &[x.id, y.id]).await, Ok(vec![x.id, y.id]));
+    s.index_objects("idx/a", &[x, y]).await.expect("index");
+    s.index_objects("idx/a", &[x]).await.expect("index again is idempotent");
+    s.index_objects("idx/a", &[]).await.expect("empty batch");
+    // 保持顺序、去重
+    assert_eq!(
+        s.missing_objects("idx/a", &[z.id, x.id, z.id, y.id]).await,
+        Ok(vec![z.id])
+    );
+    // 仓库之间互相隔离
+    assert_eq!(s.missing_objects("idx/b", &[x.id]).await, Ok(vec![x.id]));
+    // 一批内的重复条目
+    s.index_objects("idx/b", &[z, z]).await.expect("duplicates in batch");
+    assert_eq!(s.missing_objects("idx/b", &[z.id]).await, Ok(vec![]));
+
+    assert!(matches!(
+        s.index_objects("nope", &[x]).await,
         Err(Error::RepoNotFound(_))
     ));
-    assert!(matches!(s.missing("nope", &[ida]).await, Err(Error::RepoNotFound(_))));
+    assert!(matches!(
+        s.missing_objects("nope", &[x.id]).await,
+        Err(Error::RepoNotFound(_))
+    ));
+}
+
+/// changeset 记录与 ref 列表的语义。
+pub async fn changesets_and_refs<S: MetaStore + ?Sized>(s: &S) {
+    s.create_repo("cs/a").await.expect("create");
+    s.create_repo("cs/b").await.expect("create");
+    let tree = ObjectId::hash(ObjectKind::Tree, b"t");
+    let root = ChangesetRecord {
+        id: cs(1),
+        root_tree: tree,
+        first_parent: None,
+        generation: 1,
+    };
+    let child = ChangesetRecord {
+        id: cs(2),
+        root_tree: tree,
+        first_parent: Some(cs(1)),
+        generation: u64::from(u32::MAX) + 7,
+    };
+
+    assert_eq!(s.get_changeset("cs/a", &cs(1)).await, Ok(None));
+    s.put_changeset("cs/a", &root).await.expect("put root");
+    s.put_changeset("cs/a", &child).await.expect("put child");
+    assert_eq!(s.get_changeset("cs/a", &cs(1)).await, Ok(Some(root)));
+    assert_eq!(s.get_changeset("cs/a", &cs(2)).await, Ok(Some(child)));
+    // 幂等：保留第一次写入
+    let other = ChangesetRecord {
+        root_tree: ObjectId::hash(ObjectKind::Tree, b"other"),
+        ..root
+    };
+    s.put_changeset("cs/a", &other).await.expect("idempotent put");
+    assert_eq!(s.get_changeset("cs/a", &cs(1)).await, Ok(Some(root)));
+    // 仓库隔离
+    assert_eq!(s.get_changeset("cs/b", &cs(1)).await, Ok(None));
+    assert!(matches!(
+        s.put_changeset("nope", &root).await,
+        Err(Error::RepoNotFound(_))
+    ));
+    assert!(matches!(
+        s.get_changeset("nope", &cs(1)).await,
+        Err(Error::RepoNotFound(_))
+    ));
+
+    // ref 列表：字节序
+    assert_eq!(s.list_refs("cs/a").await, Ok(vec![]));
+    for name in ["main", "Zeta", "feature/x"] {
+        s.cas_ref("cs/a", name, RefExpect::Absent, cs(1))
+            .await
+            .expect("create ref");
+    }
+    s.cas_ref("cs/a", "main", RefExpect::Version(1), cs(2))
+        .await
+        .expect("update");
+    let refs = s.list_refs("cs/a").await.expect("list");
+    let names: Vec<_> = refs.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["Zeta", "feature/x", "main"]);
+    assert_eq!(
+        refs[2].1,
+        RefState {
+            target: cs(2),
+            version: 2
+        }
+    );
+    assert_eq!(s.list_refs("cs/b").await, Ok(vec![]));
+    assert!(matches!(s.list_refs("nope").await, Err(Error::RepoNotFound(_))));
 }
 
 /// 并发 CAS：同一版本上的多个竞争者恰好只有一个成功，且版本严格连续。

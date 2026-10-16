@@ -12,7 +12,10 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+bytes.workspace = true
 scion-client.workspace = true
+scion-gitimport.workspace = true
+scion-wc.workspace = true
 scion-proto.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -22,5 +25,6 @@ tokio.workspace = true
 workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 scion-api.workspace = true
 scion-store.workspace = true

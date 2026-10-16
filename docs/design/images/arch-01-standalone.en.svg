@@ -1,0 +1,151 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1000" viewBox="0 0 1400 1000">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#475569"/></marker>
+  </defs>
+  <style>
+    text{font-family:-apple-system,"Segoe UI","Helvetica Neue",Arial,sans-serif;fill:#0f172a}
+    .h{font-size:24px;font-weight:700}
+    .sub{font-size:13px;fill:#64748b}
+    .lane{font-size:14px;font-weight:700}
+    .t{font-size:15px;font-weight:600}
+    .s{font-size:12px;fill:#475569}
+    .lbl{font-size:12px;fill:#334155}
+    .e{stroke:#475569;stroke-width:1.6;fill:none;marker-end:url(#a)}
+    .d{stroke-dasharray:6 4}
+  </style>
+  <rect width="1400" height="1000" fill="#ffffff"/>
+  <text x="40" y="44" class="h">Scion standalone architecture (Rust)</text>
+  <text x="40" y="68" class="sub">Content-addressed · computed server-side · three cache tiers (L1 node / L2 region / L3 authority) · the only mutable state is refs (single-row CAS)</text>
+
+  <!-- Lane A: clients -->
+  <rect x="20" y="88" width="1360" height="172" rx="10" fill="#eff6ff"/>
+  <text x="34" y="112" class="lane" fill="#1d4ed8">Clients</text>
+  <rect x="160" y="104" width="640" height="140" rx="8" fill="#fff" stroke="#93c5fd"/>
+  <text x="176" y="128" class="s">Official default client in Rust (scion-client SDK / scion-wc / scn)</text>
+  <rect x="176" y="142" width="196" height="86" rx="6" fill="#dbeafe" stroke="#60a5fa"/>
+  <text x="274" y="176" text-anchor="middle" class="t">scn CLI</text>
+  <text x="274" y="198" text-anchor="middle" class="s">clone · commit · land · sync</text>
+  <text x="274" y="216" text-anchor="middle" class="s">--json for agents</text>
+  <rect x="386" y="142" width="196" height="86" rx="6" fill="#dbeafe" stroke="#60a5fa"/>
+  <text x="484" y="176" text-anchor="middle" class="t">Agent / CI</text>
+  <text x="484" y="198" text-anchor="middle" class="s">Rust SDK, API only</text>
+  <text x="484" y="216" text-anchor="middle" class="s">no checkout needed</text>
+  <rect x="596" y="142" width="190" height="86" rx="6" fill="#dbeafe" stroke="#60a5fa"/>
+  <text x="691" y="176" text-anchor="middle" class="t">Web / scripts</text>
+  <text x="691" y="198" text-anchor="middle" class="s">gRPC-Web · REST/JSON</text>
+  <text x="691" y="216" text-anchor="middle" class="s">other languages: codegen</text>
+
+  <rect x="900" y="104" width="440" height="140" rx="8" fill="#dbeafe" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="920" y="132" class="t">scn daemon (L1, one per node)</text>
+  <text x="920" y="158" class="s">· Local CAS cache (bounded LRU, BLAKE3-verified)</text>
+  <text x="920" y="180" class="s">· Serves ObjectService locally, forwards other RPCs</text>
+  <text x="920" y="202" class="s">· Prefetches new trees via WatchRefs · holds no credentials</text>
+  <text x="920" y="224" class="s">· Working copy: sparse checkout / virtual FS (FUSE·NFS, later)</text>
+  <path d="M800,174 L898,174" class="e"/>
+  <text x="849" y="166" text-anchor="middle" class="lbl">Unix socket</text>
+
+  <!-- Lane B: L2 -->
+  <rect x="20" y="280" width="1360" height="130" rx="10" fill="#f0fdf4"/>
+  <text x="34" y="304" class="lane" fill="#15803d">Regional cache L2</text>
+  <rect x="160" y="316" width="400" height="78" rx="8" fill="#dcfce7" stroke="#22c55e"/>
+  <text x="180" y="342" class="t">scion cache ×N (region A)</text>
+  <text x="180" y="364" class="s">foyer memory + NVMe · rendezvous sharding</text>
+  <text x="180" y="382" class="s">singleflight fills · hedged requests · stateless</text>
+  <rect x="600" y="316" width="400" height="78" rx="8" fill="#dcfce7" stroke="#22c55e"/>
+  <text x="620" y="342" class="t">scion cache ×N (region B)</text>
+  <text x="620" y="364" class="s">Same ObjectService as L1 and L3</text>
+  <text x="620" y="382" class="s">Strict tiering: never bypasses to origin</text>
+  <path d="M960,244 L960,314" class="e"/>
+  <text x="952" y="284" text-anchor="end" class="lbl">reads: L1 miss</text>
+  <path d="M360,244 L360,314" class="e d"/>
+  <text x="368" y="284" class="lbl">no daemon: nearest L2 directly</text>
+  <text x="1028" y="300" class="lbl">writes / queries / refs:</text>
+  <text x="1028" y="316" class="lbl">passed through to L3</text>
+
+  <!-- Lane C: L3 -->
+  <rect x="20" y="430" width="1360" height="290" rx="10" fill="#fff7ed"/>
+  <text x="34" y="454" class="lane" fill="#c2410c">Authority L3</text>
+  <path d="M1020,244 L1020,486" class="e d"/>
+  <path d="M360,394 L360,486" class="e"/>
+  <text x="368" y="440" class="lbl">misses go to origin (~1%)</text>
+  <path d="M800,394 L800,486" class="e"/>
+
+  <rect x="160" y="488" width="880" height="216" rx="8" fill="#ffedd5" stroke="#f97316" stroke-width="1.5"/>
+  <text x="180" y="514" class="t">scion server ×N (stateless; one binary, role per subcommand)</text>
+  <rect x="180" y="526" width="840" height="30" rx="5" fill="#fff" stroke="#fdba74"/>
+  <text x="600" y="546" text-anchor="middle" class="s">Gateway: tonic gRPC · tonic-web · axum REST (pbjson) · TLS + Bearer JWT</text>
+  <rect x="180" y="562" width="840" height="30" rx="5" fill="#fff" stroke="#fdba74"/>
+  <text x="600" y="582" text-anchor="middle" class="s">tower middleware: authn → rate limit → concurrency limit / load shedding → deadlines → idempotency → authz</text>
+  <g>
+    <rect x="180" y="602" width="130" height="88" rx="6" fill="#fff" stroke="#fb923c"/>
+    <text x="245" y="628" text-anchor="middle" class="t">Object</text>
+    <text x="245" y="650" text-anchor="middle" class="s">GetObjects</text>
+    <text x="245" y="668" text-anchor="middle" class="s">GetTrees · upload</text>
+    <rect x="322" y="602" width="130" height="88" rx="6" fill="#fff" stroke="#fb923c"/>
+    <text x="387" y="628" text-anchor="middle" class="t">Write</text>
+    <text x="387" y="650" text-anchor="middle" class="s">CreateChangeset</text>
+    <text x="387" y="668" text-anchor="middle" class="s">TreeBuilder</text>
+    <rect x="464" y="602" width="130" height="88" rx="6" fill="#fed7aa" stroke="#ea580c"/>
+    <text x="529" y="628" text-anchor="middle" class="t">Land</text>
+    <text x="529" y="650" text-anchor="middle" class="s">rebase + CAS</text>
+    <text x="529" y="668" text-anchor="middle" class="s">batching leader per ref</text>
+    <rect x="606" y="602" width="130" height="88" rx="6" fill="#fff" stroke="#fb923c"/>
+    <text x="671" y="628" text-anchor="middle" class="t">Ref</text>
+    <text x="671" y="650" text-anchor="middle" class="s">Resolve · CAS</text>
+    <text x="671" y="668" text-anchor="middle" class="s">WatchRefs</text>
+    <rect x="748" y="602" width="130" height="88" rx="6" fill="#fff" stroke="#fb923c"/>
+    <text x="813" y="628" text-anchor="middle" class="t">Query</text>
+    <text x="813" y="650" text-anchor="middle" class="s">log · blame · diff</text>
+    <text x="813" y="668" text-anchor="middle" class="s">ReadFile · Archive</text>
+    <rect x="890" y="602" width="130" height="88" rx="6" fill="#fff" stroke="#fb923c"/>
+    <text x="955" y="628" text-anchor="middle" class="t">Auth / Admin</text>
+    <text x="955" y="650" text-anchor="middle" class="s">JWT · ACL</text>
+    <text x="955" y="668" text-anchor="middle" class="s">RepoAdmin · Redact</text>
+  </g>
+
+  <rect x="1070" y="488" width="290" height="64" rx="8" fill="#ffedd5" stroke="#f97316"/>
+  <text x="1086" y="514" class="t">scion deriver ×N</text>
+  <text x="1086" y="536" class="s">follows cs_log: tree · gen · blame · GitSha…</text>
+  <rect x="1070" y="564" width="290" height="64" rx="8" fill="#ffedd5" stroke="#f97316"/>
+  <text x="1086" y="590" class="t">scion janitor</text>
+  <text x="1086" y="612" class="s">orphan/staging GC · redaction purge · snapshots</text>
+  <rect x="1070" y="640" width="290" height="64" rx="8" fill="#fff" stroke="#f97316" stroke-dasharray="6 4"/>
+  <text x="1086" y="666" class="t">scion git-gateway (later)</text>
+  <text x="1086" y="688" class="s">Gitaly SmartHTTP/SSH subset for the git CLI</text>
+
+  <!-- Lane D: storage -->
+  <rect x="20" y="740" width="1360" height="200" rx="10" fill="#f5f3ff"/>
+  <text x="34" y="764" class="lane" fill="#6d28d9">Storage</text>
+  <path d="M420,704 L420,774" class="e"/>
+  <path d="M860,704 L860,774" class="e"/>
+  <path d="M1000,704 L1000,722 L1230,722 L1230,774" class="e"/>
+  <text x="1238" y="760" class="lbl">events</text>
+
+  <rect x="160" y="776" width="520" height="148" rx="8" fill="#ede9fe" stroke="#8b5cf6"/>
+  <text x="180" y="802" class="t">MetaStore (one sqlx codebase, three tiers)</text>
+  <text x="180" y="826" class="s">changesets · cs_log(WAL) · refs(CAS) · derived · leases · idempotency</text>
+  <rect x="180" y="840" width="150" height="70" rx="6" fill="#fff" stroke="#a78bfa"/>
+  <text x="255" y="866" text-anchor="middle" class="t">SQLite</text>
+  <text x="255" y="888" text-anchor="middle" class="s">Lite · single node</text>
+  <rect x="345" y="840" width="150" height="70" rx="6" fill="#fff" stroke="#a78bfa"/>
+  <text x="420" y="866" text-anchor="middle" class="t">PostgreSQL</text>
+  <text x="420" y="888" text-anchor="middle" class="s">Standard · Patroni</text>
+  <rect x="510" y="840" width="150" height="70" rx="6" fill="#fff" stroke="#a78bfa"/>
+  <text x="585" y="866" text-anchor="middle" class="t">YugabyteDB</text>
+  <text x="585" y="888" text-anchor="middle" class="s">Distributed · 3 AZ</text>
+
+  <rect x="700" y="776" width="400" height="148" rx="8" fill="#ede9fe" stroke="#8b5cf6"/>
+  <text x="720" y="802" class="t">BlobStore (immutable · content-addressed)</text>
+  <text x="720" y="828" class="s">S3-compatible: AWS S3 · SeaweedFS · MinIO · Ceph · OSS</text>
+  <text x="720" y="850" class="s">Local filesystem (Lite)</text>
+  <text x="720" y="872" class="s">zstd · FastCDC chunking · presigned direct reads</text>
+  <text x="720" y="894" class="s">Core S3 API only · startup self-test</text>
+
+  <rect x="1120" y="776" width="240" height="148" rx="8" fill="#ede9fe" stroke="#8b5cf6"/>
+  <text x="1140" y="802" class="t">EventBus</text>
+  <text x="1140" y="828" class="s">NATS JetStream</text>
+  <text x="1140" y="850" class="s">scion.&lt;repo&gt;.ref.updated</text>
+  <text x="1140" y="872" class="s">→ CI triggers / external systems</text>
+
+  <text x="40" y="972" class="sub">Solid: main path  ·  Dashed: optional / later  ·  L1, L2 and L3 serve the same ObjectService, so clients need not know the cache topology</text>
+</svg>

@@ -11,8 +11,10 @@ bytes.workspace = true
 scion-object.workspace = true
 scion-proto.workspace = true
 thiserror.workspace = true
+tokio-stream.workspace = true
 tonic.workspace = true
 tonic-types.workspace = true
+uuid = { version = "1", features = ["v7"] }
 
 [dev-dependencies]
 # 只有测试可以在进程内拉起服务端（客户端文档 §0）

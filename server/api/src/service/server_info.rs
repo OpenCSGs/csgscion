@@ -20,9 +20,18 @@ impl ServerInfoSvc {
 
     /// 当前实现的能力。只有真正实现了的能力才能出现在这里。
     fn features() -> Vec<String> {
-        [features::OBJECTS_GET, features::OBJECTS_HAS]
-            .map(String::from)
-            .to_vec()
+        [
+            features::OBJECTS_GET,
+            features::OBJECTS_HAS,
+            features::WRITE_UPLOAD,
+            features::WRITE_CHANGESET,
+            features::LAND_DIRECT,
+            features::REFS,
+            features::QUERY_READ_FILE,
+            features::QUERY_LIST_DIR,
+        ]
+        .map(String::from)
+        .to_vec()
     }
 
     fn info(&self) -> v1::ServerInfo {

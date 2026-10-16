@@ -40,4 +40,28 @@ enum ErrorReason {
   ERROR_REASON_REPO_NOT_FOUND = 8;
   ERROR_REASON_INVALID_OBJECT_ID = 9;
   ERROR_REASON_LIMIT_EXCEEDED = 10;
+  // changeset 的 delta 无法应用到父提交上（删除不存在的文件、路径冲突等），metadata.path 为出错路径。
+  ERROR_REASON_INVALID_CHANGESET = 11;
+  // 合入的 changeset 不是 ref 当前提交的直接后继（M1 尚无服务端 rebase），metadata.tip 为当前提交。
+  ERROR_REASON_NOT_FAST_FORWARD = 12;
+  ERROR_REASON_REF_NOT_FOUND = 13;
+  ERROR_REASON_PATH_NOT_FOUND = 14;
+}
+
+// 目录条目类型，取值与 SPEC.md §4 的 mode 字节一致。
+enum EntryMode {
+  ENTRY_MODE_UNSPECIFIED = 0;
+  ENTRY_MODE_FILE = 1;
+  ENTRY_MODE_EXECUTABLE = 2;
+  ENTRY_MODE_SYMLINK = 3;
+  ENTRY_MODE_TREE = 4;
+}
+
+message TreeEntry {
+  string name = 1;
+  EntryMode mode = 2;
+  // 34 字节 ObjectId。
+  bytes id = 3;
+  // 文件字节数；目录为 0。
+  uint64 size = 4;
 }

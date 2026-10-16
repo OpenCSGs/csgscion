@@ -27,6 +27,13 @@ pub fn parse_reason(s: &str) -> Option<v1::ErrorReason> {
 pub mod features {
     pub const OBJECTS_GET: &str = "objects.get";
     pub const OBJECTS_HAS: &str = "objects.has";
+    pub const WRITE_UPLOAD: &str = "write.upload";
+    pub const WRITE_CHANGESET: &str = "write.changeset";
+    /// M1 的合入：只允许快进，不做服务端 rebase。
+    pub const LAND_DIRECT: &str = "land.direct";
+    pub const REFS: &str = "refs";
+    pub const QUERY_READ_FILE: &str = "query.read_file";
+    pub const QUERY_LIST_DIR: &str = "query.list_dir";
 }
 
 #[cfg(test)]

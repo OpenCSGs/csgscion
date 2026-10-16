@@ -242,7 +242,7 @@ Changeset { parents, author, committer, time, message, change_id, delta: [FileCh
 | 表 | 主键 | 说明 |
 |---|---|---|
 | `repos` | repo_id | 配置、限额 |
-| `objects_index` | (repo_id, id) | 大小、存储位置（inline 或 S3 key）、redaction 标记 |
+| `objects_index` | (repo_id, id) | 仓库能看到哪些对象：大小、redaction 标记。对象字节本身全局只存一份，这张表决定可见性 |
 | `objects_inline` | (repo_id, id) | 小于 4 KiB 的对象直接内联存储（tree 大多很小） |
 | `changesets` | (repo_id, cs_id) | 规范编码字节、gen、first_parent |
 | `cs_log` | (repo_id, seq) | WAL，序号单调递增（每仓库一个 sequence） |
@@ -257,7 +257,7 @@ Changeset { parents, author, committer, time, message, change_id, delta: [FileCh
 热点规避：Distributed 档的表都以 `HASH(repo_id)` 作为分片键，避免同一个仓库的写入集中到单个 tablet；`cs_log` 的序号做法见上表。Standard 和 Lite 档不需要处理热点。
 
 ### 4.5 Blob 存储布局
-`s3://bucket/{repo_shard}/{kind}/{hh}/{hex}`，对象内容为 zstd 压缩后的字节。
+`s3://bucket/{prefix}objects/{kind}/{hh}/{hex}`。**对象字节全局只存一份**，不按仓库分目录：相同内容（例如同一模型的量化版、微调版之间的公共分片）在所有仓库中只存一次。仓库能读到哪些对象由 `objects_index` 决定，`HasObjects` 和 `GetObjects` 都先查索引，因此一个仓库无法探测其它仓库有哪些对象。M1 存原始字节，zstd 压缩在后续里程碑加入（以 key 后缀区分，旧对象照常可读）。
 
 写入顺序不变式：**blob 持久化 → changeset 与 cs_tree 持久化 → ref CAS**。读路径永远不会看到悬挂引用。
 
@@ -309,17 +309,20 @@ storage_class     = ""                      # 可选
 3. 客户端调用 `CommitUpload(expected_id)`。服务端流式读回数据并校验 hash，通过后用 CopyObject 放到正式的 CAS key 下，然后删除暂存数据。
 4. 校验失败就删除暂存数据并返回错误。janitor 会清理超过 24 小时仍未提交的暂存数据。
 
-**key 布局**：`{prefix}{repo_shard}/{kind}/{hh}/{hex}`。用 hash 作前缀，可以把对象均匀分散到 MinIO 的各个 erasure set 和 S3 的各个分区；`staging/` 和 `snapshots/` 是独立的前缀，方便单独配置生命周期规则。
+**key 布局**：`{prefix}objects/{kind}/{hh}/{hex}`。用 hash 作前缀，可以把对象均匀分散到 MinIO 的各个 erasure set 和 S3 的各个分区；`staging/` 和 `snapshots/` 是独立的前缀，方便单独配置生命周期规则。
 
 **兼容性测试矩阵（CI）**：
 | 后端 | 方式 | 频率 |
 |---|---|---|
-| MinIO（锁定版本） | testcontainers | 每个 PR |
-| Ceph RGW、SeaweedFS | testcontainers | 每晚 |
+| SeaweedFS（锁定版本，开启签名鉴权） | CI 中 `docker run`，与本地开发环境 `deploy/dev` 相同 | 每个 PR |
+| 本地文件系统（`object_store::local`） | 单元测试和 Lite 档 | 每个 PR |
+| Ceph RGW、RustFS、MinIO 存量版本 | 容器 | 每晚 |
 | AWS S3、阿里云 OSS、华为 OBS | 真实账号，使用专门的测试 bucket | 每周和发布前 |
-| 本地文件系统（`object_store::local`） | 单元测试和开发环境 | 每个 PR |
 
-> 注意：MinIO 社区版近年来调整了发行和维护策略。我们**只依赖标准 S3 语义，不使用任何 MinIO 专有 API**（如 `mc admin`、MinIO 的事件通知），以后迁到 Ceph、SeaweedFS 或云厂商存储时不需要改代码。
+> **MinIO 开源版已停止维护**（2026-10 核实）：官方下载站对全部社区版程序返回 `410 Gone`，说明 MinIO Server、mc、KES 开源项目已归档，不再提供安全更新，也不再处理漏洞报告。因此：
+> - 开发环境和 PR 级 CI 改用 **SeaweedFS**（Apache 2.0，仍在维护）作为默认 S3 兼容存储；
+> - 我们**只依赖标准 S3 语义，不使用任何 MinIO 专有 API**（如 `mc admin`、MinIO 的事件通知），所以 starhub 现有的 MinIO 依然可以直接使用，以后迁到 SeaweedFS、Ceph、RustFS 或云厂商存储时不需要改代码；
+> - 建议新部署优先选择仍在维护的 S3 兼容存储，存量 MinIO 部署评估迁移计划。
 
 ---
 
@@ -340,7 +343,7 @@ common/                服务端和客户端共用，只能依赖 common
 server/                服务端，可依赖 common 与更低层的 server crate
   store/               scion-store        trait MetaStore / BlobStore + 内存实现 + 后端一致性测试套件
   store-sql/           scion-store-sql    sqlx：SQLite / PostgreSQL / YugabyteDB 三档 + Dialect
-  store-blob/          scion-store-blob   object_store：S3 / MinIO / 本地文件系统
+  store-blob/          scion-store-blob   object_store：S3 兼容存储 / 本地文件系统
   merge/               scion-merge        diff3、三方合并、冲突描述（纯计算）
   tree/                scion-tree         增量 TreeBuilder
   derive/              scion-derive       派生框架 + 各 deriver
@@ -357,6 +360,7 @@ client/                客户端，只能依赖 common 与 client，禁止依赖
   wc/                  scion-wc           工作副本
   daemon/              scion-daemon       节点 L1 缓存
   vfs/                 scion-vfs          虚拟化 checkout（M7 之后）
+  gitimport/           scion-gitimport    git 历史导入（只走公开协议，scn import git）
   cli/                 scion-cli          二进制 scn
 
 testing/               scion-testkit（假后端、故障注入、git 差分对照、lincheck）
@@ -547,7 +551,7 @@ pub trait Deriver: Send + Sync + 'static {
 
 **写法约定**
 - 测试命名：`<函数名>_<场景>_<预期>`，如 `decode_tree_unsorted_entries_rejected`。
-- 测试必须确定、可重复：不依赖网络、真实时间和执行顺序；时间和随机数通过注入的 `Clock`、种子控制。需要外部服务（PG、MinIO）的测试放在 `tests/` 下，用 `#[ignore]` 或 feature 隔离，在 CI 的集成阶段统一跑。
+- 测试必须确定、可重复：不依赖网络、真实时间和执行顺序；时间和随机数通过注入的 `Clock`、种子控制。需要外部服务（PG、S3）的测试放在 `tests/` 下，用 `#[ignore]` 或 feature 隔离，在 CI 的集成阶段统一跑。
 - 只断言行为，不断言实现细节；错误用 `matches!` 断言具体变体，不比较错误文案。
 - 单个单元测试应在 100 毫秒内完成。
 
@@ -588,7 +592,11 @@ SDK、工作副本、daemon 和 CLI 的完整设计见 [`rust-client-architectur
 | 里程碑 | 周期 | 内容 | 验收 |
 |---|---|---|---|
 | **M0 协议与骨架** | 2 周 | proto v1 + buf CI、`scion-object`、golden 测试向量、内存版 store、单二进制骨架、`GetServerInfo`、覆盖率门槛接入 CI | 编码向量测试通过；`scion-client` 能连上并完成能力协商；满足 §12.1 |
-| **M1 最小闭环** | 4 周 | sqlx（SQLite + PostgreSQL）+ object_store（本地文件系统 + MinIO）、Lite 模式、Upload/CreateChangeset/TreeBuilder、直接 CAS 的 Land、ReadFile/ListDir/GetTrees、git 导入 | `scn` 完成 clone(sparse)/commit/land；差分测试通过 |
+| **M1 最小闭环** | 4 周 | sqlx（SQLite + PostgreSQL）+ object_store（本地文件系统 + S3 兼容存储，CI 用 SeaweedFS）、Lite 模式、Upload/CreateChangeset/TreeBuilder、直接 CAS 的 Land、ReadFile/ListDir/GetTrees、git 导入 | `scn` 完成 clone(sparse)/commit/land；差分测试通过 |
+
+> **M1 实现说明**（2026-10-16）：
+> - **git 导入放在客户端**（`client/gitimport`，命令 `scn import git <path> --repo NAME`），只通过公开协议写入，与普通用户走同一条校验路径；服务端不需要额外的写入通道。结果确定：`change_id` 由 git sha 推导，git sha 存入扩展字段 `git.sha1`，重复导入得到相同的提交 id；增量导入沿第一父提交链逐个快进。差分测试逐个提交比对 git 与 Scion 的文件列表、mode、内容和元数据。大仓库的批量导入（starhub 迁移，§16）后续改为服务端直写。
+> - **合入只支持快进**；工作副本的 `scn sync` 在客户端做文件级 rebase，冲突以退出码 3 报告。M3 的服务端 rebase 上线后，`Land` 直接处理落后的提交。
 | **M2 派生与查询** | 3 周 | 派生框架、Gen/SkipList/PathHistory/Blame、Log/Blame/Diff/MergeBase、deriver 进程 | 在 10 万提交的仓库上，查询 p99 小于 100 毫秒 |
 | **M3 高并发** | 3 周 | LandCoordinator 批处理和租约、幂等表、限流与过载丢弃、lincheck | 单 ref 每秒 200 次以上 land；leader 被杀时没有重复或丢失的合入 |
 | **M4 缓存层** | 3 周 | `scion cache`(foyer + rendezvous + singleflight + 对冲)、WatchRefs、预热 | L2 命中率不低于 99%；单节点 20 万对象读/秒以上 |
