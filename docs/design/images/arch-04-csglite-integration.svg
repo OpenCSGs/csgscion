@@ -1,0 +1,136 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="880" viewBox="0 0 1400 880">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#475569"/></marker>
+    <marker id="b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#db2777"/></marker>
+  </defs>
+  <style>
+    text{font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",sans-serif;fill:#0f172a}
+    .h{font-size:24px;font-weight:700}
+    .sub{font-size:13px;fill:#64748b}
+    .lane{font-size:14px;font-weight:700}
+    .t{font-size:15px;font-weight:600}
+    .s{font-size:12px;fill:#475569}
+    .lbl{font-size:12px;fill:#334155}
+    .lblp{font-size:12px;fill:#be185d;font-weight:600}
+    .k{font-size:13px;font-weight:700;fill:#be185d}
+    .e{stroke:#475569;stroke-width:1.6;fill:none;marker-end:url(#a)}
+    .p{stroke:#db2777;stroke-width:1.8;fill:none;marker-end:url(#b)}
+    .pd{stroke-dasharray:6 4}
+    .bi{marker-start:url(#b)}
+  </style>
+  <rect width="1400" height="880" fill="#ffffff"/>
+  <text x="40" y="44" class="h">Scion × CSGLite：四种结合方式（可叠加，由浅入深）</text>
+  <text x="40" y="68" class="sub">CSGLite = Go 单二进制本地推理工具（SQLite · llama.cpp · 局域网集群 mDNS）；现状通过 starhub 的 HF 兼容 /resolve 下载模型</text>
+
+  <!-- Top: CSGHub platform -->
+  <rect x="20" y="86" width="1360" height="244" rx="10" fill="#f0fdfa"/>
+  <text x="34" y="110" class="lane" fill="#0f766e">CSGHub 平台</text>
+  <rect x="60" y="124" width="380" height="180" rx="8" fill="#ccfbf1" stroke="#14b8a6" stroke-width="1.5"/>
+  <text x="80" y="150" class="t">starhub-server（Go）</text>
+  <text x="80" y="176" class="s">HF 兼容：/api/v1/{type}/{ns}/{name}/resolve/{path}</text>
+  <text x="80" y="198" class="s">RoutingGitServer：Scion 仓库 → scion adapter</text>
+  <text x="80" y="220" class="s">大文件：302 → MinIO 预签名 URL（与现有 LFS 一致）</text>
+  <text x="80" y="242" class="s">签发 JWT（CSGLite 的访问令牌换取）</text>
+  <text x="80" y="264" class="s">模型 / 数据集元数据 · 市场 · 权限</text>
+
+  <rect x="470" y="124" width="520" height="180" rx="8" fill="#ffedd5" stroke="#f97316" stroke-width="1.5"/>
+  <text x="490" y="150" class="t">Scion（Rust）</text>
+  <rect x="490" y="166" width="230" height="118" rx="6" fill="#dcfce7" stroke="#22c55e"/>
+  <text x="605" y="194" text-anchor="middle" class="t">scion cache（L2）</text>
+  <text x="605" y="218" text-anchor="middle" class="s">区域缓存 · singleflight</text>
+  <text x="605" y="238" text-anchor="middle" class="s">ObjectService</text>
+  <text x="605" y="258" text-anchor="middle" class="s">（与 L1 同一协议）</text>
+  <rect x="740" y="166" width="230" height="118" rx="6" fill="#fed7aa" stroke="#ea580c"/>
+  <text x="855" y="194" text-anchor="middle" class="t">scion server（L3）</text>
+  <text x="855" y="218" text-anchor="middle" class="s">模型仓库 = Scion 仓库</text>
+  <text x="855" y="238" text-anchor="middle" class="s">Land · Query · Archive</text>
+  <text x="855" y="258" text-anchor="middle" class="s">Sha256 派生（HF/LFS 兼容）</text>
+  <path d="M720,225 L738,225" class="e"/>
+
+  <rect x="1020" y="124" width="340" height="180" rx="8" fill="#ede9fe" stroke="#8b5cf6" stroke-width="1.5"/>
+  <text x="1040" y="150" class="t">MinIO / S3</text>
+  <text x="1040" y="176" class="s">模型权重按 FastCDC 分块存储</text>
+  <text x="1040" y="198" class="s">内容寻址：不同模型的相同分片只存一份</text>
+  <text x="1040" y="220" class="s">（量化版、微调版、LoRA 合并版之间大量重复）</text>
+  <text x="1040" y="242" class="s">预签名直连下载，减轻服务端带宽</text>
+  <path d="M440,214 L468,214" class="e"/>
+  <path d="M990,214 L1018,214" class="e"/>
+
+  <!-- Bottom: LAN -->
+  <rect x="20" y="370" width="1360" height="440" rx="10" fill="#fdf2f8"/>
+  <text x="1366" y="394" text-anchor="end" class="lane" fill="#be185d">局域网 · CSGLite 集群（mDNS 发现 · 共享密钥）</text>
+
+  <rect x="60" y="410" width="560" height="380" rx="10" fill="#fff" stroke="#db2777" stroke-width="1.5"/>
+  <text x="228" y="436" class="t">CSGLite 节点 A（Go 单二进制）</text>
+  <!-- left col -->
+  <rect x="80" y="452" width="250" height="78" rx="6" fill="#dbeafe" stroke="#60a5fa"/>
+  <text x="205" y="478" text-anchor="middle" class="t">① 下载器（现有）</text>
+  <text x="205" y="500" text-anchor="middle" class="s">internal/csghub · HTTP /resolve</text>
+  <text x="205" y="518" text-anchor="middle" class="s">断点续传 · LFS 回退</text>
+  <rect x="80" y="546" width="250" height="88" rx="6" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text x="205" y="574" text-anchor="middle" class="t">模型库 / 推理</text>
+  <text x="205" y="596" text-anchor="middle" class="s">llama.cpp · MLX · GGUF</text>
+  <text x="205" y="616" text-anchor="middle" class="s">SQLite：模型元数据 / 用量</text>
+  <rect x="80" y="650" width="250" height="122" rx="6" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text x="205" y="680" text-anchor="middle" class="t">OpenAI 兼容 API · Web UI</text>
+  <text x="205" y="704" text-anchor="middle" class="s">Coding Agents（Claude Code 等）</text>
+  <text x="205" y="724" text-anchor="middle" class="s">集群路由：请求转给</text>
+  <text x="205" y="744" text-anchor="middle" class="s">最快能完成的节点</text>
+  <!-- right col -->
+  <rect x="350" y="452" width="250" height="78" rx="6" fill="#fdf2f8" stroke="#db2777" stroke-width="2"/>
+  <text x="475" y="478" text-anchor="middle" class="t">② Scion 拉取器 ★</text>
+  <text x="475" y="500" text-anchor="middle" class="s">ObjectService · 分块 + BLAKE3 校验</text>
+  <text x="475" y="518" text-anchor="middle" class="s">只拉缺失分片 · 跨模型去重</text>
+  <rect x="350" y="546" width="250" height="88" rx="6" fill="#fdf2f8" stroke="#db2777" stroke-width="2" stroke-dasharray="6 4"/>
+  <text x="475" y="574" text-anchor="middle" class="t">④ scion --lite（可选嵌入）</text>
+  <text x="475" y="596" text-anchor="middle" class="s">SQLite + 本地 FS</text>
+  <text x="475" y="616" text-anchor="middle" class="s">本地微调模型 / 数据集 / 工作区版本化</text>
+  <rect x="350" y="650" width="250" height="122" rx="6" fill="#fdf2f8" stroke="#db2777" stroke-width="2"/>
+  <text x="475" y="680" text-anchor="middle" class="t">③ Scion 读缓存（L1）★</text>
+  <text x="475" y="704" text-anchor="middle" class="s">本地 CAS · 有界 LRU</text>
+  <text x="475" y="724" text-anchor="middle" class="s">对局域网提供 ObjectService</text>
+  <text x="475" y="744" text-anchor="middle" class="s">先问邻居 → 再回源 L2</text>
+
+  <rect x="660" y="410" width="330" height="380" rx="10" fill="#fff" stroke="#db2777" stroke-width="1.5"/>
+  <text x="680" y="436" class="t">CSGLite 节点 B / C …</text>
+  <rect x="680" y="452" width="290" height="78" rx="6" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text x="825" y="486" text-anchor="middle" class="t">模型库 / 推理</text>
+  <text x="825" y="508" text-anchor="middle" class="s">同一个 csghub-lite 二进制</text>
+  <rect x="680" y="546" width="290" height="88" rx="6" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text x="825" y="580" text-anchor="middle" class="t">OpenAI 兼容 API</text>
+  <text x="825" y="602" text-anchor="middle" class="s">接收节点 A 转发的请求</text>
+  <rect x="680" y="650" width="290" height="122" rx="6" fill="#fdf2f8" stroke="#db2777" stroke-width="2"/>
+  <text x="825" y="680" text-anchor="middle" class="t">③ Scion 读缓存（L1）★</text>
+  <text x="825" y="704" text-anchor="middle" class="s">邻居节点互为缓存</text>
+  <text x="825" y="724" text-anchor="middle" class="s">取代现有「节点间复制模型」</text>
+  <text x="825" y="744" text-anchor="middle" class="s">按对象 hash 共享，天然可校验</text>
+
+  <!-- arrows -->
+  <path d="M205,450 L205,306" class="e"/>
+  <text x="213" y="350" class="lbl">① HTTP /resolve（现状）</text>
+  <path d="M540,450 L540,286" class="p"/>
+  <text x="532" y="350" text-anchor="end" class="lblp">② ObjectService</text>
+  <path d="M600,590 L640,590 L640,346 L930,346 L930,286" class="p pd"/>
+  <text x="790" y="340" text-anchor="middle" class="lblp">④ land / 推送到 CSGHub</text>
+  <path d="M602,711 L678,711" class="p bi"/>
+  <text x="640" y="764" text-anchor="middle" class="lblp">③</text>
+
+  <!-- legend -->
+  <rect x="1020" y="410" width="340" height="380" rx="10" fill="#fff" stroke="#e2e8f0"/>
+  <text x="1040" y="438" class="t">结合方式</text>
+  <text x="1040" y="470" class="k">① 间接接入（零改动，立即可用）</text>
+  <text x="1040" y="492" class="s">CSGLite 照旧调用 /resolve；starhub 内部</text>
+  <text x="1040" y="510" class="s">路由到 Scion，大文件 302 到 MinIO 预签名</text>
+  <text x="1040" y="546" class="k">② 原生拉取</text>
+  <text x="1040" y="568" class="s">内置 Scion 拉取器（Go，按 proto 生成）：</text>
+  <text x="1040" y="586" class="s">按分片拉取 + 校验，不同模型间相同分片</text>
+  <text x="1040" y="604" class="s">只下载一次，断点续传天然支持</text>
+  <text x="1040" y="640" class="k">③ 局域网对等缓存</text>
+  <text x="1040" y="662" class="s">每个节点都是 L1，邻居之间用同一套</text>
+  <text x="1040" y="680" class="s">ObjectService 互取，命中不出局域网</text>
+  <text x="1040" y="716" class="k">④ 本地 Lite 版本库（可选）</text>
+  <text x="1040" y="738" class="s">内嵌 scion --lite（SQLite，与 CSGLite 同栈）</text>
+  <text x="1040" y="756" class="s">管理本地产物版本，再 land 到 CSGHub</text>
+
+  <text x="40" y="846" class="sub">★ / 粉色：新增　　①→②→③ 逐步替换下载链路，④ 独立可选　　所有路径最终都由 BLAKE3 内容寻址保证完整性</text>
+</svg>

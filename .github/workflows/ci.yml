@@ -1,0 +1,80 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets
+      # 依赖方向：客户端不得依赖服务端，服务端内部只能依赖下层
+      - run: cargo xtask layers
+
+  proto:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: bufbuild/buf-action@v1
+        with:
+          lint: true
+          format: true
+          # 已发布的 v1 协议不允许出现破坏性变更
+          breaking: ${{ github.event_name == 'pull_request' }}
+          breaking_against: ${{ github.event.repository.clone_url }}#branch=${{ github.base_ref }}
+
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+      # golden 向量必须与构造逻辑一致（不允许手改 JSON）
+      - run: git diff --exit-code testdata/
+
+  # 函数级测试要求（服务端设计文档 §12.1）
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # 分支覆盖率需要 nightly
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests with coverage
+        run: cargo llvm-cov --workspace --branch --no-report
+      - name: Core crates (lines >= 90%, branches >= 80%)
+        run: |
+          cargo llvm-cov report --package scion-object --package scion-store \
+            --ignore-filename-regex '(xtask|testsuite)' --json --summary-only > core.json
+          jq -e '.data[0].totals.lines.percent >= 90' core.json
+          jq -e '(.data[0].totals.branches.count == 0) or (.data[0].totals.branches.percent >= 80)' core.json
+      - name: Whole workspace (lines >= 80%)
+        run: cargo llvm-cov report --ignore-filename-regex 'xtask' --fail-under-lines 80
+      - name: Diff coverage (>= 90% of changed lines)
+        if: github.event_name == 'pull_request'
+        run: |
+          cargo llvm-cov report --ignore-filename-regex 'xtask' --lcov --output-path lcov.info
+          pipx run diff-cover lcov.info --compare-branch=origin/${{ github.base_ref }} --fail-under=90

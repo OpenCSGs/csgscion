@@ -1,0 +1,151 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1000" viewBox="0 0 1400 1000">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#475569"/></marker>
+  </defs>
+  <style>
+    text{font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",sans-serif;fill:#0f172a}
+    .h{font-size:24px;font-weight:700}
+    .sub{font-size:13px;fill:#64748b}
+    .lane{font-size:14px;font-weight:700}
+    .t{font-size:15px;font-weight:600}
+    .s{font-size:12px;fill:#475569}
+    .lbl{font-size:12px;fill:#334155}
+    .e{stroke:#475569;stroke-width:1.6;fill:none;marker-end:url(#a)}
+    .d{stroke-dasharray:6 4}
+  </style>
+  <rect width="1400" height="1000" fill="#ffffff"/>
+  <text x="40" y="44" class="h">Scion 独立部署架构（Rust）</text>
+  <text x="40" y="68" class="sub">内容寻址 · 服务端计算 · 三级缓存（L1 节点 / L2 区域 / L3 权威）· 唯一可变状态 = ref（单行 CAS）</text>
+
+  <!-- Lane A: clients -->
+  <rect x="20" y="88" width="1360" height="172" rx="10" fill="#eff6ff"/>
+  <text x="34" y="112" class="lane" fill="#1d4ed8">客户端</text>
+  <rect x="160" y="104" width="640" height="140" rx="8" fill="#fff" stroke="#93c5fd"/>
+  <text x="176" y="128" class="s">官方默认客户端：Rust（scion-client SDK / scion-wc / scn）</text>
+  <rect x="176" y="142" width="196" height="86" rx="6" fill="#dbeafe" stroke="#60a5fa"/>
+  <text x="274" y="176" text-anchor="middle" class="t">scn CLI</text>
+  <text x="274" y="198" text-anchor="middle" class="s">clone · commit · land · sync</text>
+  <text x="274" y="216" text-anchor="middle" class="s">--json 供 Agent 解析</text>
+  <rect x="386" y="142" width="196" height="86" rx="6" fill="#dbeafe" stroke="#60a5fa"/>
+  <text x="484" y="176" text-anchor="middle" class="t">Agent / CI</text>
+  <text x="484" y="198" text-anchor="middle" class="s">Rust SDK，只用 API</text>
+  <text x="484" y="216" text-anchor="middle" class="s">无需 checkout</text>
+  <rect x="596" y="142" width="190" height="86" rx="6" fill="#dbeafe" stroke="#60a5fa"/>
+  <text x="691" y="176" text-anchor="middle" class="t">Web / 脚本</text>
+  <text x="691" y="198" text-anchor="middle" class="s">gRPC-Web · REST/JSON</text>
+  <text x="691" y="216" text-anchor="middle" class="s">其它语言按 proto 生成</text>
+
+  <rect x="900" y="104" width="440" height="140" rx="8" fill="#dbeafe" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="920" y="132" class="t">scn daemon（每节点 L1）</text>
+  <text x="920" y="158" class="s">· 本地 CAS 缓存（有界 LRU，写入前校验 BLAKE3）</text>
+  <text x="920" y="180" class="s">· ObjectService 就地应答，其余 RPC 透明转发</text>
+  <text x="920" y="202" class="s">· WatchRefs 预取 main 新 tree · 不持有用户凭证</text>
+  <text x="920" y="224" class="s">· 工作副本：sparse 物化 / 虚拟化（FUSE·NFS，后期）</text>
+  <path d="M800,174 L898,174" class="e"/>
+  <text x="849" y="166" text-anchor="middle" class="lbl">Unix socket</text>
+
+  <!-- Lane B: L2 -->
+  <rect x="20" y="280" width="1360" height="130" rx="10" fill="#f0fdf4"/>
+  <text x="34" y="304" class="lane" fill="#15803d">区域缓存 L2</text>
+  <rect x="160" y="316" width="400" height="78" rx="8" fill="#dcfce7" stroke="#22c55e"/>
+  <text x="180" y="342" class="t">scion cache ×N（区域 A）</text>
+  <text x="180" y="364" class="s">foyer 内存 + NVMe · rendezvous 分片</text>
+  <text x="180" y="382" class="s">singleflight 合并回源 · 请求对冲 · 无持久状态</text>
+  <rect x="600" y="316" width="400" height="78" rx="8" fill="#dcfce7" stroke="#22c55e"/>
+  <text x="620" y="342" class="t">scion cache ×N（区域 B）</text>
+  <text x="620" y="364" class="s">与 L1/L3 提供同一套 ObjectService</text>
+  <text x="620" y="382" class="s">严格分层：上游异常时不绕过直连源站</text>
+  <path d="M960,244 L960,314" class="e"/>
+  <text x="952" y="284" text-anchor="end" class="lbl">读：L1 未命中</text>
+  <path d="M360,244 L360,314" class="e d"/>
+  <text x="368" y="284" class="lbl">无 daemon 时直连最近 L2</text>
+  <text x="1028" y="300" class="lbl">写 / 查询 / ref：</text>
+  <text x="1028" y="316" class="lbl">透传到 L3</text>
+
+  <!-- Lane C: L3 -->
+  <rect x="20" y="430" width="1360" height="290" rx="10" fill="#fff7ed"/>
+  <text x="34" y="454" class="lane" fill="#c2410c">权威层 L3</text>
+  <path d="M1020,244 L1020,486" class="e d"/>
+  <path d="M360,394 L360,486" class="e"/>
+  <text x="368" y="440" class="lbl">未命中回源（约 1%）</text>
+  <path d="M800,394 L800,486" class="e"/>
+
+  <rect x="160" y="488" width="880" height="216" rx="8" fill="#ffedd5" stroke="#f97316" stroke-width="1.5"/>
+  <text x="180" y="514" class="t">scion server ×N（无状态，单二进制按角色启动）</text>
+  <rect x="180" y="526" width="840" height="30" rx="5" fill="#fff" stroke="#fdba74"/>
+  <text x="600" y="546" text-anchor="middle" class="s">网关：tonic gRPC · tonic-web · axum REST（pbjson）· TLS + Bearer JWT</text>
+  <rect x="180" y="562" width="840" height="30" rx="5" fill="#fff" stroke="#fdba74"/>
+  <text x="600" y="582" text-anchor="middle" class="s">tower 中间件：认证 → 限流 → 并发上限/过载丢弃 → deadline 传递 → 幂等 → 鉴权</text>
+  <g>
+    <rect x="180" y="602" width="130" height="88" rx="6" fill="#fff" stroke="#fb923c"/>
+    <text x="245" y="628" text-anchor="middle" class="t">Object</text>
+    <text x="245" y="650" text-anchor="middle" class="s">GetObjects</text>
+    <text x="245" y="668" text-anchor="middle" class="s">GetTrees · 上传</text>
+    <rect x="322" y="602" width="130" height="88" rx="6" fill="#fff" stroke="#fb923c"/>
+    <text x="387" y="628" text-anchor="middle" class="t">Write</text>
+    <text x="387" y="650" text-anchor="middle" class="s">CreateChangeset</text>
+    <text x="387" y="668" text-anchor="middle" class="s">TreeBuilder</text>
+    <rect x="464" y="602" width="130" height="88" rx="6" fill="#fed7aa" stroke="#ea580c"/>
+    <text x="529" y="628" text-anchor="middle" class="t">Land</text>
+    <text x="529" y="650" text-anchor="middle" class="s">rebase + CAS</text>
+    <text x="529" y="668" text-anchor="middle" class="s">每 ref 批处理 leader</text>
+    <rect x="606" y="602" width="130" height="88" rx="6" fill="#fff" stroke="#fb923c"/>
+    <text x="671" y="628" text-anchor="middle" class="t">Ref</text>
+    <text x="671" y="650" text-anchor="middle" class="s">Resolve · CAS</text>
+    <text x="671" y="668" text-anchor="middle" class="s">WatchRefs</text>
+    <rect x="748" y="602" width="130" height="88" rx="6" fill="#fff" stroke="#fb923c"/>
+    <text x="813" y="628" text-anchor="middle" class="t">Query</text>
+    <text x="813" y="650" text-anchor="middle" class="s">log · blame · diff</text>
+    <text x="813" y="668" text-anchor="middle" class="s">ReadFile · Archive</text>
+    <rect x="890" y="602" width="130" height="88" rx="6" fill="#fff" stroke="#fb923c"/>
+    <text x="955" y="628" text-anchor="middle" class="t">Auth / Admin</text>
+    <text x="955" y="650" text-anchor="middle" class="s">JWT · ACL</text>
+    <text x="955" y="668" text-anchor="middle" class="s">RepoAdmin · Redact</text>
+  </g>
+
+  <rect x="1070" y="488" width="290" height="64" rx="8" fill="#ffedd5" stroke="#f97316"/>
+  <text x="1086" y="514" class="t">scion deriver ×N</text>
+  <text x="1086" y="536" class="s">跟随 cs_log：tree · gen · blame · GitSha…</text>
+  <rect x="1070" y="564" width="290" height="64" rx="8" fill="#ffedd5" stroke="#f97316"/>
+  <text x="1086" y="590" class="t">scion janitor</text>
+  <text x="1086" y="612" class="s">孤儿/暂存清理 · redaction purge · 快照</text>
+  <rect x="1070" y="640" width="290" height="64" rx="8" fill="#fff" stroke="#f97316" stroke-dasharray="6 4"/>
+  <text x="1086" y="666" class="t">scion git-gateway（后期）</text>
+  <text x="1086" y="688" class="s">Gitaly SmartHTTP/SSH 子集，兼容 git CLI</text>
+
+  <!-- Lane D: storage -->
+  <rect x="20" y="740" width="1360" height="200" rx="10" fill="#f5f3ff"/>
+  <text x="34" y="764" class="lane" fill="#6d28d9">存储</text>
+  <path d="M420,704 L420,774" class="e"/>
+  <path d="M860,704 L860,774" class="e"/>
+  <path d="M1000,704 L1000,722 L1230,722 L1230,774" class="e"/>
+  <text x="1238" y="760" class="lbl">事件</text>
+
+  <rect x="160" y="776" width="520" height="148" rx="8" fill="#ede9fe" stroke="#8b5cf6"/>
+  <text x="180" y="802" class="t">MetaStore（同一套 sqlx 代码，三档）</text>
+  <text x="180" y="826" class="s">changesets · cs_log(WAL) · refs(CAS) · derived · leases · idempotency</text>
+  <rect x="180" y="840" width="150" height="70" rx="6" fill="#fff" stroke="#a78bfa"/>
+  <text x="255" y="866" text-anchor="middle" class="t">SQLite</text>
+  <text x="255" y="888" text-anchor="middle" class="s">Lite · 单机</text>
+  <rect x="345" y="840" width="150" height="70" rx="6" fill="#fff" stroke="#a78bfa"/>
+  <text x="420" y="866" text-anchor="middle" class="t">PostgreSQL</text>
+  <text x="420" y="888" text-anchor="middle" class="s">Standard · Patroni</text>
+  <rect x="510" y="840" width="150" height="70" rx="6" fill="#fff" stroke="#a78bfa"/>
+  <text x="585" y="866" text-anchor="middle" class="t">YugabyteDB</text>
+  <text x="585" y="888" text-anchor="middle" class="s">Distributed · 3 AZ</text>
+
+  <rect x="700" y="776" width="400" height="148" rx="8" fill="#ede9fe" stroke="#8b5cf6"/>
+  <text x="720" y="802" class="t">BlobStore（不可变 · 内容寻址）</text>
+  <text x="720" y="828" class="s">S3 兼容：MinIO · AWS S3 · Ceph · OSS/OBS/COS</text>
+  <text x="720" y="850" class="s">本地文件系统（Lite）</text>
+  <text x="720" y="872" class="s">zstd 压缩 · FastCDC 分块 · 预签名直连</text>
+  <text x="720" y="894" class="s">只用 S3 核心 API · 启动自检</text>
+
+  <rect x="1120" y="776" width="240" height="148" rx="8" fill="#ede9fe" stroke="#8b5cf6"/>
+  <text x="1140" y="802" class="t">EventBus</text>
+  <text x="1140" y="828" class="s">NATS JetStream</text>
+  <text x="1140" y="850" class="s">scion.&lt;repo&gt;.ref.updated</text>
+  <text x="1140" y="872" class="s">→ CI 触发 / 外部系统</text>
+
+  <text x="40" y="972" class="sub">实线：主路径　　虚线：可选 / 后期　　L1/L2/L3 提供同一套 ObjectService，客户端不需要了解缓存拓扑</text>
+</svg>

@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package scion.v1;
+
+import "scion/v1/common.proto";
+
+// 对象读取。L1 / L2 / L3 三层都实现，是唯一可被缓存的服务。
+service ObjectService {
+  // 按 id 批量取对象。大对象分块流式返回；断开后用 ObjectWant.offset 续传。
+  rpc GetObjects(GetObjectsRequest) returns (stream GetObjectsResponse);
+  // 返回请求中服务端不存在的对象（FindMissing）。
+  rpc HasObjects(HasObjectsRequest) returns (HasObjectsResponse);
+}
+
+message ObjectWant {
+  // 34 字节 ObjectId。
+  bytes id = 1;
+  // 从该字节偏移开始返回（续传用），0 表示从头开始。
+  uint64 offset = 2;
+}
+
+message GetObjectsRequest {
+  string repo = 1;
+  repeated ObjectWant wants = 2;
+  // 客户端可接受的编码；为空等价于只接受 ENCODING_IDENTITY。
+  repeated Encoding accept_encodings = 3;
+}
+
+// 一个对象的一个分块。同一对象的分块按 offset 递增连续发送，最后一块 last=true。
+message GetObjectsResponse {
+  bytes id = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+  Encoding encoding = 4;
+  bool last = 5;
+  // 对象未压缩时的总字节数。
+  uint64 total_size = 6;
+}
+
+message HasObjectsRequest {
+  string repo = 1;
+  repeated bytes ids = 2;
+}
+
+message HasObjectsResponse {
+  // 请求中不存在的 id，保持请求中的相对顺序。
+  repeated bytes missing_ids = 1;
+}

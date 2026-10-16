@@ -1,0 +1,24 @@
+[package]
+name = "scion-client"
+description = "Official Rust SDK for Scion (depends only on the public protocol)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes.workspace = true
+scion-object.workspace = true
+scion-proto.workspace = true
+thiserror.workspace = true
+tonic.workspace = true
+tonic-types.workspace = true
+
+[dev-dependencies]
+# 只有测试可以在进程内拉起服务端（客户端文档 §0）
+scion-api.workspace = true
+scion-store.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

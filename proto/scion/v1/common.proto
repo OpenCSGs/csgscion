@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package scion.v1;
+
+// 哈希算法，取值与 SPEC.md §1 中 ObjectId 的 algo 字节一致。
+enum HashAlgo {
+  HASH_ALGO_UNSPECIFIED = 0;
+  HASH_ALGO_BLAKE3_256 = 1;
+}
+
+// 对象类型，取值与 SPEC.md §1 中 ObjectId 的 kind 字节一致。
+enum ObjectKind {
+  OBJECT_KIND_UNSPECIFIED = 0;
+  OBJECT_KIND_BLOB = 1;
+  OBJECT_KIND_TREE = 2;
+  OBJECT_KIND_CHANGESET = 3;
+  OBJECT_KIND_CHUNK_LIST = 5;
+}
+
+// 传输时对象数据的编码。
+enum Encoding {
+  ENCODING_UNSPECIFIED = 0;
+  // 原始字节。
+  ENCODING_IDENTITY = 1;
+  // zstd 压缩。仅当服务端声明 feature "objects.zstd" 时可用。
+  ENCODING_ZSTD = 2;
+}
+
+// 错误原因。出错时放在 google.rpc.ErrorInfo.reason（字符串形式，即枚举名去掉 ERROR_REASON_ 前缀），
+// domain 固定为 "scion.dev"。重试语义见服务端设计文档 §3.5。
+enum ErrorReason {
+  ERROR_REASON_UNSPECIFIED = 0;
+  ERROR_REASON_MERGE_CONFLICT = 1;
+  ERROR_REASON_LAND_CONTENTION = 2;
+  ERROR_REASON_ALREADY_LANDED = 3;
+  ERROR_REASON_REF_VERSION_MISMATCH = 4;
+  ERROR_REASON_OBJECT_MISSING = 5;
+  ERROR_REASON_REDACTED = 6;
+  ERROR_REASON_RATE_LIMITED = 7;
+  ERROR_REASON_REPO_NOT_FOUND = 8;
+  ERROR_REASON_INVALID_OBJECT_ID = 9;
+  ERROR_REASON_LIMIT_EXCEEDED = 10;
+}

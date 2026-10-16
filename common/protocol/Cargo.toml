@@ -1,0 +1,19 @@
+[package]
+name = "scion-proto"
+description = "Generated protobuf / gRPC code for the Scion v1 protocol (no business logic)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+prost.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+protox.workspace = true
+tonic-prost-build.workspace = true
+
+[lints]
+workspace = true

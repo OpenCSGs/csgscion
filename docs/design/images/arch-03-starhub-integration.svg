@@ -1,0 +1,169 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1090" viewBox="0 0 1400 1090">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#475569"/></marker>
+    <marker id="b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#db2777"/></marker>
+  </defs>
+  <style>
+    text{font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",sans-serif;fill:#0f172a}
+    .h{font-size:24px;font-weight:700}
+    .sub{font-size:13px;fill:#64748b}
+    .lane{font-size:14px;font-weight:700}
+    .t{font-size:15px;font-weight:600}
+    .s{font-size:12px;fill:#475569}
+    .lbl{font-size:12px;fill:#334155}
+    .lblp{font-size:12px;fill:#be185d}
+    .e{stroke:#475569;stroke-width:1.6;fill:none;marker-end:url(#a)}
+    .ev{stroke:#db2777;stroke-width:1.6;fill:none;stroke-dasharray:6 4;marker-end:url(#b)}
+    .new{stroke:#db2777;stroke-width:2}
+  </style>
+  <rect width="1400" height="1090" fill="#ffffff"/>
+  <text x="40" y="44" class="h">Scion 接入 starhub-server：与 Gitaly 按仓库并行</text>
+  <text x="40" y="68" class="sub">改动只在 builder 层 + 少量路由/配置；component 及推送后管线零改动。★ / 粉色描边 = 新增</text>
+
+  <!-- Lane 1 -->
+  <rect x="20" y="86" width="1360" height="100" rx="10" fill="#eff6ff"/>
+  <text x="34" y="112" class="lane" fill="#1d4ed8">访问入口</text>
+  <rect x="150" y="108" width="240" height="58" rx="7" fill="#dbeafe" stroke="#60a5fa"/>
+  <text x="270" y="132" text-anchor="middle" class="t">Web / HF SDK / CSGLite</text>
+  <text x="270" y="153" text-anchor="middle" class="s">REST · /resolve · LFS</text>
+  <rect x="410" y="108" width="170" height="58" rx="7" fill="#dbeafe" stroke="#60a5fa"/>
+  <text x="495" y="132" text-anchor="middle" class="t">git CLI（HTTP）</text>
+  <text x="495" y="153" text-anchor="middle" class="s">smart HTTP</text>
+  <rect x="600" y="108" width="150" height="58" rx="7" fill="#dbeafe" stroke="#60a5fa"/>
+  <text x="675" y="132" text-anchor="middle" class="t">git CLI（SSH）</text>
+  <text x="675" y="153" text-anchor="middle" class="s">ssh://</text>
+  <rect x="780" y="108" width="180" height="58" rx="7" fill="#e2e8f0" stroke="#94a3b8"/>
+  <text x="870" y="132" text-anchor="middle" class="t">gitlab-shell（现有）</text>
+  <text x="870" y="153" text-anchor="middle" class="s">SSH 入口</text>
+  <rect x="1000" y="108" width="260" height="58" rx="7" fill="#dbeafe" stroke="#db2777" stroke-width="2"/>
+  <text x="1130" y="132" text-anchor="middle" class="t">scn / Agent / CI（Rust）★</text>
+  <text x="1130" y="153" text-anchor="middle" class="s">Scion 原生协议 · starhub 签发的 JWT</text>
+  <path d="M750,137 L778,137" class="e"/>
+
+  <!-- Lane 2 -->
+  <rect x="20" y="200" width="1360" height="420" rx="10" fill="#f0fdfa"/>
+  <text x="34" y="226" class="lane" fill="#0f766e">业务层</text>
+  <rect x="150" y="212" width="810" height="396" rx="10" fill="#ccfbf1" stroke="#14b8a6" stroke-width="1.5"/>
+  <text x="515" y="234" class="t">starhub-server（Go · gin · bun · Temporal）</text>
+
+  <rect x="170" y="244" width="470" height="66" rx="7" fill="#fff" stroke="#5eead4"/>
+  <text x="405" y="270" text-anchor="middle" class="t">api handler（现有）</text>
+  <text x="405" y="292" text-anchor="middle" class="s">REST · HF 兼容 /resolve · git smart HTTP · LFS / Xnet</text>
+  <rect x="660" y="244" width="285" height="66" rx="7" fill="#fff" stroke="#db2777" stroke-width="2"/>
+  <text x="802" y="266" text-anchor="middle" class="t">internal API（现有 + 扩展）</text>
+  <text x="802" y="284" text-anchor="middle" class="s">/allowed · /pre_receive · /post_receive</text>
+  <text x="802" y="300" text-anchor="middle" class="s">/internal/scion/pre_land ★</text>
+
+  <rect x="170" y="328" width="470" height="48" rx="7" fill="#fff" stroke="#5eead4"/>
+  <text x="405" y="358" text-anchor="middle" class="t">component（业务逻辑 · 零改动）</text>
+  <rect x="170" y="394" width="470" height="68" rx="7" fill="#fdf2f8" stroke="#db2777" stroke-width="2"/>
+  <text x="405" y="416" text-anchor="middle" class="t">RoutingGitServer ★</text>
+  <text x="405" y="436" text-anchor="middle" class="s">实现 gitserver.GitServer · 按 repositories.storage_backend 分派</text>
+  <text x="405" y="454" text-anchor="middle" class="s">新增字段 storage_backend（'gitaly' | 'scion'）· backend_migration_tasks 表</text>
+  <rect x="170" y="476" width="225" height="58" rx="7" fill="#fff" stroke="#5eead4"/>
+  <text x="282" y="500" text-anchor="middle" class="t">gitaly.Client（现有）</text>
+  <text x="282" y="521" text-anchor="middle" class="s">gitalypb gRPC</text>
+  <rect x="415" y="476" width="225" height="58" rx="7" fill="#fdf2f8" stroke="#db2777" stroke-width="2"/>
+  <text x="527" y="500" text-anchor="middle" class="t">scion adapter ★</text>
+  <text x="527" y="521" text-anchor="middle" class="s">buf 生成 Go stub · 方法映射</text>
+
+  <rect x="660" y="328" width="240" height="56" rx="7" fill="#fdf2f8" stroke="#db2777" stroke-width="2"/>
+  <text x="780" y="351" text-anchor="middle" class="t">scion-ref-events ★</text>
+  <text x="780" y="372" text-anchor="middle" class="s">订阅 NATS → GiteaCallbackPushReq</text>
+  <rect x="660" y="394" width="240" height="58" rx="7" fill="#fff" stroke="#5eead4"/>
+  <text x="780" y="418" text-anchor="middle" class="t">HandlePushWorkflow（现有）</text>
+  <text x="780" y="440" text-anchor="middle" class="s">元数据 · 标签 · 敏感检查 · 大小</text>
+  <rect x="660" y="476" width="240" height="58" rx="7" fill="#fdf2f8" stroke="#db2777" stroke-width="2"/>
+  <text x="780" y="500" text-anchor="middle" class="t">MigrateRepoToScion ★</text>
+  <text x="780" y="521" text-anchor="middle" class="s">仿 Xnet：导入→冻结→追平→切换</text>
+  <rect x="660" y="548" width="240" height="48" rx="7" fill="#fdf2f8" stroke="#db2777" stroke-width="2"/>
+  <text x="780" y="569" text-anchor="middle" class="t">JWT 签发 + JWKS ★</text>
+  <text x="780" y="587" text-anchor="middle" class="s">Scion 用 JWKS 验签，不共享密钥</text>
+
+
+  <!-- internal arrows lane 2 -->
+  <path d="M270,166 L270,242" class="e"/>
+  <path d="M495,166 L495,242" class="e"/>
+  <path d="M870,166 L870,242" class="e"/>
+  <text x="862" y="194" text-anchor="end" class="lbl">/allowed 鉴权（按仓库返回后端地址）</text>
+  <path d="M405,310 L405,326" class="e"/>
+  <path d="M405,376 L405,392" class="e"/>
+  <path d="M282,462 L282,474" class="e"/>
+  <path d="M527,462 L527,474" class="e"/>
+  <path d="M780,384 L780,392" class="e"/>
+
+  <!-- Lane 3 -->
+  <rect x="20" y="640" width="1360" height="190" rx="10" fill="#fff7ed"/>
+  <text x="34" y="666" class="lane" fill="#c2410c">Git 后端</text>
+  <rect x="150" y="676" width="300" height="134" rx="8" fill="#e2e8f0" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="170" y="702" class="t">Gitaly v16（现有）</text>
+  <text x="170" y="728" class="s">storage_backend = 'gitaly'</text>
+  <text x="170" y="750" class="s">存量仓库 · 本地仓库磁盘</text>
+  <text x="170" y="772" class="s">hooks → internal API</text>
+  <text x="170" y="794" class="s">（pre_receive / post_receive）</text>
+
+  <rect x="480" y="676" width="880" height="134" rx="8" fill="#ffedd5" stroke="#db2777" stroke-width="2"/>
+  <text x="1345" y="700" text-anchor="end" class="t">Scion 集群（Rust）★</text>
+  <rect x="500" y="712" width="190" height="84" rx="6" fill="#fff" stroke="#f97316" stroke-dasharray="6 4"/>
+  <text x="595" y="740" text-anchor="middle" class="t">git-gateway（后期）</text>
+  <text x="595" y="762" text-anchor="middle" class="s">Gitaly SmartHTTP/SSH</text>
+  <text x="595" y="780" text-anchor="middle" class="s">子集 · git CLI 透明</text>
+  <rect x="705" y="712" width="195" height="84" rx="6" fill="#fed7aa" stroke="#ea580c"/>
+  <text x="802" y="740" text-anchor="middle" class="t">scion server（L3）</text>
+  <text x="802" y="762" text-anchor="middle" class="s">RepoAdmin · Land</text>
+  <text x="802" y="780" text-anchor="middle" class="s">Query · Archive</text>
+  <rect x="960" y="712" width="180" height="84" rx="6" fill="#dcfce7" stroke="#22c55e"/>
+  <text x="1050" y="740" text-anchor="middle" class="t">scion cache（L2）</text>
+  <text x="1050" y="762" text-anchor="middle" class="s">原生客户端读路径</text>
+  <text x="1050" y="780" text-anchor="middle" class="s">预签名直连大对象</text>
+  <rect x="1160" y="712" width="185" height="84" rx="6" fill="#fff" stroke="#f97316"/>
+  <text x="1252" y="740" text-anchor="middle" class="t">deriver / janitor</text>
+  <text x="1252" y="762" text-anchor="middle" class="s">GitSha · TreeStats</text>
+  <text x="1252" y="780" text-anchor="middle" class="s">LastCommitPerEntry</text>
+  <path d="M690,754 L703,754" class="e"/>
+  <path d="M960,754 L902,754" class="e"/>
+
+  <!-- Lane 4 -->
+  <rect x="20" y="850" width="1360" height="182" rx="10" fill="#f5f3ff"/>
+  <text x="34" y="876" class="lane" fill="#6d28d9">共享基础设施</text>
+  <rect x="150" y="878" width="330" height="134" rx="8" fill="#ede9fe" stroke="#8b5cf6"/>
+  <text x="170" y="904" class="t">PostgreSQL + Patroni（共用集群）</text>
+  <text x="170" y="932" class="s">database: starhub（现有）</text>
+  <text x="170" y="956" class="s">database: scion ★（Standard 档）</text>
+  <text x="170" y="980" class="s">规模变大后单独迁到 YugabyteDB</text>
+  <rect x="500" y="878" width="360" height="134" rx="8" fill="#ede9fe" stroke="#8b5cf6"/>
+  <text x="520" y="904" class="t">MinIO / S3（共用）</text>
+  <text x="520" y="932" class="s">bucket: LFS / Xnet（现有）</text>
+  <text x="520" y="956" class="s">bucket: scion-objects ★（或 prefix 隔离）</text>
+  <text x="520" y="980" class="s">path-style · 启动自检 · 预签名直连</text>
+  <rect x="880" y="878" width="220" height="134" rx="8" fill="#ede9fe" stroke="#8b5cf6"/>
+  <text x="900" y="904" class="t">NATS（共用）</text>
+  <text x="900" y="932" class="s">scion.&lt;repo&gt;.ref.updated ★</text>
+  <text x="900" y="956" class="s">路径级 delta</text>
+  <rect x="1120" y="878" width="240" height="134" rx="8" fill="#ede9fe" stroke="#8b5cf6"/>
+  <text x="1140" y="904" class="t">Temporal · Redis（现有）</text>
+  <text x="1140" y="932" class="s">推送工作流 · 迁移工作流</text>
+  <text x="1140" y="956" class="s">路由缓存失效（pub/sub）</text>
+
+  <!-- cross-lane arrows -->
+  <path d="M282,534 L282,674" class="e"/>
+  <text x="290" y="620" class="lbl">gRPC</text>
+  <path d="M527,534 L527,626 L820,626 L820,710" class="e"/>
+  <text x="560" y="618" class="lbl">gRPC（Scion 原生协议）+ JWT</text>
+  <path d="M950,166 L950,190 L985,190 L985,656 L400,656 L400,674" class="e"/>
+  <path d="M600,656 L600,710" class="e"/>
+  <text x="993" y="400" class="lbl">SSH</text>
+  <text x="993" y="416" class="lbl">数据面</text>
+  <path d="M1050,166 L1050,710" class="e"/>
+  <text x="1058" y="400" class="lbl">原生读路径</text>
+  <path d="M760,796 L760,842 L315,842 L315,876" class="e"/>
+  <path d="M820,796 L820,876" class="e"/>
+  <path d="M890,796 L890,876" class="e"/>
+  <path d="M930,876 L930,356 L902,356" class="ev"/>
+  <text x="938" y="840" class="lblp">① ref.updated</text>
+  <text x="905" y="645" text-anchor="end" class="lblp">② pre_land</text>
+  <path d="M880,712 L880,666 L915,666 L915,312" class="ev"/>
+
+  <!-- legend -->
+  <text x="40" y="1062" class="sub">★ / 粉色描边：新增　　实线：调用 / 数据　　粉色虚线：①（NATS → scion-ref-events）推送事件　②（Scion → /internal/scion/pre_land）合入前检查 webhook</text>
+</svg>

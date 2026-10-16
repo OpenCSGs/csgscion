@@ -1,0 +1,65 @@
+[workspace]
+resolver = "3"
+members = [
+    # 服务端和客户端共用：协议生成代码、对象模型
+    "common/protocol",
+    "common/object",
+    # 服务端
+    "server/store",
+    "server/api",
+    "server/scion",
+    # 客户端
+    "client/sdk",
+    "client/cli",
+    # 开发工具（依赖分层检查等）
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+scion-proto = { path = "common/protocol" }
+scion-object = { path = "common/object" }
+scion-store = { path = "server/store" }
+scion-api = { path = "server/api" }
+scion-client = { path = "client/sdk" }
+
+anyhow = "1"
+async-trait = "0.1"
+blake3 = "1.8"
+bytes = "1"
+clap = { version = "4.6", features = ["derive", "env"] }
+hex = "0.4"
+prost = "0.14"
+proptest = "1.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "net", "signal", "sync"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots"] }
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+tonic-types = "0.14"
+tonic-health = "0.14"
+protox = "0.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+cargo_metadata = "0.23"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,24 @@
+[package]
+name = "scion-store"
+description = "Scion storage traits (MetaStore / BlobStore), in-memory backend and backend conformance suite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# 对外提供 conformance 测试套件，供其它存储后端（SQLite / PG / YugabyteDB / S3）复用
+testsuite = ["dep:tokio"]
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+scion-object.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

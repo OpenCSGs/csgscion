@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+package scion.v1;
+
+import "scion/v1/common.proto";
+
+// 能力协商。客户端连接后首先调用，只依赖 features 中声明的能力。
+service ServerInfoService {
+  rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
+}
+
+message GetServerInfoRequest {
+  // 客户端名称与版本，仅用于日志和统计，例如 "scn" / "0.1.0"。
+  string client_name = 1;
+  string client_version = 2;
+  // 客户端实现的协议版本，例如 "1.0"。
+  string protocol_version = 3;
+}
+
+message GetServerInfoResponse {
+  ServerInfo info = 1;
+}
+
+// 应答方在缓存层级中的角色。
+enum ServerRole {
+  SERVER_ROLE_UNSPECIFIED = 0;
+  // L3：权威服务端。
+  SERVER_ROLE_SERVER = 1;
+  // L2：区域缓存。
+  SERVER_ROLE_CACHE = 2;
+  // L1：节点 daemon。
+  SERVER_ROLE_DAEMON = 3;
+}
+
+message ServerInfo {
+  // "主版本.次版本"。主版本不同即不兼容；次版本只增加能力。
+  string protocol_version = 1;
+  // 能力标记，例如 "objects.get"、"objects.has"。新增能力只加标记，不改已有语义。
+  repeated string features = 2;
+  Limits limits = 3;
+  // 推荐的只读端点（区域缓存），客户端可以不用。
+  repeated Endpoint read_endpoints = 4;
+  HashAlgo hash_algo = 5;
+  // 服务端实现版本，仅供展示。
+  string server_version = 6;
+  ServerRole role = 7;
+}
+
+message Limits {
+  // 单次 GetObjects / HasObjects 最多的对象个数。
+  uint32 max_batch_objects = 1;
+  // 单个流式分块的最大字节数。
+  uint64 max_chunk_bytes = 2;
+  // 单个 changeset 最多的改动条目数。
+  uint32 max_changes_per_changeset = 3;
+  // 可以随请求内联上传的最大对象字节数。
+  uint64 max_inline_bytes = 4;
+}
+
+message Endpoint {
+  string url = 1;
+  string region = 2;
+}

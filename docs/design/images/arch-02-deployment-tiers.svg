@@ -1,0 +1,135 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="760" viewBox="0 0 1400 760">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#475569"/></marker>
+  </defs>
+  <style>
+    text{font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",sans-serif;fill:#0f172a}
+    .h{font-size:24px;font-weight:700}
+    .sub{font-size:13px;fill:#64748b}
+    .th{font-size:20px;font-weight:700;fill:#fff}
+    .thl{font-size:13px;fill:#f1f5f9}
+    .t{font-size:15px;font-weight:600}
+    .s{font-size:12px;fill:#475569}
+    .k{font-size:12px;font-weight:700;fill:#334155}
+    .e{stroke:#475569;stroke-width:1.6;fill:none;marker-end:url(#a)}
+  </style>
+  <rect width="1400" height="760" fill="#ffffff"/>
+  <text x="40" y="44" class="h">部署三档：Lite / Standard / Distributed</text>
+  <text x="40" y="68" class="sub">同一个 scion 二进制 · 同一套 sqlx 代码（Dialect 抽象）· 同一套协议，客户端无感切换</text>
+
+  <!-- Column 1: Lite -->
+  <rect x="30" y="92" width="430" height="560" rx="12" fill="#f8fafc" stroke="#cbd5e1"/>
+  <rect x="30" y="92" width="430" height="64" rx="12" fill="#0ea5e9"/>
+  <rect x="30" y="140" width="430" height="16" fill="#0ea5e9"/>
+  <text x="50" y="122" class="th">Lite</text>
+  <text x="50" y="144" class="thl">单进程 · 零外部依赖</text>
+  <rect x="60" y="180" width="370" height="128" rx="8" fill="#e0f2fe" stroke="#0ea5e9"/>
+  <text x="80" y="206" class="t">scion server --lite --data-dir ~/.scion</text>
+  <rect x="80" y="220" width="104" height="70" rx="6" fill="#fff" stroke="#7dd3fc"/>
+  <text x="132" y="252" text-anchor="middle" class="t">server</text>
+  <text x="132" y="272" text-anchor="middle" class="s">API</text>
+  <rect x="193" y="220" width="104" height="70" rx="6" fill="#fff" stroke="#7dd3fc"/>
+  <text x="245" y="252" text-anchor="middle" class="t">deriver</text>
+  <text x="245" y="272" text-anchor="middle" class="s">进程内任务</text>
+  <rect x="306" y="220" width="104" height="70" rx="6" fill="#fff" stroke="#7dd3fc"/>
+  <text x="358" y="252" text-anchor="middle" class="t">janitor</text>
+  <text x="358" y="272" text-anchor="middle" class="s">进程内任务</text>
+  <path d="M175,308 L175,346" class="e"/>
+  <path d="M315,308 L315,346" class="e"/>
+  <rect x="60" y="348" width="180" height="76" rx="8" fill="#ede9fe" stroke="#8b5cf6"/>
+  <text x="150" y="380" text-anchor="middle" class="t">SQLite（WAL）</text>
+  <text x="150" y="402" text-anchor="middle" class="s">meta.db 单文件</text>
+  <rect x="250" y="348" width="180" height="76" rx="8" fill="#ede9fe" stroke="#8b5cf6"/>
+  <text x="340" y="380" text-anchor="middle" class="t">本地文件系统</text>
+  <text x="340" y="402" text-anchor="middle" class="s">objects/&lt;hh&gt;/&lt;hex&gt;</text>
+  <text x="60" y="462" class="k">适用</text>
+  <text x="60" y="484" class="s">开发 / 单机 / 边缘设备 / 嵌入 CSGLite 等本地产品</text>
+  <text x="60" y="516" class="k">高可用</text>
+  <text x="60" y="538" class="s">无（单机）；VACUUM INTO / Litestream 类工具定期备份</text>
+  <text x="60" y="570" class="k">规模</text>
+  <text x="60" y="592" class="s">单写者 · 每天数千到数万次合入</text>
+  <text x="60" y="624" class="k">许可证</text>
+  <text x="120" y="624" class="s">SQLite：Public Domain</text>
+
+  <!-- Column 2: Standard -->
+  <rect x="485" y="92" width="430" height="560" rx="12" fill="#f8fafc" stroke="#cbd5e1"/>
+  <rect x="485" y="92" width="430" height="64" rx="12" fill="#f97316"/>
+  <rect x="485" y="140" width="430" height="16" fill="#f97316"/>
+  <text x="505" y="122" class="th">Standard（默认）</text>
+  <text x="505" y="144" class="thl">常规私有化 · 与 starhub 共用 PG / MinIO</text>
+  <rect x="515" y="176" width="370" height="46" rx="8" fill="#dcfce7" stroke="#22c55e" stroke-dasharray="6 4"/>
+  <text x="700" y="204" text-anchor="middle" class="t">scion cache ×N（可选）</text>
+  <path d="M700,222 L700,240" class="e"/>
+  <rect x="515" y="242" width="250" height="56" rx="8" fill="#ffedd5" stroke="#f97316"/>
+  <text x="640" y="266" text-anchor="middle" class="t">scion server ×N</text>
+  <text x="640" y="286" text-anchor="middle" class="s">K8s / compose · 无状态</text>
+  <rect x="775" y="242" width="110" height="56" rx="8" fill="#ffedd5" stroke="#f97316"/>
+  <text x="830" y="266" text-anchor="middle" class="t">deriver</text>
+  <text x="830" y="286" text-anchor="middle" class="s">janitor</text>
+  <path d="M580,298 L580,346" class="e"/>
+  <path d="M700,298 L700,346" class="e"/>
+  <path d="M830,298 L830,346" class="e"/>
+  <rect x="515" y="348" width="160" height="76" rx="8" fill="#ede9fe" stroke="#8b5cf6"/>
+  <text x="595" y="376" text-anchor="middle" class="t">PostgreSQL</text>
+  <text x="595" y="396" text-anchor="middle" class="s">Patroni</text>
+  <text x="595" y="414" text-anchor="middle" class="s">1 主 2 备 · 同步复制</text>
+  <rect x="683" y="348" width="120" height="76" rx="8" fill="#ede9fe" stroke="#8b5cf6"/>
+  <text x="743" y="376" text-anchor="middle" class="t">MinIO / S3</text>
+  <text x="743" y="396" text-anchor="middle" class="s">S3 兼容</text>
+  <text x="743" y="414" text-anchor="middle" class="s">path-style</text>
+  <rect x="811" y="348" width="74" height="76" rx="8" fill="#ede9fe" stroke="#8b5cf6"/>
+  <text x="848" y="380" text-anchor="middle" class="t">NATS</text>
+  <text x="848" y="400" text-anchor="middle" class="s">事件</text>
+  <text x="515" y="462" class="k">适用</text>
+  <text x="515" y="484" class="s">企业私有化部署 · 接入 starhub-server（独立 database）</text>
+  <text x="515" y="516" class="k">高可用</text>
+  <text x="515" y="538" class="s">无状态层多副本；PG 主备自动切换，同步复制时 RPO=0</text>
+  <text x="515" y="570" class="k">规模</text>
+  <text x="515" y="592" class="s">单 PG 主库：约每秒 1 到 3 千行写入（10 万次合入/天）</text>
+  <text x="515" y="624" class="k">许可证</text>
+  <text x="575" y="624" class="s">PostgreSQL License · MinIO 可替换为 Ceph 等</text>
+
+  <!-- Column 3: Distributed -->
+  <rect x="940" y="92" width="430" height="560" rx="12" fill="#f8fafc" stroke="#cbd5e1"/>
+  <rect x="940" y="92" width="430" height="64" rx="12" fill="#7c3aed"/>
+  <rect x="940" y="140" width="430" height="16" fill="#7c3aed"/>
+  <text x="960" y="122" class="th">Distributed</text>
+  <text x="960" y="144" class="thl">多可用区 · 多区域 · 大规模高写入</text>
+  <rect x="970" y="176" width="180" height="46" rx="8" fill="#dcfce7" stroke="#22c55e"/>
+  <text x="1060" y="204" text-anchor="middle" class="t">区域 A cache ×N</text>
+  <rect x="1160" y="176" width="180" height="46" rx="8" fill="#dcfce7" stroke="#22c55e"/>
+  <text x="1250" y="204" text-anchor="middle" class="t">区域 B cache ×N</text>
+  <path d="M1060,222 L1060,240" class="e"/>
+  <path d="M1250,222 L1250,240" class="e"/>
+  <rect x="970" y="242" width="370" height="56" rx="8" fill="#ffedd5" stroke="#f97316"/>
+  <text x="1155" y="266" text-anchor="middle" class="t">scion server / deriver ×N（跨 AZ）</text>
+  <text x="1155" y="286" text-anchor="middle" class="s">LandCoordinator：每个热点 ref 一个 leader（租约）</text>
+  <path d="M1040,298 L1040,346" class="e"/>
+  <path d="M1190,298 L1190,346" class="e"/>
+  <path d="M1300,298 L1300,346" class="e"/>
+  <rect x="970" y="348" width="160" height="76" rx="8" fill="#ede9fe" stroke="#8b5cf6"/>
+  <text x="1050" y="376" text-anchor="middle" class="t">YugabyteDB</text>
+  <text x="1050" y="396" text-anchor="middle" class="s">3 AZ · RF=3/5</text>
+  <text x="1050" y="414" text-anchor="middle" class="s">follower read</text>
+  <rect x="1138" y="348" width="120" height="76" rx="8" fill="#ede9fe" stroke="#8b5cf6"/>
+  <text x="1198" y="376" text-anchor="middle" class="t">S3 / OSS</text>
+  <text x="1198" y="396" text-anchor="middle" class="s">跨区域复制</text>
+  <text x="1198" y="414" text-anchor="middle" class="s">预签名直连</text>
+  <rect x="1266" y="348" width="74" height="76" rx="8" fill="#ede9fe" stroke="#8b5cf6"/>
+  <text x="1303" y="380" text-anchor="middle" class="t">NATS</text>
+  <text x="1303" y="400" text-anchor="middle" class="s">集群</text>
+  <text x="970" y="462" class="k">适用</text>
+  <text x="970" y="484" class="s">SaaS / 超大规模单仓库 / 多区域 Agent 集群</text>
+  <text x="970" y="516" class="k">高可用</text>
+  <text x="970" y="538" class="s">少数派副本失效无感 · RPO=0 · 单 AZ 故障无感</text>
+  <text x="970" y="570" class="k">规模</text>
+  <text x="970" y="592" class="s">单 ref 每秒数百次 land · 3,000 万次 checkout/天</text>
+  <text x="970" y="624" class="k">许可证</text>
+  <text x="1030" y="624" class="s">YugabyteDB：Apache 2.0</text>
+
+  <!-- migration band -->
+  <rect x="30" y="672" width="1340" height="64" rx="10" fill="#f1f5f9" stroke="#cbd5e1"/>
+  <path d="M60,704 L1340,704" class="e"/>
+  <rect x="300" y="690" width="800" height="28" rx="6" fill="#f1f5f9"/>
+  <text x="700" y="709" text-anchor="middle" class="t">scion admin migrate-meta：Lite → Standard → Distributed（对象原样复用，只迁元数据）</text>
+</svg>
