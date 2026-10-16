@@ -113,6 +113,17 @@ impl ObjectBlobStore {
         }
     }
 
+    /// 读出已有对象并校验 BLAKE3。对象在读取期间消失时视为不完好（随后会被重新写入）。
+    async fn intact(&self, key: &Path, id: &ObjectId) -> Result<bool> {
+        let res = match self.store.get(key).await {
+            Ok(r) => r,
+            Err(object_store::Error::NotFound { .. }) => return Ok(false),
+            Err(e) => return Err(backend("get object", e)),
+        };
+        let data = res.bytes().await.map_err(|e| backend("read object", e))?;
+        Ok(id.verify(&data))
+    }
+
     fn key(&self, id: &ObjectId) -> Path {
         Path::from(format!("{}{}", self.prefix, object_key(id)))
     }
@@ -154,10 +165,17 @@ fn short(e: &object_store::Error) -> &'static str {
 #[async_trait]
 impl BlobStore for ObjectBlobStore {
     async fn put(&self, id: ObjectId, data: Bytes) -> Result<()> {
+        if !id.verify(&data) {
+            return Err(Error::Backend(format!(
+                "refusing to store bytes that do not match {id}"
+            )));
+        }
         let key = self.key(&id);
-        // 已存在就不再上传：内容寻址保证内容相同，大文件可省去一次完整传输
+        // 已存在且完好就不再上传。已存在但大小不符或内容校验失败（截断、位翻转）时覆盖写入，
+        // 否则损坏的对象永远无法被重新上传修复，跨仓库去重还会让新仓库引用到坏数据。
         match self.store.head(&key).await {
-            Ok(_) => return Ok(()),
+            Ok(meta) if meta.size == data.len() as u64 && self.intact(&key, &id).await? => return Ok(()),
+            Ok(_) => tracing::warn!(%id, "existing blob is damaged; overwriting with verified bytes"),
             Err(object_store::Error::NotFound { .. }) => {}
             Err(e) => return Err(backend("head object", e)),
         }
@@ -272,6 +290,51 @@ mod tests {
         s.put(id, Bytes::from_static(b"good")).await.expect("put");
         std::fs::write(dir.path().join(object_key(&id)), b"evil").expect("tamper");
         assert!(matches!(s.get(&id).await, Err(Error::Backend(m)) if m.contains("integrity")));
+    }
+
+    /// 回归测试（PR #1 review）：已损坏的对象必须能被重新上传修复。
+    #[tokio::test]
+    async fn put_repairs_truncated_and_bit_flipped_objects() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let s = ObjectBlobStore::local(dir.path()).expect("open");
+        let data = Bytes::from_static(b"precious model weights");
+        let id = ObjectId::of_blob(&data);
+        let file = dir.path().join(object_key(&id));
+        s.put(id, data.clone()).await.expect("put");
+
+        // 截断：大小不一致
+        std::fs::write(&file, b"precious").expect("truncate");
+        assert!(matches!(s.get(&id).await, Err(Error::Backend(_))));
+        s.put(id, data.clone()).await.expect("re-upload repairs");
+        assert_eq!(s.get(&id).await, Ok(Some(data.clone())));
+
+        // 位翻转：大小相同但内容不同
+        let mut flipped = data.to_vec();
+        flipped[0] ^= 0x01;
+        std::fs::write(&file, &flipped).expect("flip");
+        assert!(matches!(s.get(&id).await, Err(Error::Backend(_))));
+        s.put(id, data.clone()).await.expect("re-upload repairs");
+        assert_eq!(s.get(&id).await, Ok(Some(data)));
+    }
+
+    #[tokio::test]
+    async fn put_rejects_bytes_not_matching_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let s = ObjectBlobStore::local(dir.path()).expect("open");
+        let id = ObjectId::of_blob(b"good");
+        assert!(matches!(
+            s.put(id, Bytes::from_static(b"evil")).await,
+            Err(Error::Backend(_))
+        ));
+        assert_eq!(s.exists(&id).await, Ok(false));
+    }
+
+    #[tokio::test]
+    async fn intact_missing_object_is_not_intact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let s = ObjectBlobStore::local(dir.path()).expect("open");
+        let id = ObjectId::of_blob(b"x");
+        assert_eq!(s.intact(&s.key(&id), &id).await, Ok(false));
     }
 
     #[tokio::test]

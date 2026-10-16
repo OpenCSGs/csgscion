@@ -113,6 +113,14 @@ pub async fn blob_store<S: BlobStore + ?Sized>(s: &S) {
     assert_eq!(s.get(&idb).await, Ok(Some(b)));
     assert_eq!(s.exists(&ida).await, Ok(true));
 
+    // 字节与 id 不符：拒绝，且不留下任何对象
+    let idc = ObjectId::of_blob(b"claimed");
+    assert!(matches!(
+        s.put(idc, Bytes::from_static(b"actual")).await,
+        Err(Error::Backend(_))
+    ));
+    assert_eq!(s.exists(&idc).await, Ok(false));
+
     // 大对象（跨越常见缓冲区边界）
     let big = Bytes::from(vec![0x5a; 3 << 20]);
     let idbig = ObjectId::of_blob(&big);

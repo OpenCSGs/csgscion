@@ -166,6 +166,11 @@ impl MetaStore for MemStore {
 #[async_trait]
 impl BlobStore for MemStore {
     async fn put(&self, id: ObjectId, data: Bytes) -> Result<()> {
+        if !id.verify(&data) {
+            return Err(Error::Backend(format!(
+                "refusing to store bytes that do not match {id}"
+            )));
+        }
         self.write()?.blobs.entry(id).or_insert(data);
         Ok(())
     }
