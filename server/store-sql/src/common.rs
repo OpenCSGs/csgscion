@@ -45,6 +45,22 @@ pub(crate) fn id_from_db(b: &[u8]) -> Result<ObjectId> {
     ObjectId::from_bytes(b).map_err(|e| Error::Backend(format!("corrupt object id in metastore: {e}")))
 }
 
+/// 单条 SQL 中最多绑定的对象个数（SQLite 默认参数上限 32766，PG 65535，留足余量）。
+pub(crate) const MAX_IDS_PER_QUERY: usize = 500;
+
+/// FindMissing 的公共部分：输入去重保序，减去已存在集合。
+pub(crate) fn subtract_present(ids: &[ObjectId], present: &std::collections::HashSet<Vec<u8>>) -> Vec<ObjectId> {
+    let mut seen = std::collections::HashSet::new();
+    ids.iter()
+        .filter(|id| !present.contains(id.to_bytes().as_slice()) && seen.insert(**id))
+        .copied()
+        .collect()
+}
+
+pub(crate) fn size_to_db(size: u64) -> Result<i64> {
+    i64::try_from(size).map_err(|_| Error::Backend(format!("object size {size} exceeds i64")))
+}
+
 /// URL 中的密码替换为 `***`，用于错误信息和日志。
 pub(crate) fn redact_url(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
@@ -81,6 +97,24 @@ mod tests {
         let id = ObjectId::of_blob(b"x");
         assert_eq!(id_from_db(&id.to_bytes()), Ok(id));
         assert!(matches!(id_from_db(b"short"), Err(Error::Backend(_))));
+    }
+
+    #[test]
+    fn subtract_present_keeps_order_and_dedups() {
+        let (a, b, c) = (
+            ObjectId::of_blob(b"a"),
+            ObjectId::of_blob(b"b"),
+            ObjectId::of_blob(b"c"),
+        );
+        let present = std::collections::HashSet::from([b.to_bytes().to_vec()]);
+        assert_eq!(subtract_present(&[c, b, a, c], &present), vec![c, a]);
+        assert_eq!(subtract_present(&[], &present), vec![]);
+    }
+
+    #[test]
+    fn size_to_db_bounds() {
+        assert_eq!(size_to_db(0), Ok(0));
+        assert!(matches!(size_to_db(u64::MAX), Err(Error::Backend(_))));
     }
 
     #[test]

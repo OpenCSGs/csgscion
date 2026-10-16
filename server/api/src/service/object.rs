@@ -94,18 +94,32 @@ impl ObjectService for ObjectSvc {
         self.check_batch(req.wants.len())?;
         negotiate_encoding(&req.accept_encodings)?;
 
-        // 先确认全部对象都在，再开始发送：要么完整成功，要么一开始就报 OBJECT_MISSING
-        let mut found = Vec::with_capacity(req.wants.len());
-        let mut missing = Vec::new();
-        for want in &req.wants {
-            let id = parse_id(&want.id)?;
-            match self.blobs.get(&req.repo, &id).await.map_err(status::from_store)? {
-                Some(data) => found.push((id, data, want.offset)),
-                None => missing.push(id),
-            }
-        }
+        let ids = req
+            .wants
+            .iter()
+            .map(|w| parse_id(&w.id))
+            .collect::<Result<Vec<_>, _>>()?;
+        // 先按仓库的对象索引确认全部可见，再开始发送：要么完整成功，要么一开始就报 OBJECT_MISSING
+        let missing = self
+            .meta
+            .missing_objects(&req.repo, &ids)
+            .await
+            .map_err(status::from_store)?;
         if !missing.is_empty() {
             return Err(status::object_missing(&missing));
+        }
+        let mut found = Vec::with_capacity(ids.len());
+        for (id, want) in ids.into_iter().zip(&req.wants) {
+            match self.blobs.get(&id).await.map_err(status::from_store)? {
+                Some(data) => found.push((id, data, want.offset)),
+                // 索引里有但字节不在：违反写入顺序不变式，属于数据损坏，需要运维介入
+                None => {
+                    tracing::error!(%id, repo = %req.repo, "indexed object missing from blob store");
+                    return Err(Status::internal(format!(
+                        "object {id} is indexed but its bytes are missing"
+                    )));
+                }
+            }
         }
         for (id, data, offset) in &found {
             if *offset > data.len() as u64 {
@@ -133,7 +147,11 @@ impl ObjectService for ObjectSvc {
         self.check_repo(&req.repo).await?;
         self.check_batch(req.ids.len())?;
         let ids = req.ids.iter().map(|b| parse_id(b)).collect::<Result<Vec<_>, _>>()?;
-        let missing = self.blobs.missing(&req.repo, &ids).await.map_err(status::from_store)?;
+        let missing = self
+            .meta
+            .missing_objects(&req.repo, &ids)
+            .await
+            .map_err(status::from_store)?;
         Ok(Response::new(HasObjectsResponse {
             missing_ids: missing
                 .iter()
@@ -147,7 +165,7 @@ impl ObjectService for ObjectSvc {
 mod tests {
     use super::*;
     use scion_proto::v1::ObjectWant;
-    use scion_store::MemStore;
+    use scion_store::{IndexedObject, MemStore};
     use tokio_stream::StreamExt;
     use tonic::Code;
 
@@ -157,10 +175,18 @@ mod tests {
         let store = Arc::new(MemStore::new());
         store.create_repo(REPO).await.expect("repo");
         for b in blobs {
+            let id = ObjectId::of_blob(b);
+            store.put(id, Bytes::copy_from_slice(b)).await.expect("put");
             store
-                .put(REPO, ObjectId::of_blob(b), Bytes::copy_from_slice(b))
+                .index_objects(
+                    REPO,
+                    &[IndexedObject {
+                        id,
+                        size: b.len() as u64,
+                    }],
+                )
                 .await
-                .expect("put");
+                .expect("index");
         }
         let cfg = ServerConfig {
             limits,
@@ -374,6 +400,48 @@ mod tests {
             accept_encodings: vec![],
         };
         assert_eq!(collect(&svc, req).await.expect("ok").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_objects_bytes_in_other_repo_not_visible() {
+        let store = Arc::new(MemStore::new());
+        store.create_repo(REPO).await.expect("repo");
+        // 字节存在于全局存储，但本仓库没有登记：不可见
+        store
+            .put(ObjectId::of_blob(b"secret"), Bytes::from_static(b"secret"))
+            .await
+            .expect("put");
+        let svc = ObjectSvc::new(Arc::new(ServerConfig::default()), store.clone(), store);
+        let req = GetObjectsRequest {
+            repo: REPO.into(),
+            wants: vec![want(b"secret", 0)],
+            accept_encodings: vec![],
+        };
+        assert_eq!(
+            collect(&svc, req).await.map_err(|s| s.code()).err(),
+            Some(Code::NotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn get_objects_indexed_but_missing_bytes_is_internal() {
+        let store = Arc::new(MemStore::new());
+        store.create_repo(REPO).await.expect("repo");
+        let id = ObjectId::of_blob(b"lost");
+        store
+            .index_objects(REPO, &[IndexedObject { id, size: 4 }])
+            .await
+            .expect("index");
+        let svc = ObjectSvc::new(Arc::new(ServerConfig::default()), store.clone(), store);
+        let req = GetObjectsRequest {
+            repo: REPO.into(),
+            wants: vec![want(b"lost", 0)],
+            accept_encodings: vec![],
+        };
+        assert_eq!(
+            collect(&svc, req).await.map_err(|s| s.code()).err(),
+            Some(Code::Internal)
+        );
     }
 
     #[tokio::test]

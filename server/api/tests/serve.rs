@@ -8,7 +8,7 @@ use scion_object::ObjectId;
 use scion_proto::v1::object_service_client::ObjectServiceClient;
 use scion_proto::v1::server_info_service_client::ServerInfoServiceClient;
 use scion_proto::v1::{GetObjectsRequest, GetServerInfoRequest, HasObjectsRequest, ObjectWant};
-use scion_store::{BlobStore, MemStore, MetaStore};
+use scion_store::{BlobStore, IndexedObject, MemStore, MetaStore};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tonic_health::pb::health_client::HealthClient;
@@ -20,7 +20,17 @@ async fn serve_end_to_end_and_shutdown() {
     store.create_repo("mono").await.expect("repo");
     let data = Bytes::from(vec![7u8; 3_000_000]); // 大于单块上限，触发多块
     let id = ObjectId::of_blob(&data);
-    store.put("mono", id, data.clone()).await.expect("put");
+    store.put(id, data.clone()).await.expect("put");
+    store
+        .index_objects(
+            "mono",
+            &[IndexedObject {
+                id,
+                size: data.len() as u64,
+            }],
+        )
+        .await
+        .expect("index");
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");

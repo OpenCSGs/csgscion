@@ -1,9 +1,10 @@
 //! Scion 存储抽象。
 //!
 //! - [`MetaStore`]：仓库与 ref 等元数据。ref 是系统中**唯一的可变状态**，只能通过 CAS 修改。
-//! - [`BlobStore`]：按内容寻址的对象字节。写入天然幂等。
+//! - [`BlobStore`]：按内容寻址的对象字节，全局只存一份，写入天然幂等；
+//!   仓库能看到哪些对象由 MetaStore 的对象索引决定。
 //!
-//! M0 只提供内存实现 [`MemStore`]；SQLite / PostgreSQL / YugabyteDB 与 S3 实现位于其它 crate，
+//! 本 crate 提供内存实现 [`MemStore`]；SQLite / PostgreSQL / YugabyteDB 与 S3 实现位于其它 crate，
 //! 都必须通过 [`testsuite`]（feature `testsuite`）中的一致性测试。
 
 mod error;
@@ -51,15 +52,32 @@ pub trait MetaStore: Send + Sync + 'static {
     /// 条件更新 ref：前置条件满足时把 target 设为 `target`，版本加 1（新建时版本为 1）。
     /// 条件不满足时返回 [`Error::RefVersionMismatch`]，其中带上当前版本。
     async fn cas_ref(&self, repo: &str, name: &str, expect: RefExpect, target: ObjectId) -> Result<RefState>;
+
+    /// 把对象登记到仓库的对象索引（幂等）。调用前对象字节必须已写入 [`BlobStore`]：
+    /// 索引里有的对象一定可读，这是写入顺序不变式（服务端设计文档 §4.5）。
+    async fn index_objects(&self, repo: &str, objects: &[IndexedObject]) -> Result<()>;
+
+    /// 返回 `ids` 中**该仓库**索引里没有的对象，保持输入中的相对顺序，重复的 id 只返回一次。
+    /// 对象字节全局只存一份，但仓库之间互相看不到对方有哪些对象。
+    async fn missing_objects(&self, repo: &str, ids: &[ObjectId]) -> Result<Vec<ObjectId>>;
 }
 
+/// 对象索引中的一条记录。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexedObject {
+    pub id: ObjectId,
+    /// 对象字节数（未压缩）。
+    pub size: u64,
+}
+
+/// 按内容寻址的对象字节存储，**全局共享**：相同内容在所有仓库中只存一份。
+/// 仓库能访问哪些对象由 [`MetaStore`] 的对象索引决定。
 #[async_trait]
 pub trait BlobStore: Send + Sync + 'static {
     /// 写入对象。同一 id 重复写入是幂等的。调用方负责保证 `data` 与 `id` 相符。
-    async fn put(&self, repo: &str, id: ObjectId, data: Bytes) -> Result<()>;
+    async fn put(&self, id: ObjectId, data: Bytes) -> Result<()>;
 
-    async fn get(&self, repo: &str, id: &ObjectId) -> Result<Option<Bytes>>;
+    async fn get(&self, id: &ObjectId) -> Result<Option<Bytes>>;
 
-    /// 返回 `ids` 中不存在的那些，保持输入中的相对顺序（重复的 id 只返回一次）。
-    async fn missing(&self, repo: &str, ids: &[ObjectId]) -> Result<Vec<ObjectId>>;
+    async fn exists(&self, id: &ObjectId) -> Result<bool>;
 }

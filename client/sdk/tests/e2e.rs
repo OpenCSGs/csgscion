@@ -6,7 +6,7 @@ use bytes::Bytes;
 use scion_api::{App, Limits, ServerConfig, serve};
 use scion_client::{Auth, Client, Error, ObjectId, ProtocolVersion, Role};
 use scion_proto::v1::ErrorReason;
-use scion_store::{BlobStore, MemStore, MetaStore};
+use scion_store::{BlobStore, IndexedObject, MemStore, MetaStore};
 use tokio::net::TcpListener;
 
 struct TestServer {
@@ -18,10 +18,18 @@ async fn start(limits: Limits, blobs: &[&'static [u8]]) -> TestServer {
     let store = Arc::new(MemStore::new());
     store.create_repo("mono").await.expect("repo");
     for b in blobs {
+        let id = ObjectId::of_blob(b);
+        store.put(id, Bytes::from_static(b)).await.expect("put");
         store
-            .put("mono", ObjectId::of_blob(b), Bytes::from_static(b))
+            .index_objects(
+                "mono",
+                &[IndexedObject {
+                    id,
+                    size: b.len() as u64,
+                }],
+            )
             .await
-            .expect("put");
+            .expect("index");
     }
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let url = format!("http://{}", listener.local_addr().expect("addr"));

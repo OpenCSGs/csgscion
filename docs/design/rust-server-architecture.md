@@ -242,7 +242,7 @@ Changeset { parents, author, committer, time, message, change_id, delta: [FileCh
 | 表 | 主键 | 说明 |
 |---|---|---|
 | `repos` | repo_id | 配置、限额 |
-| `objects_index` | (repo_id, id) | 大小、存储位置（inline 或 S3 key）、redaction 标记 |
+| `objects_index` | (repo_id, id) | 仓库能看到哪些对象：大小、redaction 标记。对象字节本身全局只存一份，这张表决定可见性 |
 | `objects_inline` | (repo_id, id) | 小于 4 KiB 的对象直接内联存储（tree 大多很小） |
 | `changesets` | (repo_id, cs_id) | 规范编码字节、gen、first_parent |
 | `cs_log` | (repo_id, seq) | WAL，序号单调递增（每仓库一个 sequence） |
@@ -257,7 +257,7 @@ Changeset { parents, author, committer, time, message, change_id, delta: [FileCh
 热点规避：Distributed 档的表都以 `HASH(repo_id)` 作为分片键，避免同一个仓库的写入集中到单个 tablet；`cs_log` 的序号做法见上表。Standard 和 Lite 档不需要处理热点。
 
 ### 4.5 Blob 存储布局
-`s3://bucket/{repo_shard}/{kind}/{hh}/{hex}`，对象内容为 zstd 压缩后的字节。
+`s3://bucket/{prefix}objects/{kind}/{hh}/{hex}`。**对象字节全局只存一份**，不按仓库分目录：相同内容（例如同一模型的量化版、微调版之间的公共分片）在所有仓库中只存一次。仓库能读到哪些对象由 `objects_index` 决定，`HasObjects` 和 `GetObjects` 都先查索引，因此一个仓库无法探测其它仓库有哪些对象。M1 存原始字节，zstd 压缩在后续里程碑加入（以 key 后缀区分，旧对象照常可读）。
 
 写入顺序不变式：**blob 持久化 → changeset 与 cs_tree 持久化 → ref CAS**。读路径永远不会看到悬挂引用。
 
@@ -309,7 +309,7 @@ storage_class     = ""                      # 可选
 3. 客户端调用 `CommitUpload(expected_id)`。服务端流式读回数据并校验 hash，通过后用 CopyObject 放到正式的 CAS key 下，然后删除暂存数据。
 4. 校验失败就删除暂存数据并返回错误。janitor 会清理超过 24 小时仍未提交的暂存数据。
 
-**key 布局**：`{prefix}{repo_shard}/{kind}/{hh}/{hex}`。用 hash 作前缀，可以把对象均匀分散到 MinIO 的各个 erasure set 和 S3 的各个分区；`staging/` 和 `snapshots/` 是独立的前缀，方便单独配置生命周期规则。
+**key 布局**：`{prefix}objects/{kind}/{hh}/{hex}`。用 hash 作前缀，可以把对象均匀分散到 MinIO 的各个 erasure set 和 S3 的各个分区；`staging/` 和 `snapshots/` 是独立的前缀，方便单独配置生命周期规则。
 
 **兼容性测试矩阵（CI）**：
 | 后端 | 方式 | 频率 |

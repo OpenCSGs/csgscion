@@ -5,10 +5,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use scion_object::ObjectId;
-use scion_store::{Error, MetaStore, RefExpect, RefState, Result, validate_repo_name};
+use scion_store::{Error, IndexedObject, MetaStore, RefExpect, RefState, Result, validate_repo_name};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous};
 
-use crate::common::{backend, id_from_db, is_unique_violation, now_ms, version_from_db, version_to_db};
+use crate::common::{
+    MAX_IDS_PER_QUERY, backend, id_from_db, is_unique_violation, now_ms, size_to_db, subtract_present, version_from_db,
+    version_to_db,
+};
 
 /// 写锁等待上限；SQLite 同一时刻只有一个写者，其余写者在此期间排队。
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -181,6 +184,52 @@ impl MetaStore for SqliteMetaStore {
             version: new_version,
         })
     }
+
+    async fn index_objects(&self, repo: &str, objects: &[IndexedObject]) -> Result<()> {
+        let repo_id = self.repo_id(repo).await?;
+        if objects.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await.map_err(|e| backend("begin", e))?;
+        for chunk in objects.chunks(MAX_IDS_PER_QUERY) {
+            let rows = chunk
+                .iter()
+                .map(|o| Ok((o.id.to_bytes().to_vec(), size_to_db(o.size)?)))
+                .collect::<Result<Vec<_>>>()?;
+            let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new("INSERT INTO objects_index (repo_id, id, size) ");
+            qb.push_values(rows, |mut b, (id, size)| {
+                b.push_bind(repo_id).push_bind(id).push_bind(size);
+            });
+            qb.push(" ON CONFLICT (repo_id, id) DO NOTHING");
+            qb.build()
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| backend("index objects", e))?;
+        }
+        tx.commit().await.map_err(|e| backend("commit", e))?;
+        Ok(())
+    }
+
+    async fn missing_objects(&self, repo: &str, ids: &[ObjectId]) -> Result<Vec<ObjectId>> {
+        let repo_id = self.repo_id(repo).await?;
+        let mut present = std::collections::HashSet::new();
+        for chunk in ids.chunks(MAX_IDS_PER_QUERY) {
+            let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new("SELECT id FROM objects_index WHERE repo_id = ");
+            qb.push_bind(repo_id).push(" AND id IN (");
+            let mut sep = qb.separated(", ");
+            for id in chunk {
+                sep.push_bind(id.to_bytes().to_vec());
+            }
+            qb.push(")");
+            let found: Vec<Vec<u8>> = qb
+                .build_query_scalar()
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| backend("find missing", e))?;
+            present.extend(found);
+        }
+        Ok(subtract_present(ids, &present))
+    }
 }
 
 #[cfg(test)]
@@ -200,6 +249,40 @@ mod tests {
     async fn conformance_meta() {
         let (_dir, s) = fresh().await;
         testsuite::meta_store(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_object_index() {
+        let (_dir, s) = fresh().await;
+        testsuite::object_index(&s).await;
+    }
+
+    #[tokio::test]
+    async fn index_objects_large_batch_spans_chunks() {
+        let (_dir, s) = fresh().await;
+        s.create_repo("r").await.expect("create");
+        let objs: Vec<_> = (0..1_234u32)
+            .map(|i| IndexedObject {
+                id: ObjectId::of_blob(&i.to_le_bytes()),
+                size: u64::from(i),
+            })
+            .collect();
+        s.index_objects("r", &objs).await.expect("index");
+        let mut ids: Vec<_> = objs.iter().map(|o| o.id).collect();
+        let extra = ObjectId::of_blob(b"extra");
+        ids.push(extra);
+        assert_eq!(s.missing_objects("r", &ids).await, Ok(vec![extra]));
+    }
+
+    #[tokio::test]
+    async fn index_objects_size_overflow_rejected() {
+        let (_dir, s) = fresh().await;
+        s.create_repo("r").await.expect("create");
+        let o = IndexedObject {
+            id: ObjectId::of_blob(b"x"),
+            size: u64::MAX,
+        };
+        assert!(matches!(s.index_objects("r", &[o]).await, Err(Error::Backend(_))));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -287,6 +370,25 @@ mod tests {
             s.cas_ref("r", "m", RefExpect::Absent, id).await,
             Err(Error::Backend(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn object_index_backend_errors() {
+        let (_dir, s) = fresh().await;
+        s.create_repo("r").await.expect("create");
+        // 让读写失败：删掉索引表
+        sqlx::query("DROP TABLE objects_index")
+            .execute(&s.pool)
+            .await
+            .expect("drop");
+        let o = IndexedObject {
+            id: ObjectId::of_blob(b"x"),
+            size: 1,
+        };
+        assert!(matches!(s.index_objects("r", &[o]).await, Err(Error::Backend(_))));
+        assert!(matches!(s.missing_objects("r", &[o.id]).await, Err(Error::Backend(_))));
+        s.pool.close().await;
+        assert!(matches!(s.index_objects("r", &[o]).await, Err(Error::Backend(_))));
     }
 
     #[tokio::test]
