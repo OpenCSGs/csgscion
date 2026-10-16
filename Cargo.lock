@@ -2464,8 +2464,10 @@ dependencies = [
  "bytes",
  "scion-object",
  "scion-store",
+ "scion-store-sql",
  "scion-tree",
  "similar",
+ "tempfile",
  "thiserror",
  "tokio",
 ]
