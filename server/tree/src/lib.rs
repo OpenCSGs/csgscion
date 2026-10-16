@@ -200,6 +200,102 @@ fn apply_dir<'a>(
     })
 }
 
+/// 一个文件的变化：`old` 为 None 表示新增，`new` 为 None 表示删除。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileDiff {
+    pub path: String,
+    pub old: Option<TreeEntry>,
+    pub new: Option<TreeEntry>,
+}
+
+/// 比较两个根目录树在 `path`（空串为整个仓库）下的文件差异，按路径排序。
+/// `None` 表示空树。内容与 mode 都相同的子树直接跳过，代价只与变化的部分有关。
+pub async fn diff(
+    src: &dyn TreeSource,
+    old_root: Option<ObjectId>,
+    new_root: Option<ObjectId>,
+    path: &str,
+) -> Result<Vec<FileDiff>> {
+    let at = |root: Option<ObjectId>| async move {
+        match root {
+            None => Ok(None),
+            Some(r) if path.is_empty() => Ok(Some(TreeEntry {
+                name: String::new(),
+                mode: EntryMode::Tree,
+                id: r,
+                size: 0,
+            })),
+            Some(r) => lookup(src, r, path).await,
+        }
+    };
+    let (old, new) = (at(old_root).await?, at(new_root).await?);
+    let mut out = Vec::new();
+    diff_entries(src, path, old, new, &mut out).await?;
+    out.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+    Ok(out)
+}
+
+fn diff_entries<'a>(
+    src: &'a dyn TreeSource,
+    path: &'a str,
+    old: Option<TreeEntry>,
+    new: Option<TreeEntry>,
+    out: &'a mut Vec<FileDiff>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        if old.as_ref().map(|e| (e.mode, e.id)) == new.as_ref().map(|e| (e.mode, e.id)) {
+            return Ok(());
+        }
+        let is_dir = |e: &Option<TreeEntry>| e.as_ref().is_some_and(|e| e.mode == EntryMode::Tree);
+        let (old_dir, new_dir) = (is_dir(&old), is_dir(&new));
+        if !old_dir && !new_dir {
+            out.push(FileDiff {
+                path: path.to_owned(),
+                old,
+                new,
+            });
+            return Ok(());
+        }
+        // 至少一侧是目录：文件那一侧单独记一条，目录那一侧逐个条目递归
+        let (mut old_children, mut new_children) = (BTreeMap::new(), BTreeMap::new());
+        match (&old, old_dir) {
+            (Some(e), true) => old_children = children(src, e.id).await?,
+            (Some(e), false) => out.push(FileDiff {
+                path: path.to_owned(),
+                old: Some(e.clone()),
+                new: None,
+            }),
+            (None, _) => {}
+        }
+        match (&new, new_dir) {
+            (Some(e), true) => new_children = children(src, e.id).await?,
+            (Some(e), false) => out.push(FileDiff {
+                path: path.to_owned(),
+                old: None,
+                new: Some(e.clone()),
+            }),
+            (None, _) => {}
+        }
+        let names: std::collections::BTreeSet<String> =
+            old_children.keys().chain(new_children.keys()).cloned().collect();
+        for name in names {
+            let child = join(path, &name);
+            diff_entries(src, &child, old_children.remove(&name), new_children.remove(&name), out).await?;
+        }
+        Ok(())
+    })
+}
+
+async fn children(src: &dyn TreeSource, id: ObjectId) -> Result<BTreeMap<String, TreeEntry>> {
+    Ok(src
+        .load_tree(&id)
+        .await?
+        .entries()
+        .iter()
+        .map(|e| (e.name.clone(), e.clone()))
+        .collect())
+}
+
 /// 按路径查找条目；`path` 为空字符串时表示根目录本身（返回 `None`，调用方直接使用根树）。
 pub async fn lookup(src: &dyn TreeSource, root: ObjectId, path: &str) -> Result<Option<TreeEntry>> {
     if path.is_empty() {
@@ -411,6 +507,121 @@ mod tests {
         assert!(
             matches!(build(&src, Some(ghost), vec![put("a", "a")]).await, Err(TreeError::BadTree(id, _)) if id == ghost)
         );
+    }
+
+    async fn diff_paths(
+        src: &MemSource,
+        a: Option<ObjectId>,
+        b: Option<ObjectId>,
+        path: &str,
+    ) -> Vec<(String, &'static str)> {
+        diff(src, a, b, path)
+            .await
+            .expect("diff")
+            .into_iter()
+            .map(|d| {
+                let kind = match (&d.old, &d.new) {
+                    (None, Some(_)) => "A",
+                    (Some(_), None) => "D",
+                    _ => "M",
+                };
+                (d.path, kind)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn diff_reports_adds_mods_deletes_sorted() {
+        let src = MemSource::default();
+        let r1 = build(
+            &src,
+            None,
+            vec![put("a/x", "1"), put("a/y", "1"), put("b", "b"), put("keep/k", "k")],
+        )
+        .await
+        .expect("v1");
+        let r2 = build(
+            &src,
+            Some(r1),
+            vec![put("a/x", "2"), del("a/y"), put("c/new", "n"), del("b")],
+        )
+        .await
+        .expect("v2");
+        assert_eq!(
+            diff_paths(&src, Some(r1), Some(r2), "").await,
+            [
+                ("a/x".into(), "M"),
+                ("a/y".into(), "D"),
+                ("b".into(), "D"),
+                ("c/new".into(), "A")
+            ]
+        );
+        assert!(diff_paths(&src, Some(r1), Some(r1), "").await.is_empty());
+        // 从空树开始：全部是新增
+        assert_eq!(diff_paths(&src, None, Some(r1), "").await.len(), 4);
+        assert_eq!(diff_paths(&src, Some(r1), None, "").await.len(), 4);
+        assert!(diff_paths(&src, None, None, "").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn diff_mode_change_and_type_change() {
+        let src = MemSource::default();
+        let r1 = build(&src, None, vec![put("f", "x"), put("d/inner", "i")])
+            .await
+            .expect("v1");
+        let exec = FileChange::put("f", EntryMode::Executable, ObjectId::of_blob(b"x"), 1);
+        let r2 = build(&src, Some(r1), vec![exec, del("d/inner"), put("d", "now a file")])
+            .await
+            .expect("v2");
+        assert_eq!(
+            diff_paths(&src, Some(r1), Some(r2), "").await,
+            [("d".into(), "A"), ("d/inner".into(), "D"), ("f".into(), "M")]
+        );
+        // 反方向：文件变回目录
+        assert_eq!(
+            diff_paths(&src, Some(r2), Some(r1), "").await,
+            [("d".into(), "D"), ("d/inner".into(), "A"), ("f".into(), "M")]
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_limited_to_path() {
+        let src = MemSource::default();
+        let r1 = build(&src, None, vec![put("a/x", "1"), put("b/y", "1")])
+            .await
+            .expect("v1");
+        let r2 = build(&src, Some(r1), vec![put("a/x", "2"), put("b/y", "2")])
+            .await
+            .expect("v2");
+        assert_eq!(diff_paths(&src, Some(r1), Some(r2), "a").await, [("a/x".into(), "M")]);
+        assert_eq!(diff_paths(&src, Some(r1), Some(r2), "b/y").await, [("b/y".into(), "M")]);
+        assert!(diff_paths(&src, Some(r1), Some(r2), "nope").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn diff_skips_identical_subtrees_without_loading() {
+        let src = MemSource::default();
+        let r1 = build(
+            &src,
+            None,
+            vec![put("big/a", "1"), put("big/b", "2"), put("small", "s")],
+        )
+        .await
+        .expect("v1");
+        let r2 = build(&src, Some(r1), vec![put("small", "t")]).await.expect("v2");
+        // 删掉 big 子树对象：如果 diff 去读它就会报错
+        let big = lookup(&src, r1, "big").await.expect("ok").expect("big").id;
+        src.trees.lock().expect("lock").remove(&big);
+        assert_eq!(diff_paths(&src, Some(r1), Some(r2), "").await, [("small".into(), "M")]);
+    }
+
+    #[tokio::test]
+    async fn diff_missing_tree_reported() {
+        let src = MemSource::default();
+        let r1 = build(&src, None, vec![put("a/x", "1")]).await.expect("v1");
+        let ghost = ObjectId::hash(scion_object::ObjectKind::Tree, b"ghost");
+        assert!(matches!(diff(&src, Some(r1), Some(ghost), "").await, Err(TreeError::BadTree(..))));
+        assert!(matches!(diff(&src, Some(ghost), Some(r1), "a").await, Err(TreeError::BadTree(..))));
     }
 
     #[tokio::test]
