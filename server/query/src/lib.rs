@@ -62,7 +62,24 @@ impl<'a> Graph<'a> {
         }
         Ok(&self.records[&id])
     }
+
+    /// 已知 `id` 的代数不大于 `below` 时使用：缓存未命中则批量预取 `below` 以下的一个窗口，
+    /// 沿历史往回走时把逐条查询变成每 [`PREFETCH_WINDOW`] 条一次。
+    pub(crate) async fn get_below(&mut self, id: ObjectId, below: u64) -> Result<&ChangesetRecord> {
+        if !self.records.contains_key(&id) {
+            for rec in self.meta.changesets_below(self.repo, below, PREFETCH_WINDOW).await? {
+                self.records.entry(rec.id).or_insert(rec);
+            }
+        }
+        self.get(id).await
+    }
 }
+
+/// 批量预取的窗口大小。
+pub const PREFETCH_WINDOW: usize = 1024;
+
+/// 按路径过滤的 log 一次从索引读取的候选提交数。
+pub const PATH_CANDIDATES: usize = 4096;
 
 /// `ancestor` 是否是 `descendant` 的祖先（含相等）。
 pub async fn is_ancestor(meta: &dyn MetaStore, repo: &str, ancestor: ObjectId, descendant: ObjectId) -> Result<bool> {
@@ -72,21 +89,22 @@ pub async fn is_ancestor(meta: &dyn MetaStore, repo: &str, ancestor: ObjectId, d
 
 async fn is_ancestor_in(g: &mut Graph<'_>, ancestor: ObjectId, descendant: ObjectId) -> Result<bool> {
     let target_gen = g.get(ancestor).await?.generation;
-    let mut queue = vec![descendant];
+    let mut queue = vec![(descendant, u64::MAX)];
     let mut seen = HashSet::new();
-    while let Some(c) = queue.pop() {
+    while let Some((c, below)) = queue.pop() {
         if c == ancestor {
             return Ok(true);
         }
         if !seen.insert(c) {
             continue;
         }
-        let rec = g.get(c).await?.clone();
+        let rec = g.get_below(c, below).await?.clone();
         // 代数不大于目标的提交不可能以目标为祖先（相等时只能是它自己，上面已判断）
         if rec.generation <= target_gen {
             continue;
         }
-        queue.extend(rec.parents.iter().copied());
+        let below = rec.generation.saturating_sub(1);
+        queue.extend(rec.parents.iter().map(|p| (*p, below)));
     }
     Ok(false)
 }
@@ -122,14 +140,15 @@ pub async fn merge_bases(meta: &dyn MetaStore, repo: &str, a: ObjectId, b: Objec
             }
             f |= STALE;
         }
-        let parents = g.get(c).await?.parents.clone();
-        for p in parents {
+        let rec = g.get(c).await?.clone();
+        let below = rec.generation.saturating_sub(1);
+        for p in rec.parents {
             let pf = flags.entry(p).or_default();
             if *pf & f == f {
                 continue;
             }
             *pf |= f;
-            let generation_of = g.get(p).await?.generation;
+            let generation_of = g.get_below(p, below).await?.generation;
             queue.push((generation_of, p));
         }
     }
@@ -208,20 +227,54 @@ pub async fn log(
         }
     }
     let path = path.filter(|p| !p.is_empty());
+    // 按路径过滤时先查 PathHistory 索引，只解码命中的提交；索引中查不到任何记录（例如索引之前写入的
+    // 旧数据）时退回逐个解码检查
+    let top = queue.peek().map_or(0, |(generation, _)| *generation);
+    let candidates = match path {
+        Some(p) => {
+            let hist = meta.path_history(repo, p, top, PATH_CANDIDATES).await?;
+            let truncated = hist.len() == PATH_CANDIDATES;
+            let floor = hist.last().map_or(0, |e| e.generation);
+            let set: HashSet<ObjectId> = hist.into_iter().map(|e| e.cs).collect();
+            (!set.is_empty()).then_some((set, truncated, floor))
+        }
+        None => None,
+    };
     let mut entries = Vec::new();
     let mut scanned = 0;
     while entries.len() < limit.max(1) && scanned < max_scan.max(1) {
+        // 候选被截断时，低于最后一个候选代数的部分留到下一页（下一页会重新读取索引）
+        if let (Some((_, true, floor)), Some((generation, _))) = (&candidates, queue.peek()) {
+            if generation < floor {
+                break;
+            }
+        }
         let Some((_, id)) = queue.pop() else { break };
         scanned += 1;
         let record = g.get(id).await?.clone();
+        let below = record.generation.saturating_sub(1);
         for p in &record.parents {
             if queued.insert(*p) {
-                queue.push((g.get(*p).await?.generation, *p));
+                queue.push((g.get_below(*p, below).await?.generation, *p));
             }
         }
-        let changeset = load_changeset(blobs, id).await?;
-        if path.is_none_or(|p| touches(&changeset, p)) {
-            entries.push(LogEntry { record, changeset });
+        let wanted = match (&candidates, path) {
+            (None, None) => true,
+            (Some((set, _, _)), _) => set.contains(&id),
+            (None, Some(_)) => false,
+        };
+        if wanted {
+            entries.push(LogEntry {
+                record,
+                changeset: load_changeset(blobs, id).await?,
+            });
+        } else if candidates.is_none() {
+            if let Some(p) = path {
+                let changeset = load_changeset(blobs, id).await?;
+                if touches(&changeset, p) {
+                    entries.push(LogEntry { record, changeset });
+                }
+            }
         }
     }
     let next = if queue.is_empty() {

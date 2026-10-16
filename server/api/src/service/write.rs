@@ -10,7 +10,7 @@ use scion_proto::v1::{
     self, ChangesetSpec, CreateChangesetRequest, CreateChangesetResponse, UploadBlobsRequest, UploadBlobsResponse,
     file_change,
 };
-use scion_store::{BlobStore, ChangesetRecord, IndexedObject, MetaStore};
+use scion_store::{BlobStore, ChangesetRecord, IndexedObject, MetaStore, PathChange};
 use scion_tree::{BlobTreeSource, apply_delta};
 use tonic::{Request, Response, Status, Streaming};
 
@@ -107,6 +107,19 @@ impl WriteSvc {
             parents: cs.parents.clone(),
             generation: generation.saturating_add(1),
         };
+        // 先写路径索引，再写记录：记录存在即表示索引完整
+        let changes: Vec<PathChange> = cs
+            .delta
+            .iter()
+            .map(|c| PathChange {
+                path: c.path.clone(),
+                deleted: matches!(c.op, scion_object::FileOp::Delete),
+            })
+            .collect();
+        self.meta
+            .index_paths(repo, cs_id, rec.generation, &changes)
+            .await
+            .map_err(status::from_store)?;
         self.meta.put_changeset(repo, &rec).await.map_err(status::from_store)?;
         Ok(rec)
     }
@@ -549,6 +562,12 @@ pub(crate) mod tests {
         assert_eq!(child.first_parent(), Some(root.id));
         assert_eq!(child.root_tree, scion_object::Tree::default().id());
         assert_eq!(store.get_changeset(REPO, &child.id).await, Ok(Some(child.clone())));
+        // 路径索引已写入
+        let hist = store.path_history(REPO, "a", 10, 10).await.expect("history");
+        assert_eq!(
+            hist.iter().map(|e| (e.cs, e.deleted)).collect::<Vec<_>>(),
+            vec![(child.id, true), (root.id, false)]
+        );
         // 幂等：同样的内容再次创建得到同样的结果
         let again = w
             .create(
