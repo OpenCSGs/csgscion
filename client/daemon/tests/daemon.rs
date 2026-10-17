@@ -16,6 +16,7 @@ use tokio::sync::oneshot;
 async fn l3() -> (String, oneshot::Sender<()>) {
     let store = Arc::new(MemStore::new());
     store.create_repo("mono").await.expect("repo");
+    store.create_repo("other").await.expect("other repo");
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let url = format!("http://{}", listener.local_addr().expect("addr"));
     let app = App {
@@ -268,4 +269,52 @@ async fn local_info_duplicate_start_and_idle_exit() {
         .await
         .expect("idle exit")
         .expect("clean");
+}
+
+/// 与服务端一致：本地缓存里有的对象，只交给索引中有它的仓库。
+#[tokio::test(flavor = "multi_thread")]
+async fn cached_objects_are_not_visible_across_repositories() {
+    let (server, _stop) = l3().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = config(dir.path());
+    let socket = cfg.socket.clone();
+    let daemon = start(cfg).await;
+    let mono = via(&socket, &server).await;
+    let cs = mono
+        .changeset(None)
+        .put("secret.txt", "only in mono")
+        .create()
+        .await
+        .expect("create");
+    let id = ObjectId::of_blob(b"only in mono");
+    mono.get_object(&id).await.expect("visible in mono");
+    assert!(mono.get_object(&cs.root_tree).await.is_ok());
+
+    let other = mono.with_repo("other");
+    let direct = Client::builder()
+        .endpoint(&server)
+        .repo("other")
+        .build()
+        .await
+        .expect("direct");
+    let via_daemon = other.get_object(&id).await.expect_err("not visible in other");
+    let from_server = direct.get_object(&id).await.expect_err("server agrees");
+    assert_eq!(via_daemon.reason(), from_server.reason());
+    assert_eq!(via_daemon.reason(), Some(scion_proto::v1::ErrorReason::ObjectMissing));
+    // 并发读同一对象的两个仓库各自得到自己的结果
+    let (a, b) = tokio::join!(other.get_object(&id), mono.get_object(&id));
+    assert!(a.is_err() && b.is_ok());
+
+    // 对象进入 other 的索引后可以读到
+    direct
+        .changeset(None)
+        .put("copy.txt", "only in mono")
+        .create()
+        .await
+        .expect("upload");
+    assert_eq!(
+        other.get_object(&id).await.expect("now visible").as_ref(),
+        b"only in mono"
+    );
+    daemon.stop().await;
 }

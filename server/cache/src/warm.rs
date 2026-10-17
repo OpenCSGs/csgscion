@@ -225,6 +225,9 @@ mod tests {
                 .map(|id| self.data.get(id).cloned().ok_or_else(|| tonic::Status::not_found("x")))
                 .collect()
         }
+        async fn missing(&self, _: &str, ids: &[ObjectId], _: &RequestCtx) -> Result<Vec<ObjectId>, tonic::Status> {
+            Ok(ids.iter().filter(|id| !self.data.contains_key(id)).copied().collect())
+        }
         fn name(&self) -> &str {
             "objects"
         }

@@ -261,3 +261,63 @@ async fn configuration_errors() {
     let _ = tx.send(());
     task.await.expect("join").expect("clean shutdown");
 }
+
+/// 与 L3 一致：对象只对索引中有它的仓库可见。另一个仓库读过、已在缓存里的对象，对看不到它的仓库
+/// 返回与 L3 相同的错误；对能看到它的仓库直接复用缓存的字节。
+#[tokio::test(flavor = "multi_thread")]
+async fn cached_objects_are_not_visible_across_repositories() {
+    let s = store();
+    s.create_repo(REPO).await.expect("repo");
+    s.create_repo("other").await.expect("other repo");
+    let up = l3(s.clone()).await;
+    seed(&up, &[("secret.txt", b"only in mono".to_vec())]).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let (url, node, _stop) = cache(config(&up.url), listener).await;
+    let id = ObjectId::of_blob(b"only in mono");
+
+    let mono = client(&url).await;
+    mono.get_object(&id).await.expect("visible in mono");
+    let other = Client::builder()
+        .endpoint(&url)
+        .repo("other")
+        .build()
+        .await
+        .expect("connect");
+    let direct_other = Client::builder()
+        .endpoint(&up.url)
+        .repo("other")
+        .build()
+        .await
+        .expect("connect");
+    let via_cache = other.get_object(&id).await.expect_err("not visible in other");
+    let from_l3 = direct_other.get_object(&id).await.expect_err("L3 agrees");
+    assert_eq!(via_cache.reason(), from_l3.reason());
+    assert_eq!(via_cache.reason(), Some(scion_proto::v1::ErrorReason::ObjectMissing));
+    assert_eq!(node.stats().upstream_objects, 1, "bytes fetched once");
+
+    // 之后对象也进入了 other 的索引（例如上传了同样的内容）：从缓存复用，不再回源字节
+    let c = Client::builder()
+        .endpoint(&up.url)
+        .repo("other")
+        .build()
+        .await
+        .expect("connect");
+    c.changeset(None)
+        .put("copy.txt", "only in mono")
+        .create()
+        .await
+        .expect("upload");
+    assert_eq!(
+        other.get_object(&id).await.expect("now visible").as_ref(),
+        b"only in mono"
+    );
+    assert_eq!(node.stats().upstream_objects, 1);
+    // 不存在的仓库：上游的错误原样返回
+    let nowhere = Client::builder()
+        .endpoint(&url)
+        .repo("nowhere")
+        .build()
+        .await
+        .expect("connect");
+    assert!(nowhere.get_object(&id).await.expect_err("no repo").is_not_found());
+}

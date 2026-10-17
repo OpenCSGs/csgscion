@@ -40,7 +40,7 @@ A server-first source control system: history, merges and rebases are computed o
   - coalesced, concurrency-limited backend reads;
   - `--read-endpoint` advertises caches to clients.
 
-The cache serves 99.5% of reads without the server and 1.61M objects/s per node; see [Performance](#performance).
+The cache serves 99.5% of reads without the server and 1.53M objects/s per node; see [Performance](#performance).
 
 Earlier milestones:
 - M3 added server-side rebase, exactly-once lands, batched landing (885 lands/s on one ref), clusters and overload protection.
@@ -56,9 +56,9 @@ Benchmarks run on one machine (Apple M5, 10 cores) with objects in memory; clien
 | Area | Workload | Result | Target |
 |---|---|---|---|
 | Cache hit rate ([`server/cache/tests/bench.rs`](server/cache/tests/bench.rs)) | 200 clients check out the same 20,000 objects (1–4 KiB) from a cold cache | 99.5% of reads served without L3; each object fetched from L3 exactly once | ≥ 99% |
-| Cache throughput (same) | 64 clients, warm cache, batches of 64 objects over gRPC | 1.61M objects/s per node | ≥ 200k/s |
-| Cache throughput (same) | 64 clients, warm cache, one object per request | 166k requests/s per node | — |
-| Checkout ([`client/daemon/tests/bench.rs`](client/daemon/tests/bench.rs)) | `scn clone` of 100,000 files in 1,000 directories | Through a warm daemon 5.4 s; creating the same files without any network takes 5.5 s on this disk, so the daemon adds no measurable overhead | < 5 s, disk permitting |
+| Cache throughput (same) | 64 clients, warm cache, batches of 64 objects over gRPC | 1.53M objects/s per node | ≥ 200k/s |
+| Cache throughput (same) | 64 clients, warm cache, one object per request | 164k requests/s per node | — |
+| Checkout ([`client/daemon/tests/bench.rs`](client/daemon/tests/bench.rs)) | `scn clone` of 100,000 files in 1,000 directories | Through a warm daemon 5.3 s; creating the same files without any network takes 5.4 s on this disk, so the daemon adds no measurable overhead | < 5 s, disk permitting |
 | Landing ([`server/land/tests/bench.rs`](server/land/tests/bench.rs)) | 2,000 lands on one ref from 200 concurrent clients | PostgreSQL 885/s (p99 379 ms); SQLite 1,921/s (p99 173 ms) | ≥ 200/s, p99 < 500 ms |
 | History queries ([`server/query/tests/bench.rs`](server/query/tests/bench.rs)) | 100,000 commits: log, diff, ancestry, merge-base, blame | p99 < 20 ms on SQLite and PostgreSQL (cold blame 13.6 ms, `log --path` 15.6 ms) | p99 < 100 ms |
 

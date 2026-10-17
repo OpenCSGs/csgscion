@@ -1,6 +1,11 @@
 //! 缓存节点的读路径：本地命中 → 合并并发未命中（single-flight）→ 按 rendezvous 分片交给负责的
 //! 节点，或自己回源。
 //!
+//! **按仓库的可见性**：与 L3 一致，对象只对索引中有它的仓库可见。字节按对象 id 缓存（跨仓库去重），
+//! 但应答前确认 id 在本次请求的仓库里可见：回源成功（L3 已按仓库校验）的 (仓库, id) 记入可见集；
+//! 本地命中而可见性未知的，先向上游批量 `HasObjects` 确认，不可见时返回与 L3 相同的 OBJECT_MISSING。
+//! single-flight 按 (仓库, id) 合并，一个仓库的回源结果不会交给另一个仓库的请求。
+//!
 //! 一个 id 只由负责它的节点回源，整个区域对同一个对象只回源一次。负责的节点不可达时自己回源
 //! （区域内绕路，但绝不让客户端绕过 L2 直连源站）。转发来的请求（[`CACHE_FORWARDED_HEADER`]）不再
 //! 转发，避免环路。
@@ -33,6 +38,8 @@ pub struct Stats {
     pub upstream_objects: AtomicU64,
     /// 回源请求数（一次请求可含多个对象）。
     pub upstream_requests: AtomicU64,
+    /// 为确认可见性而向上游查询的对象数。
+    pub visibility_checks: AtomicU64,
 }
 
 /// [`Stats`] 的一个快照。
@@ -43,6 +50,7 @@ pub struct StatsSnapshot {
     pub peer_objects: u64,
     pub upstream_objects: u64,
     pub upstream_requests: u64,
+    pub visibility_checks: u64,
 }
 
 impl StatsSnapshot {
@@ -65,15 +73,43 @@ impl Stats {
             peer_objects: self.peer_objects.load(Ordering::Relaxed),
             upstream_objects: self.upstream_objects.load(Ordering::Relaxed),
             upstream_requests: self.upstream_requests.load(Ordering::Relaxed),
+            visibility_checks: self.visibility_checks.load(Ordering::Relaxed),
         }
     }
 }
 
 type Outcome = Result<Bytes, Status>;
+type FlightKey = (Arc<str>, ObjectId);
+
+/// 可见集默认条目数上限（每条约百字节）。
+pub const DEFAULT_VISIBLE_ENTRIES: u64 = 10_000_000;
+
+/// 错误中最多列出的 id 个数（与 L3 相同）。
+const MAX_IDS_IN_ERROR: usize = 32;
+
+/// 与 L3 相同的「对象不存在」错误：NOT_FOUND / OBJECT_MISSING，metadata 带 `ids` 与 `count`。
+pub fn object_missing(ids: &[ObjectId]) -> Status {
+    let listed: Vec<String> = ids.iter().take(MAX_IDS_IN_ERROR).map(ToString::to_string).collect();
+    let details = tonic_types::ErrorDetails::with_error_info(
+        scion_proto::reason_name(scion_proto::v1::ErrorReason::ObjectMissing),
+        scion_proto::ERROR_DOMAIN,
+        HashMap::from([
+            ("ids".to_string(), listed.join(",")),
+            ("count".to_string(), ids.len().to_string()),
+        ]),
+    );
+    <Status as tonic_types::StatusExt>::with_error_details(
+        tonic::Code::NotFound,
+        format!("{} object(s) not found", ids.len()),
+        details,
+    )
+}
 
 pub struct CacheNode {
     store: ObjectCache,
-    flight: Group<ObjectId, Outcome>,
+    flight: Group<FlightKey, Outcome>,
+    /// 已确认可见的 (仓库, id)。对象一旦进入仓库索引就不会离开（redaction 在 M5 处理）。
+    visible: moka::sync::Cache<FlightKey, ()>,
     ring: Ring,
     /// 本节点在 ring 中的地址；不在 ring 中（单节点）时为 `None`。
     me: Option<String>,
@@ -101,6 +137,7 @@ impl CacheNode {
         Self {
             store,
             flight: Group::new(),
+            visible: moka::sync::Cache::new(DEFAULT_VISIBLE_ENTRIES),
             ring,
             me,
             peers,
@@ -140,20 +177,47 @@ impl CacheNode {
         let mut unique: Vec<ObjectId> = ids.to_vec();
         unique.sort_unstable_by_key(|id| id.to_bytes());
         unique.dedup();
-        let found = self.resolve(repo, &unique, ctx, forwarded).await;
-        ids.iter()
+        let repo_key: Arc<str> = Arc::from(repo);
+        let found = self.resolve(&repo_key, &unique, ctx, forwarded).await;
+        let out: Vec<Bytes> = ids
+            .iter()
             .map(|id| match found.get(id) {
                 Some(Ok(b)) => Ok(b.clone()),
                 Some(Err(e)) => Err(e.clone()),
                 None => Err(Status::internal(format!("object {id} was not resolved"))),
             })
-            .collect()
+            .collect::<Result<_, _>>()?;
+        self.check_visible(&repo_key, &unique, ctx).await?;
+        Ok(out)
+    }
+
+    /// 确认 `ids` 都在 `repo` 中可见：可见集里没有的向上游批量查询。
+    async fn check_visible(&self, repo: &Arc<str>, ids: &[ObjectId], ctx: &RequestCtx) -> Result<(), Status> {
+        let unknown: Vec<ObjectId> = ids
+            .iter()
+            .filter(|id| !self.visible.contains_key(&(repo.clone(), **id)))
+            .copied()
+            .collect();
+        if unknown.is_empty() {
+            return Ok(());
+        }
+        self.stats
+            .visibility_checks
+            .fetch_add(unknown.len() as u64, Ordering::Relaxed);
+        let missing = self.upstream.missing(repo, &unknown, ctx).await?;
+        if !missing.is_empty() {
+            return Err(object_missing(&missing));
+        }
+        for id in unknown {
+            self.visible.insert((repo.clone(), id), ());
+        }
+        Ok(())
     }
 
     /// 解析一组不重复的 id。
     async fn resolve(
         &self,
-        repo: &str,
+        repo: &Arc<str>,
         ids: &[ObjectId],
         ctx: &RequestCtx,
         forwarded: bool,
@@ -170,7 +234,7 @@ impl CacheNode {
                 }
                 None => {
                     self.stats.misses.fetch_add(1, Ordering::Relaxed);
-                    match self.flight.claim(*id) {
+                    match self.flight.claim((repo.clone(), *id)) {
                         Claim::Leader(l) => leaders.push(l),
                         Claim::Follower(f) => followers.push((*id, f)),
                     }
@@ -179,12 +243,12 @@ impl CacheNode {
         }
 
         // 成为 leader 后再查一次缓存：上一个 leader 可能刚好在我们查缓存和领取之间完成
-        let rechecked = join_all(leaders.iter().map(|l| self.store.get(l.key()))).await;
+        let rechecked = join_all(leaders.iter().map(|l| self.store.get(&l.key().1))).await;
         let mut pending = Vec::with_capacity(leaders.len());
         for (l, hit) in leaders.into_iter().zip(rechecked) {
             match hit {
                 Some(b) => {
-                    out.insert(*l.key(), Ok(b.clone()));
+                    out.insert(l.key().1, Ok(b.clone()));
                     l.complete(Ok(b));
                 }
                 None => pending.push(l),
@@ -193,19 +257,21 @@ impl CacheNode {
         let leaders = pending;
 
         // 自己负责回源的 id，按去向分组，各组并发
-        let mut groups: HashMap<Route, Vec<scion_flight::Leader<ObjectId, Outcome>>> = HashMap::new();
+        let mut groups: HashMap<Route, Vec<scion_flight::Leader<FlightKey, Outcome>>> = HashMap::new();
         for l in leaders {
-            groups.entry(self.route(l.key(), forwarded)).or_default().push(l);
+            groups.entry(self.route(&l.key().1, forwarded)).or_default().push(l);
         }
         let fetched = join_all(groups.into_iter().map(|(route, group)| async move {
-            let ids: Vec<ObjectId> = group.iter().map(|l| *l.key()).collect();
+            let ids: Vec<ObjectId> = group.iter().map(|l| l.key().1).collect();
             let results = self.fetch_group(&route, repo, &ids, ctx).await;
             let mut done = Vec::with_capacity(group.len());
             for (l, r) in group.into_iter().zip(results) {
+                let id = l.key().1;
                 if let Ok(b) = &r {
-                    self.store.insert(*l.key(), b.clone());
+                    self.store.insert(id, b.clone());
+                    // 上游（或负责的节点）按这个仓库校验过：可见。先记下再交付，等待者据此免查
+                    self.visible.insert((repo.clone(), id), ());
                 }
-                let id = *l.key();
                 l.complete(r.clone());
                 done.push((id, r));
             }
@@ -384,7 +450,7 @@ mod tests {
         let up = Arc::new(Fake::new("l3", &[A]));
         let n = single(&up).await;
         // 模拟另一个请求领取后被取消
-        let Claim::Leader(l) = n.flight.claim(id(A)) else {
+        let Claim::Leader(l) = n.flight.claim((Arc::from("r"), id(A))) else {
             panic!("leader");
         };
         let ctx = RequestCtx::default();
@@ -394,6 +460,72 @@ mod tests {
             drop(l);
         });
         assert_eq!(got.expect("retried"), [Bytes::from_static(A)]);
+    }
+
+    /// 评审指出的问题：缓存命中与 single-flight 不能跨仓库交出对象（与 L3 的按仓库可见性一致）。
+    #[tokio::test]
+    async fn objects_are_only_served_to_repos_that_can_see_them() {
+        let up = Arc::new(Fake::new("l3", &[A, B]).visible_in("a", &[A]).visible_in("b", &[A, B]));
+        let n = single(&up).await;
+        let ctx = RequestCtx::default();
+        // b 取到 B，字节进入缓存
+        n.get_many("b", &[id(B)], &ctx, false).await.expect("b sees B");
+        // a 看不到 B：命中缓存也不交出，返回与 L3 相同的 OBJECT_MISSING
+        let err = n
+            .get_many("a", &[id(B)], &ctx, false)
+            .await
+            .expect_err("a cannot see B");
+        assert_eq!(err.code(), Code::NotFound);
+        let info = tonic_types::StatusExt::get_error_details(&err)
+            .error_info()
+            .cloned()
+            .expect("info");
+        assert_eq!(
+            (info.reason.as_str(), info.metadata["count"].as_str()),
+            ("OBJECT_MISSING", "1")
+        );
+        assert_eq!(info.metadata["ids"], id(B).to_string());
+        // a 能看到 A：b 取过的字节直接复用，只确认一次可见性
+        n.get_many("b", &[id(A)], &ctx, false).await.expect("b sees A");
+        let before = up.calls();
+        n.get_many("a", &[id(A)], &ctx, false).await.expect("a sees A");
+        n.get_many("a", &[id(A)], &ctx, false).await.expect("again");
+        assert_eq!(up.calls(), before, "bytes not fetched again");
+        assert_eq!(
+            up.missing_calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one check per (repo, id)"
+        );
+        assert_eq!(n.stats().visibility_checks, 2);
+        // 回源成功的对象不需要再确认
+        let fresh = single(&up).await;
+        fresh.get_many("b", &[id(A), id(B)], &ctx, false).await.expect("ok");
+        assert_eq!(fresh.stats().visibility_checks, 0);
+        // 确认可见性时上游故障：错误原样返回
+        let down = Arc::new(Fake::new("down", &[A]).script(vec![Ok(()), Err(Status::unavailable("down"))]));
+        let n = single(&down).await;
+        n.get_many("x", &[id(A)], &ctx, false).await.expect("fetched");
+        n.visible.invalidate_all();
+        let err = n.get_many("x", &[id(A)], &ctx, false).await.expect_err("check fails");
+        assert_eq!(err.code(), Code::Unavailable);
+    }
+
+    /// 并发的不同仓库各自回源：a 的失败不会交给 b。
+    #[tokio::test]
+    async fn single_flight_is_per_repo() {
+        let up = Arc::new(
+            Fake::new("l3", &[B])
+                .visible_in("a", &[])
+                .visible_in("b", &[B])
+                .delay(Duration::from_millis(30)),
+        );
+        let n = Arc::new(single(&up).await);
+        let (na, nb) = (n.clone(), n.clone());
+        let a = tokio::spawn(async move { na.get_many("a", &[id(B)], &RequestCtx::default(), false).await });
+        let b = tokio::spawn(async move { nb.get_many("b", &[id(B)], &RequestCtx::default(), false).await });
+        assert!(a.await.expect("join").is_err(), "a cannot see B");
+        assert_eq!(b.await.expect("join").expect("b sees B"), [Bytes::from_static(B)]);
+        assert_eq!(up.calls(), 2, "one fetch per repo");
     }
 
     #[tokio::test]

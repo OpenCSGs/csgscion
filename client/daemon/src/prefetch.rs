@@ -173,7 +173,7 @@ async fn follow(
             if let Some(old) = old.filter(|o| *o != new) {
                 let client = w_client(&up, &repo, &auth).await;
                 if let Some(client) = client {
-                    match warm(&daemon, &client, &up.url, old, new, opts).await {
+                    match warm(&daemon, &client, &up.url, &repo, old, new, opts).await {
                         Ok(n) => tracing::debug!(%repo, r#ref = %reference, objects = n, "prefetched"),
                         Err(e) => tracing::debug!(%repo, r#ref = %reference, error = %e, "prefetch failed"),
                     }
@@ -194,10 +194,12 @@ pub(crate) async fn warm(
     daemon: &Daemon,
     client: &Client,
     upstream: &str,
+    repo: &str,
     old: ObjectId,
     new: ObjectId,
     opts: PrefetchOptions,
 ) -> Result<usize, tonic::Status> {
+    let (upstream, repo): (Arc<str>, Arc<str>) = (Arc::from(upstream), Arc::from(repo));
     let mut seen = 0;
     let mut level = vec![(Some(old), new)];
     while !level.is_empty() && seen < opts.max_objects {
@@ -205,7 +207,7 @@ pub(crate) async fn warm(
         want.extend(level.iter().filter_map(|(o, _)| *o));
         want.sort_unstable_by_key(|id| id.to_bytes());
         want.dedup();
-        let got = daemon.objects(client, upstream, &want).await;
+        let got = daemon.objects(client, &upstream, &repo, &want).await;
         seen += level.len();
         let tree = |id: &ObjectId| -> Result<Tree, tonic::Status> {
             match got.get(id) {
@@ -235,7 +237,7 @@ pub(crate) async fn warm(
         if !blobs.is_empty() {
             blobs.sort_unstable_by_key(|id| id.to_bytes());
             blobs.dedup();
-            for r in daemon.objects(client, upstream, &blobs).await.into_values() {
+            for r in daemon.objects(client, &upstream, &repo, &blobs).await.into_values() {
                 r?;
             }
             seen += blobs.len();

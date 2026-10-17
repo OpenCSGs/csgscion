@@ -34,7 +34,7 @@ use tonic::transport::{Channel, Endpoint};
 
 pub use breaker::Breaker;
 pub use latency::Latency;
-pub use node::{CacheNode, Stats, StatsSnapshot};
+pub use node::{CacheNode, DEFAULT_VISIBLE_ENTRIES, Stats, StatsSnapshot, object_missing};
 pub use ring::Ring;
 pub use service::{CacheInfoSvc, CacheObjectSvc};
 pub use store::{CacheKey, DiskConfig, ObjectCache, StorageConfig};

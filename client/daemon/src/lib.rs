@@ -7,8 +7,8 @@
 //! - `RefService`：转发（ref 永远不缓存），`ResolveRef` 同时登记 WatchRefs 预取；
 //! - 其它全部 RPC：在 HTTP/2 层原样转发，daemon 不需要理解它们。
 //!
-//! daemon 不持有凭证：每个请求带着调用者自己的 token，原样转给服务端。对象按内容寻址，256 位哈希
-//! 即访问凭据（与区域缓存的模型相同，服务端设计文档 §9）。
+//! daemon 不持有凭证：每个请求带着调用者自己的 token，原样转给服务端。可见性与服务端一致：本地缓存
+//! 按对象 id 去重，但只把对象交给索引中有它的仓库（见 `objects.rs`）。
 
 mod cas;
 mod objects;
@@ -111,6 +111,7 @@ pub struct Daemon {
     pub(crate) cas: Arc<Cas>,
     pub(crate) upstreams: Upstreams,
     pub(crate) flight: objects::Flight,
+    pub(crate) visible: objects::Visible,
     pub(crate) prefetch: Prefetcher,
     pub(crate) stats: Stats,
     /// 最近一次请求的时间（Unix 秒）。
@@ -130,6 +131,7 @@ impl Daemon {
             cas,
             upstreams: Upstreams::default(),
             flight: objects::Flight::new(),
+            visible: objects::Visible::new(1_000_000),
             prefetch: Prefetcher::new(prefetch),
             stats: Stats::default(),
             last_activity: AtomicU64::new(now_secs()),

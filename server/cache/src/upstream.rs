@@ -16,7 +16,7 @@ use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use scion_object::ObjectId;
 use scion_proto::v1::object_service_client::ObjectServiceClient;
-use scion_proto::v1::{Encoding, GetObjectsRequest, ObjectWant};
+use scion_proto::v1::{Encoding, GetObjectsRequest, HasObjectsRequest, ObjectWant};
 use tokio::sync::Semaphore;
 use tonic::Code;
 use tonic::Status;
@@ -40,6 +40,9 @@ pub struct RequestCtx {
 pub trait Upstream: Send + Sync {
     /// 取一批对象的完整内容，顺序与 `ids` 相同，并校验内容哈希。
     async fn fetch(&self, repo: &str, ids: &[ObjectId], ctx: &RequestCtx) -> Result<Vec<Bytes>, Status>;
+
+    /// `ids` 中在 `repo` 里不可见的对象（`HasObjects`）。
+    async fn missing(&self, repo: &str, ids: &[ObjectId], ctx: &RequestCtx) -> Result<Vec<ObjectId>, Status>;
 
     /// 日志中使用的名字（地址）。
     fn name(&self) -> &str;
@@ -136,6 +139,30 @@ impl Upstream for GrpcUpstream {
         let mut out = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(self.max_batch) {
             out.extend(self.fetch_batch(repo, chunk, ctx).await?);
+        }
+        Ok(out)
+    }
+
+    async fn missing(&self, repo: &str, ids: &[ObjectId], ctx: &RequestCtx) -> Result<Vec<ObjectId>, Status> {
+        let mut out = Vec::new();
+        for chunk in ids.chunks(self.max_batch) {
+            let mut req = tonic::Request::new(HasObjectsRequest {
+                repo: repo.to_owned(),
+                ids: chunk.iter().map(|id| Bytes::copy_from_slice(&id.to_bytes())).collect(),
+            });
+            if let Some(a) = &ctx.authorization {
+                req.metadata_mut().insert("authorization", a.clone());
+            }
+            let resp = ObjectServiceClient::new(self.channel.clone())
+                .has_objects(req)
+                .await?
+                .into_inner();
+            for raw in resp.missing_ids {
+                out.push(
+                    ObjectId::from_bytes(&raw)
+                        .map_err(|e| Status::internal(format!("{} returned a bad id: {e}", self.name)))?,
+                );
+            }
         }
         Ok(out)
     }
@@ -261,6 +288,30 @@ impl UpstreamPool {
         order.find(|i| self.members[*i].breaker.allow())
     }
 
+    /// 查询 `ids` 中在 `repo` 里不可见的对象：依次尝试可用的上游，上游故障时换下一个（不对冲）。
+    pub async fn missing(&self, repo: &str, ids: &[ObjectId], ctx: &RequestCtx) -> Result<Vec<ObjectId>, Status> {
+        let mut order = self.order().into_iter();
+        let mut last_err = None;
+        while let Some(i) = self.take_next(&mut order) {
+            let m = &self.members[i];
+            match m.up.missing(repo, ids, ctx).await {
+                Ok(v) => {
+                    m.breaker.success();
+                    return Ok(v);
+                }
+                Err(e) if is_upstream_failure(&e) => {
+                    m.breaker.failure();
+                    last_err = Some(e);
+                }
+                Err(e) => {
+                    m.breaker.success();
+                    return Err(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| Status::unavailable("all upstreams are unavailable")))
+    }
+
     /// 回源一批对象。
     pub async fn fetch(&self, repo: &str, ids: &[ObjectId], ctx: &RequestCtx) -> Result<Vec<Bytes>, Status> {
         let _permit = self
@@ -323,6 +374,9 @@ pub(crate) mod tests {
         pub script: Mutex<Vec<Result<(), Status>>>,
         pub calls: AtomicU32,
         pub data: std::collections::HashMap<ObjectId, Bytes>,
+        /// 每个仓库可见的对象；`None` 表示所有仓库都能看到全部对象。
+        pub repos: Option<std::collections::HashMap<String, Vec<ObjectId>>>,
+        pub missing_calls: AtomicU32,
     }
 
     impl Fake {
@@ -332,6 +386,8 @@ pub(crate) mod tests {
                 delay: Duration::ZERO,
                 script: Mutex::new(vec![Ok(())]),
                 calls: AtomicU32::new(0),
+                repos: None,
+                missing_calls: AtomicU32::new(0),
                 data: objects
                     .iter()
                     .map(|o| (ObjectId::of_blob(o), Bytes::from_static(o)))
@@ -352,11 +408,34 @@ pub(crate) mod tests {
         pub(crate) fn calls(&self) -> u32 {
             self.calls.load(Ordering::SeqCst)
         }
+
+        /// 只让 `repo` 看到 `objects`（可多次调用）。
+        pub(crate) fn visible_in(mut self, repo: &str, objects: &[&[u8]]) -> Self {
+            self.repos
+                .get_or_insert_with(Default::default)
+                .insert(repo.into(), objects.iter().map(|o| ObjectId::of_blob(o)).collect());
+            self
+        }
+
+        fn sees(&self, repo: &str, id: &ObjectId) -> bool {
+            self.data.contains_key(id)
+                && self
+                    .repos
+                    .as_ref()
+                    .is_none_or(|r| r.get(repo).is_some_and(|v| v.contains(id)))
+        }
     }
 
     #[tonic::async_trait]
     impl Upstream for Fake {
-        async fn fetch(&self, _repo: &str, ids: &[ObjectId], _ctx: &RequestCtx) -> Result<Vec<Bytes>, Status> {
+        async fn missing(&self, repo: &str, ids: &[ObjectId], _ctx: &RequestCtx) -> Result<Vec<ObjectId>, Status> {
+            self.missing_calls.fetch_add(1, Ordering::SeqCst);
+            let step = self.script.lock().expect("lock").last().cloned().unwrap_or(Ok(()));
+            step?;
+            Ok(ids.iter().filter(|id| !self.sees(repo, id)).copied().collect())
+        }
+
+        async fn fetch(&self, repo: &str, ids: &[ObjectId], _ctx: &RequestCtx) -> Result<Vec<Bytes>, Status> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let step = {
                 let mut s = self.script.lock().expect("lock");
@@ -366,10 +445,11 @@ pub(crate) mod tests {
             step?;
             ids.iter()
                 .map(|id| {
-                    self.data
-                        .get(id)
-                        .cloned()
-                        .ok_or_else(|| Status::failed_precondition(format!("missing {id}")))
+                    if self.sees(repo, id) {
+                        Ok(self.data[id].clone())
+                    } else {
+                        Err(Status::failed_precondition(format!("missing {id}")))
+                    }
                 })
                 .collect()
         }
@@ -498,6 +578,41 @@ pub(crate) mod tests {
             .await
             .expect("primary wins");
         assert_eq!((slow.calls(), broken.calls()), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn missing_fails_over_and_passes_business_errors() {
+        let down = Arc::new(Fake::new("down", &[OBJ]).script(vec![Err(Status::unavailable("down"))]));
+        let up = Arc::new(Fake::new("up", &[OBJ]).visible_in("r", &[OBJ]));
+        let p = pool(vec![down.clone(), up.clone()], no_hedge());
+        let other = ObjectId::of_blob(b"other");
+        for _ in 0..2 {
+            assert_eq!(
+                p.missing("r", &[id(), other], &RequestCtx::default())
+                    .await
+                    .expect("ok"),
+                [other]
+            );
+        }
+        assert_eq!(
+            p.missing("x", &[id()], &RequestCtx::default()).await.expect("ok"),
+            [id()]
+        );
+        let gone = Arc::new(Fake::new("gone", &[]).script(vec![Err(Status::not_found("repo"))]));
+        let p = pool(vec![gone], no_hedge());
+        assert_eq!(
+            p.missing("r", &[id()], &RequestCtx::default())
+                .await
+                .map_err(|e| e.code()),
+            Err(Code::NotFound)
+        );
+        let p = pool(vec![down], no_hedge());
+        assert_eq!(
+            p.missing("r", &[id()], &RequestCtx::default())
+                .await
+                .map_err(|e| e.code()),
+            Err(Code::Unavailable)
+        );
     }
 
     #[test]
