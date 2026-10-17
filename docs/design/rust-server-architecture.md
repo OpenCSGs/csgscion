@@ -633,6 +633,11 @@ SDK、工作副本、daemon 和 CLI 的完整设计见 [`rust-client-architectur
 > - **修复**：WriteService 的请求大小上限原先等于上传分块（约 1.1 MB），10 万个改动的 `CreateChangeset` 会被拒绝；现在按 `max_changes_per_changeset` 留足空间（每条 256 字节，最多 256 MiB）。
 > - **验收**：`server/cache/tests/bench.rs`（Apple M5、对象在内存、客户端与缓存同机）：200 个客户端冷启动检出同一组 2 万个对象，命中率 99.5%（理论上限），每个对象只回源一次；热缓存单节点每秒 153 万个对象（gRPC，每批 64 个），每次 1 个对象时每秒 16.4 万次请求。`client/daemon/tests/bench.rs`：10 万个文件经热 daemon 检出 5.3 秒，与本机直接创建这些文件的 5.4 秒相同（客户端目标 5 秒受本机文件系统限制，多线程创建文件反而更慢）。
 > - **推迟**：缓存层的敏感前缀隔离与 L2 的 token 校验随 M5 的 ACL 一起做；daemon 的 `/metrics` 与 systemd / launchd 托管放到 M5；`GetTrees` 递归 RPC 未实现（预热与检出用按层批量的 `GetObjects`）。
+> **M5a 认证与鉴权实现说明**（2026-10-17）：M5 拆成多个 PR，这是第一个。
+> - **只用标准协议**：自签访问令牌（ES256 JWT，15 分钟）；不透明令牌（PAT / 刷新令牌，只存 SHA-256）；外部 JWT（JWKS 或 HS256 共享密钥，claims 映射可配）；RFC 7662 内省；RFC 8628 device flow；OPA 兼容的鉴权回调。starhub-server（HS256、`current_user`、rebac）只是一份配置，见 `docs/guide/auth.md`。
+> - **ACL**：TOML 规则按主体、仓库通配、动作（read < write < land < admin）、ref、路径前缀授予，存在元数据库中，各节点 30 秒内重新加载。按 id 读对象需要整个仓库的读权限（§9 中 GetTrees 过滤目录条目的做法推迟，`GetTrees` 尚未实现）；`ListDir` / `Diff` 为只限部分路径的读者过滤条目；创建提交逐个检查改动路径；合入检查目标 ref。
+> - **缓存层**：与 §9「L2 只验签」不同，L2 和 daemon 不解析令牌，用调用者的令牌向 L3 `CheckAccess(repo, read)`，结果按（令牌, 仓库）缓存 60 秒。这样对 PAT、外部令牌和鉴权回调都适用，吊销最多延迟 60 秒。daemon 在服务端不可达时，对 24 小时内确认过的身份放行本地读取。敏感前缀不缓存（§9）尚未实现。
+> - **客户端**：SDK `Auth::Exchange` 换取访问令牌并提前 2 分钟续期；`scn login`（device flow 或 `--token`）、`whoami`、`logout`，凭据存 macOS 钥匙串或 0600 文件。
 | **M5 生产化** | 4 周 | YugabyteDB 档与 `migrate-meta` 工具、ACL/OIDC/JWT、redaction、OTel、Helm、混沌测试、多区域 follower read、`conformance` 发布 | 全部 SLO 达标；单 AZ 故障演练通过 |
 
 ---

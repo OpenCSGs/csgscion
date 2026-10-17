@@ -119,9 +119,12 @@ backend_migration_tasks          (仿照 xnet_migration_task)
 新增内部接口 `POST /api/v1/internal/scion/pre_land`，复用 `component/checker`（文件大小、LFS 对象存在性、skill 文件规则）和 `pre_receive` 中的逻辑。Scion 在 land 之前同步调用它。
 
 ### 3.6 认证与鉴权
-- starhub 作为 token 签发方：用户的 PAT、session、access token 由 starhub 换成**短期 Scion JWT**，claims 为 `{sub, repos: {"models/ns/name": "read|write|admin"}, exp}`；也可以只放用户身份，由 Scion 实时回调查询权限（见 §5）。
-- Scion 通过 starhub 暴露的 **JWKS** 验签，不需要共享密钥。
-- `scn` 访问 starhub 托管的 Scion 时，`scn login` 走 starhub 的 OIDC（casdoor）或 PAT 换取 token，复用客户端文档 §3 的机制。
+> 2026-10-17 按 starhub-server 的实际实现修订（之前假设 starhub 提供 JWKS 和 `repos` claim，与实际不符）。Scion 侧只用标准协议，没有 starhub 专用代码，配置见 [`docs/guide/auth.md`](../guide/auth.md#接入-starhub-server)。
+
+- **starhub 的 JWT**：HS256 共享密钥签发（`STARHUB_JWT_SIGNING_KEY`），`iss = "OpenCSG"`，用户名在 `current_user`。Scion 把 starhub 配成一个 HS256 签发方（`hs256_secret_env`、`subject_claim = "current_user"`）直接验签。
+- **starhub 的 access token**（不透明）：Scion 按 RFC 7662 调用 starhub 的内省接口。starhub 侧新增 `POST /api/v1/internal/scion/introspect`，内部调用 `VerifyByAccessToken`。
+- **权限**：留在 starhub（rebac、组织继承、公开/私有仓库）。Scion 按 OPA 兼容的格式调用 starhub 的鉴权接口。starhub 侧新增 `POST /api/v1/internal/scion/authz`，把仓库名映射回 starhub 仓库并调用 `CheckUserRepoPermission`。结果在 Scion 侧缓存（允许 30 秒、拒绝 5 秒）。
+- `scn` 访问 starhub 托管的 Scion 时，`scn login` 走 starhub 的 Casdoor OIDC（device flow），或者用 `scn login --token <access token>`。
 
 ---
 
@@ -150,8 +153,8 @@ MigrateRepoToScion(repo):
 | 能力 | 说明 |
 |---|---|
 | `RepoAdminService` | Create/Delete/Get/Update/Fork/List；仓库属性（默认分支、可见性标记、配额）。从第一天起支持多租户和大量小仓库（starhub 的模型、数据集、Space 都是独立仓库） |
-| 外部身份（JWKS） | 配置可信的 issuer 和 JWKS URL，并定义 claims 到权限的映射规则 |
-| 外部鉴权回调（可选） | `authz.webhook`：按 (subject, repo, action) 查询，带 TTL 缓存；在权限复杂或需要实时生效时使用 |
+| 外部身份（M5 已实现） | 受信任的签发方：JWKS（标准 OIDC）或 HS256 共享密钥（starhub 现状），claims 映射可配；RFC 7662 内省校验外部的不透明令牌 |
+| 外部鉴权回调（M5 已实现） | OPA 兼容：`{"input": {subject, groups, repo, action, ref, path}}` → `{"result": bool}`，带 TTL 缓存；starhub 用它接入 rebac |
 | pre-land webhook | 同步调用，可配置超时和故障时的处理（fail-open 或 fail-closed）；把 delta 和文件元数据发给外部系统做检查 |
 | 事件 | `scion.<repo>.ref.updated`（包含每个提交的路径级 delta）发到 NATS；同时可以选择 webhook 方式 |
 | 派生数据 | `GitSha`（git 兼容的 commit/tree/blob SHA-1）、`LastCommitPerEntry`、`LfsPointerIndex`、`TreeStats`、blob 的 `Sha256`（供 LFS/HF 使用） |

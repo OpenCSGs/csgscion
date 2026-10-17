@@ -15,13 +15,22 @@
 - [对象存储](docs/guide/object-storage.md)：SeaweedFS、MinIO 与其他 S3 兼容服务；服务识别与启动检查
 - [多节点部署与合入](docs/guide/cluster.md)：合入语义（rebase、恰好一次）、`--advertise-url` 集群模式、故障切换与过载保护
 - [缓存](docs/guide/cache.md)：区域缓存 `scion cache`（分片、对冲、预热）与本机 daemon `scn daemon`
+- [认证与鉴权](docs/guide/auth.md)：令牌、访问控制策略、OIDC 登录、外部签发方、OPA 兼容的鉴权回调、接入 starhub-server
 
 **设计与规范**
 - 设计文档：[服务端](docs/design/rust-server-architecture.md) · [客户端](docs/design/rust-client-architecture.md) · [接入 starhub / CSGLite](docs/design/starhub-integration.md)
 - 对象格式规范：[`SPEC.md`](SPEC.md)，golden 测试向量在 [`testdata/vectors/`](testdata/vectors/)
 - 协议：[`proto/scion/v1/`](proto/scion/v1/)
 
-当前进度：**M4 缓存层**已完成：
+当前进度：**M5 生产化**进行中，认证与鉴权已完成：
+- **令牌**：自签 ES256 访问令牌、PAT、刷新令牌。
+- **外部身份（只用标准协议）**：JWKS 或 HS256 签发方、RFC 7662 内省、OPA 兼容的鉴权回调。接入 starhub-server 只需配置。
+- **ACL**：按主体、仓库、动作、ref、路径授予权限。
+- **`scn login`**：OIDC device flow，凭据存钥匙串。
+
+M5 后续还有 redaction、可观测性、YugabyteDB、Helm 与混沌测试。
+
+**M4 缓存层**已完成：
 - **区域缓存 `scion cache`（L2）**：
   - 存储：foyer 内存加 NVMe；
   - 多节点按 rendezvous 哈希分片，整个区域对同一对象只回源一次；
@@ -45,7 +54,7 @@
 - M2 实现了历史查询（10 万提交 p99 低于 20 ms）；
 - M1 实现了写入路径、Lite 模式、`scn` 工作副本与 git 导入。
 
-下一步 M5：生产化（YugabyteDB、ACL / OIDC、redaction、OpenTelemetry、Helm）。
+M5 剩余工作：redaction 与 fsck、OpenTelemetry 与指标、YugabyteDB 档、Helm 与发布构建。
 
 ## 性能
 

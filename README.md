@@ -15,6 +15,7 @@ A server-first source control system: history, merges and rebases are computed o
 - [Object storage](docs/guide/object-storage.md) (Chinese): SeaweedFS, MinIO and other S3-compatible services; provider detection and startup checks
 - [Clusters and landing](docs/guide/cluster.md) (Chinese): land semantics (rebase, exactly once), multi-node mode with `--advertise-url`, failover and overload protection
 - [Caching](docs/guide/cache.md) (Chinese): the regional cache `scion cache` (sharding, hedging, warm-up) and the local daemon `scn daemon`
+- [Authentication and access control](docs/guide/auth.md) (Chinese): tokens, ACL policy, OIDC login, external issuers, OPA-compatible authorization, starhub-server integration
 
 **Design and specifications** (Chinese)
 - Design docs: [server](docs/design/rust-server-architecture.md) · [client](docs/design/rust-client-architecture.md) · [starhub / CSGLite integration](docs/design/starhub-integration.md)
@@ -22,6 +23,14 @@ A server-first source control system: history, merges and rebases are computed o
 - Protocol: [`proto/scion/v1/`](proto/scion/v1/)
 
 ## Status
+
+**M5 (production hardening) is in progress.** Authentication and access control are done:
+- **Tokens:** self-issued ES256 access tokens, PATs, and refresh tokens.
+- **External identities, standards only:** JWKS or HS256 issuers, RFC 7662 introspection and an OPA-compatible authorization webhook. starhub-server is supported through configuration alone.
+- **ACL:** rules by subject, repo, action, ref and path.
+- **`scn login`:** OIDC device flow, with credentials stored in the keychain.
+
+Still to come in M5: redaction, observability, YugabyteDB, Helm and chaos testing.
 
 **M4 (cache layer) is complete**:
 - **Regional cache `scion cache` (L2):**
@@ -47,7 +56,7 @@ Earlier milestones:
 - M2 added history queries (p99 under 20 ms on 100k commits).
 - M1 added the write path, Lite mode, the `scn` working copy and git import.
 
-Next is M5: production hardening (YugabyteDB, ACL / OIDC, redaction, OpenTelemetry, Helm).
+The remaining M5 work: redaction and fsck, OpenTelemetry and metrics, the YugabyteDB tier, Helm and release builds.
 
 ## Performance
 
