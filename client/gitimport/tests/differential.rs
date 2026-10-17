@@ -266,7 +266,7 @@ async fn reimport_is_idempotent_and_incremental_import_fast_forwards() {
         "nothing to land"
     );
 
-    // 新增两个提交：沿第一父提交链逐个快进
+    // 新增两个提交：一次快进到新的 tip
     write(dir, "a", b"2");
     commit(dir, "two", "1700000100 +0000");
     write(dir, "b", b"b");
@@ -274,7 +274,9 @@ async fn reimport_is_idempotent_and_incremental_import_fast_forwards() {
     let third = import(&c, dir, "main", "main", |_, _| {}).await.expect("incremental");
     let tip = c.resolve_ref("main").await.expect("ok").expect("ref");
     assert_eq!(Some(tip.changeset), third.tip);
-    assert_eq!(tip.version, 3);
+    assert_eq!(tip.version, 2, "one fast-forward for both commits");
+    let log = c.log("main", None, 10, None).await.expect("log");
+    assert_eq!(log.entries.len(), 3, "every imported commit is in the history");
 
     // 改写历史后再导入：拒绝
     git(dir, &["reset", "-q", "--hard", "HEAD~2"]);

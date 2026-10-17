@@ -75,7 +75,7 @@ scn clone mono && cd mono          # 检出（默认 ref main，空仓库也可�
 echo 'hello' > README.md
 scn status                          # A README.md
 scn commit -m "add readme" --author "Ada <ada@example.com>"
-scn land                            # 快进合入 main
+scn land                            # 合入 main；main 已前进时由服务端 rebase（三方合并）
 scn sync                            # 拉取别人合入的改动；有未合入的提交时自动做文件级 rebase
 scn cat main:README.md              # 不需要工作副本也能读文件（工作副本外加 --repo）
 scn ls main:                        # 列目录；所有命令都支持 --json

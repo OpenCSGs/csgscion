@@ -10,6 +10,7 @@ members = [
     "server/store-blob",
     "server/tree",
     "server/merge",
+    "server/land",
     "server/query",
     "server/api",
     "server/scion",
@@ -36,6 +37,7 @@ scion-store-sql = { path = "server/store-sql" }
 scion-store-blob = { path = "server/store-blob" }
 scion-tree = { path = "server/tree" }
 scion-merge = { path = "server/merge" }
+scion-land = { path = "server/land" }
 scion-query = { path = "server/query" }
 scion-api = { path = "server/api" }
 scion-client = { path = "client/sdk" }
@@ -53,7 +55,7 @@ proptest = "1.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "net", "signal", "sync"] }
+tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots"] }
 tonic-prost = "0.14"

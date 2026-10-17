@@ -133,7 +133,7 @@ async fn two_developers_collaborate() {
     assert!(alice.status().expect("status").is_clean());
     assert_eq!(alice.sync(&c).await.expect("again"), SyncOutcome::UpToDate);
 
-    // Bob 落后于 ref：直接合入被拒；sync 做文件级 rebase 后即可合入
+    // Bob 落后于 ref：有未提交的改动时只允许快进，被拒；sync 做文件级 rebase 后即可合入
     write(&b_dir, "late.txt", "late\n");
     write(&a_dir, "early.txt", "early\n");
     alice.commit(&c, "a", None).await.expect("commit").expect("changes");
@@ -142,11 +142,13 @@ async fn two_developers_collaborate() {
         .await
         .expect("commit")
         .expect("changes");
-    let err = bob.land(&c).await.expect_err("bob is behind");
+    write(&b_dir, "scratch.txt", "uncommitted\n");
+    let err = bob.land(&c).await.expect_err("bob is behind with local edits");
     assert!(
         matches!(&err, Error::Client(e) if e.reason() == Some(ErrorReason::NotFastForward)),
         "{err:?}"
     );
+    std::fs::remove_file(b_dir.join("scratch.txt")).expect("rm");
     let outcome = bob.sync(&c).await.expect("rebase");
     assert!(
         matches!(
@@ -171,6 +173,62 @@ async fn two_developers_collaborate() {
         .await
         .expect("server has it");
     assert_eq!(meta.as_ref(), b"late\n");
+}
+
+/// 工作区干净时，落后的提交直接合入：服务端 rebase，合入后工作区包含上游改动。
+#[tokio::test]
+async fn land_while_behind_rebases_on_server_and_updates_working_copy() {
+    let srv = server().await;
+    let c = client(&srv.url).await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (a_dir, b_dir) = (tmp.path().join("a"), tmp.path().join("b"));
+    let mut a = WorkingCopy::clone(&c, &srv.url, "mono", "main", &a_dir)
+        .await
+        .expect("clone");
+    write(&a_dir, "shared.txt", "1\n2\n3\n");
+    a.commit(&c, "base", None).await.expect("commit").expect("changes");
+    a.land(&c).await.expect("land");
+    let mut b = WorkingCopy::clone(&c, &srv.url, "mono", "main", &b_dir)
+        .await
+        .expect("clone");
+
+    write(&a_dir, "alice.txt", "alice\n");
+    write(&a_dir, "shared.txt", "one\n2\n3\n");
+    a.commit(&c, "a", None).await.expect("commit").expect("changes");
+    a.land(&c).await.expect("alice lands");
+
+    write(&b_dir, "bob.txt", "bob\n");
+    write(&b_dir, "shared.txt", "1\n2\nthree\n");
+    b.commit(&c, "b", None).await.expect("commit").expect("changes");
+    let landed = b.land(&c).await.expect("server-side rebase");
+    assert!(landed.rebased());
+    assert_eq!(b.state().base.as_deref(), Some(landed.tip.to_string().as_str()));
+    assert!(b.state().head.is_none());
+    // 上游新增的文件与三方合并的结果都写入了工作区，状态干净
+    assert_eq!(
+        std::fs::read_to_string(b_dir.join("alice.txt")).expect("read"),
+        "alice\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(b_dir.join("shared.txt")).expect("read"),
+        "one\n2\nthree\n"
+    );
+    assert!(b.status().expect("status").is_clean());
+
+    // 与 ref 上的改动冲突：返回冲突详情，本地状态不变
+    a.sync(&c).await.expect("alice syncs");
+    write(&a_dir, "shared.txt", "uno\n2\nthree\n");
+    a.commit(&c, "a2", None).await.expect("commit").expect("changes");
+    a.land(&c).await.expect("alice lands");
+    write(&b_dir, "shared.txt", "eins\n2\nthree\n");
+    b.commit(&c, "b2", None).await.expect("commit").expect("changes");
+    let err = b.land(&c).await.expect_err("conflict");
+    let conflict = match &err {
+        Error::Client(e) => e.merge_conflict().expect("details"),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(conflict.paths[0].path, "shared.txt");
+    assert!(b.state().head.is_some(), "commit kept for resolution");
 }
 
 #[tokio::test]

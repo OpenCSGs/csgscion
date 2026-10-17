@@ -197,8 +197,11 @@ async fn write_land_and_query_end_to_end() {
     assert_eq!(root.generation, 1);
     let landed = c.land("main", &root.id).await.expect("land root");
     assert_eq!((landed.tip, landed.version), (root.id, 1));
-    // 重试安全
-    assert_eq!(c.land("main", &root.id).await.expect("retry"), landed);
+    assert_eq!(landed.landed.len(), 1);
+    assert!(!landed.rebased());
+    // 重试安全：已在历史中，返回当前状态，不再合入
+    let retry = c.land("main", &root.id).await.expect("retry");
+    assert_eq!((retry.tip, retry.version, retry.landed.len()), (root.id, 1, 0));
 
     let tip = c.resolve_ref("main").await.expect("resolve").expect("exists");
     assert_eq!((tip.changeset, tip.root_tree), (root.id, root.root_tree));
@@ -249,10 +252,28 @@ async fn write_land_and_query_end_to_end() {
     let refs = c.list_refs().await.expect("list refs");
     assert_eq!(refs, vec![("main".to_string(), child.id, 2)]);
 
-    // 基于旧提交的改动不能快进合入
+    // 基于旧提交的改动：只允许快进时被拒，默认由服务端 rebase
     let stale = c.changeset(Some(root.id)).put("x", "x").create().await.expect("stale");
-    let err = c.land("main", &stale.id).await.expect_err("not fast forward");
+    let err = c
+        .land_fast_forward("main", &stale.id)
+        .await
+        .expect_err("not fast forward");
     assert_eq!(err.reason(), Some(ErrorReason::NotFastForward));
+    let rebased = c.land("main", &stale.id).await.expect("rebased");
+    assert!(rebased.rebased());
+    assert_eq!(rebased.landed.len(), 1);
+    assert_eq!(rebased.landed[0].changeset, stale.id);
+    assert_eq!(rebased.landed[0].landed, rebased.tip);
+    assert_eq!(c.read_file("main", "x").await.expect("x").as_ref(), b"x");
+    // 与 ref 上的改动冲突：返回冲突详情
+    let clash = c.changeset(Some(root.id)).put("x", "y").create().await.expect("clash");
+    let err = c.land("main", &clash.id).await.expect_err("conflict");
+    let conflict = err.merge_conflict().expect("details");
+    assert_eq!(
+        (conflict.changeset, conflict.paths[0].path.as_str()),
+        (Some(clash.id), "x")
+    );
+    assert_eq!(conflict.paths[0].kind, "add_add");
 
     // 错误映射
     let err = c.read_file("main", "nope").await.expect_err("missing path");

@@ -32,10 +32,27 @@ pub struct CreatedChangeset {
 }
 
 /// 合入结果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Landed {
     pub tip: ObjectId,
     pub version: u64,
+    /// 本次合入的提交（从旧到新）；为空表示提交早已在 ref 的历史中。
+    pub landed: Vec<LandedChangeset>,
+}
+
+impl Landed {
+    /// 是否经过服务端 rebase（进入历史的提交与提交的不同）。
+    pub fn rebased(&self) -> bool {
+        self.landed.iter().any(|l| l.changeset != l.landed)
+    }
+}
+
+/// 合入的一个提交：`changeset` 是提交的，`landed` 是进入 ref 历史的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LandedChangeset {
+    pub changeset: ObjectId,
+    pub landed: ObjectId,
+    pub change_id: [u8; 16],
 }
 
 /// 目录条目。
@@ -180,21 +197,45 @@ impl Client {
         }
     }
 
-    /// 合入：把 `reference` 移到 `changeset`。M1 只允许快进。
+    /// 合入：把 `reference` 移到 `changeset`。落后时由服务端 rebase，冲突时返回 MERGE_CONFLICT
+    /// （详情见 [`crate::Error::merge_conflict`]）。
     pub async fn land(&self, reference: &str, changeset: &ObjectId) -> Result<Landed> {
+        self.land_with(reference, changeset, false).await
+    }
+
+    /// 只允许快进的合入：落后时返回 NOT_FAST_FORWARD。
+    pub async fn land_fast_forward(&self, reference: &str, changeset: &ObjectId) -> Result<Landed> {
+        self.land_with(reference, changeset, true).await
+    }
+
+    async fn land_with(&self, reference: &str, changeset: &ObjectId, fast_forward_only: bool) -> Result<Landed> {
         let req = LandRequest {
             repo: self.repo()?,
             request_id: request_id(),
             r#ref: reference.to_owned(),
             changeset_id: bytes_of(changeset),
+            fast_forward_only,
         };
         let resp = LandServiceClient::new(self.channel.clone())
             .land(self.request(req)?)
             .await?
             .into_inner();
+        let mut landed = Vec::with_capacity(resp.landed.len());
+        for l in &resp.landed {
+            landed.push(LandedChangeset {
+                changeset: id_from(&l.changeset_id, "changeset id")?,
+                landed: id_from(&l.landed_id, "landed id")?,
+                change_id: l
+                    .change_id
+                    .as_ref()
+                    .try_into()
+                    .map_err(|_| Error::Protocol(format!("change id must be 16 bytes, got {}", l.change_id.len())))?,
+            });
+        }
         Ok(Landed {
             tip: id_from(&resp.tip, "tip")?,
             version: resp.ref_version,
+            landed,
         })
     }
 

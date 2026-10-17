@@ -29,8 +29,10 @@ pub mod features {
     pub const OBJECTS_HAS: &str = "objects.has";
     pub const WRITE_UPLOAD: &str = "write.upload";
     pub const WRITE_CHANGESET: &str = "write.changeset";
-    /// M1 的合入：只允许快进，不做服务端 rebase。
+    /// 合入（条件更新 ref）；`fast_forward_only` 时只允许快进。
     pub const LAND_DIRECT: &str = "land.direct";
+    /// 合入时在服务端 rebase 落后的提交栈，冲突返回 MERGE_CONFLICT。
+    pub const LAND_REBASE: &str = "land.rebase";
     pub const REFS: &str = "refs";
     pub const QUERY_READ_FILE: &str = "query.read_file";
     pub const QUERY_LIST_DIR: &str = "query.list_dir";

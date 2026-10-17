@@ -26,6 +26,7 @@ impl ServerInfoSvc {
             features::WRITE_UPLOAD,
             features::WRITE_CHANGESET,
             features::LAND_DIRECT,
+            features::LAND_REBASE,
             features::REFS,
             features::QUERY_READ_FILE,
             features::QUERY_LIST_DIR,

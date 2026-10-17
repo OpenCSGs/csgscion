@@ -146,7 +146,7 @@ pub async fn import(
     })
 }
 
-/// 沿第一父提交链，从 ref 当前位置开始逐个快进到 `tip`。
+/// 把 ref 快进到 `tip`：ref 当前提交必须在 `tip` 的第一父提交链上（否则 git 历史被改写过）。
 async fn land_chain(
     client: &Client,
     target_ref: &str,
@@ -170,13 +170,10 @@ async fn land_chain(
                 current: cur_tip,
             });
         }
-    } else {
-        // ref 不存在：直接创建在 tip 上即可
-        client.land(target_ref, &tip).await?;
-        return Ok(());
     }
-    for c in chain.into_iter().rev() {
-        client.land(target_ref, &c).await?;
+    if !chain.is_empty() {
+        // 只允许快进：导入的历史必须原样进入 ref，期间 ref 被别人移动时报错而不是 rebase
+        client.land_fast_forward(target_ref, &tip).await?;
     }
     Ok(())
 }

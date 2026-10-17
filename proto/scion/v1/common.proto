@@ -30,6 +30,10 @@ enum Encoding {
 // domain 固定为 "scion.dev"。重试语义见服务端设计文档 §3.5。
 enum ErrorReason {
   ERROR_REASON_UNSPECIFIED = 0;
+  // 服务端 rebase 时与 ref 上的改动冲突。metadata：changeset（冲突的原提交）、count（冲突路径数），
+  // 以及每个冲突（最多 32 个，N 从 0 开始）的 path.N、kind.N（content、add_add、modify_delete、
+  // delete_modify、binary、too_large、symlink、path）和 base.N、ours.N、theirs.N（blob 文本 ID，
+  // 该方没有文件时为空）。
   ERROR_REASON_MERGE_CONFLICT = 1;
   ERROR_REASON_LAND_CONTENTION = 2;
   ERROR_REASON_ALREADY_LANDED = 3;
@@ -42,7 +46,7 @@ enum ErrorReason {
   ERROR_REASON_LIMIT_EXCEEDED = 10;
   // changeset 的 delta 无法应用到父提交上（删除不存在的文件、路径冲突等），metadata.path 为出错路径。
   ERROR_REASON_INVALID_CHANGESET = 11;
-  // 合入的 changeset 不是 ref 当前提交的直接后继（M1 尚无服务端 rebase），metadata.tip 为当前提交。
+  // 只允许快进时，合入的 changeset 不是 ref 当前提交的后继，metadata.tip 为当前提交。
   ERROR_REASON_NOT_FAST_FORWARD = 12;
   ERROR_REASON_REF_NOT_FOUND = 13;
   ERROR_REASON_PATH_NOT_FOUND = 14;

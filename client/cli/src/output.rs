@@ -92,9 +92,14 @@ impl CliError {
             CliError::Client(scion_client::Error::IncompatibleProtocol { .. }) => {
                 Some("upgrade scn to a version matching the server's protocol")
             }
-            CliError::Client(e) if e.reason() == Some(ErrorReason::NotFastForward) => {
-                Some("the ref has moved; run `scn sync` to rebase onto it, then `scn land`")
-            }
+            CliError::Client(e) if e.reason() == Some(ErrorReason::NotFastForward) => Some(
+                "the ref has moved and you have uncommitted changes; commit or discard them and `scn land` again \
+                 (the server rebases), or run `scn sync`",
+            ),
+            CliError::Client(e) if e.reason() == Some(ErrorReason::MergeConflict) => Some(
+                "the ref changed the same lines or files; edit them on top of the latest ref \
+                 (fresh `scn clone`), commit and land again",
+            ),
             CliError::Client(e) if e.reason() == Some(ErrorReason::RepoNotFound) => {
                 Some("check the repository name, or create it with `scion server --repo NAME`")
             }
@@ -105,8 +110,8 @@ impl CliError {
                 Some("the git history was rewritten; import into a new ref with --ref")
             }
             CliError::Wc(scion_wc::Error::Conflict(_)) => Some(
-                "both sides changed these files; M1 cannot merge them automatically. \
-                 Re-apply your change on a fresh `scn clone` (server-side merge arrives in M3)",
+                "both sides changed these files; run `scn land` to let the server merge them, \
+                 or re-apply your change on a fresh `scn clone`",
             ),
             _ => None,
         }
@@ -121,6 +126,15 @@ pub struct ErrorOut {
     pub retryable: bool,
     pub exit_code: u8,
     pub hint: Option<&'static str>,
+    /// MERGE_CONFLICT 时的冲突路径。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<ConflictOut>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct ConflictOut {
+    pub path: String,
+    pub kind: String,
 }
 
 pub fn error_out(err: &CliError) -> ErrorOut {
@@ -131,6 +145,19 @@ pub fn error_out(err: &CliError) -> ErrorOut {
         retryable: err.client().is_some_and(|e| e.is_retryable()),
         exit_code: err.exit_code(),
         hint: err.hint(),
+        conflicts: err
+            .client()
+            .and_then(|e| e.merge_conflict())
+            .map(|c| {
+                c.paths
+                    .into_iter()
+                    .map(|p| ConflictOut {
+                        path: p.path,
+                        kind: p.kind,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -369,6 +396,29 @@ mod tests {
         assert_eq!(e.reason, None);
         assert!(e.error.contains("uncommitted"));
         assert_eq!(error_out(&CliError::Usage("bad".into())).error, "bad");
+        assert!(e.conflicts.is_empty());
+        // 冲突详情
+        let md = std::collections::HashMap::from([
+            ("path.0".to_string(), "f".to_string()),
+            ("kind.0".to_string(), "content".to_string()),
+        ]);
+        let conflict = CliError::Client(scion_client::Error::Rpc {
+            code: Code::Aborted,
+            reason: Some(ErrorReason::MergeConflict),
+            message: "conflict".into(),
+            metadata: md,
+        });
+        let e = error_out(&conflict);
+        assert_eq!((e.exit_code, e.reason), (EXIT_CONFLICT, Some("MERGE_CONFLICT")));
+        assert_eq!(
+            e.conflicts,
+            vec![ConflictOut {
+                path: "f".into(),
+                kind: "content".into()
+            }]
+        );
+        assert!(conflict.hint().expect("hint").contains("land again"));
+        assert!(serde_json::to_string(&e).expect("json").contains("\"conflicts\""));
     }
 
     #[test]

@@ -42,7 +42,7 @@ scn clone mono && cd mono          # check out (ref main by default; empty repos
 echo 'hello' > README.md
 scn status                          # A README.md
 scn commit -m "add readme" --author "Ada <ada@example.com>"
-scn land                            # fast-forward main
+scn land                            # land on main; if main moved, the server rebases (three-way merge)
 scn sync                            # pull others' changes; rebases a pending commit at file level
 scn cat main:README.md              # read files without a working copy (add --repo outside one)
 scn ls main:                        # list a directory; every command supports --json

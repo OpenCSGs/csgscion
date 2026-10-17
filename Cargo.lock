@@ -2429,6 +2429,8 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "hex",
+ "scion-land",
+ "scion-merge",
  "scion-object",
  "scion-proto",
  "scion-query",
@@ -2492,6 +2494,22 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "scion-land"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "scion-merge",
+ "scion-object",
+ "scion-query",
+ "scion-store",
+ "scion-tree",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
