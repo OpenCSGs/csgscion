@@ -42,6 +42,7 @@ fn config(dir: &Path) -> DaemonConfig {
         memory_bytes: 8 << 20,
         idle_timeout: None,
         prefetch: PrefetchOptions::default(),
+        redaction_ttl: scion_daemon::REDACTION_TTL,
     }
 }
 
@@ -381,5 +382,69 @@ async fn cached_objects_require_read_access() {
     let e = as_user(eve).await.get_object(&id).await.expect_err("eve has no access");
     assert_eq!(e.reason(), Some(scion_proto::v1::ErrorReason::PermissionDenied));
     assert!(b.get_object(&cs.root_tree).await.is_ok());
+    daemon.stop().await;
+}
+
+/// redaction：daemon 用调用者的身份同步，redact 过的对象返回 REDACTED 并删除本地副本；撤销后恢复。
+#[tokio::test(flavor = "multi_thread")]
+async fn redacted_objects_are_refused_by_the_daemon() {
+    let store = Arc::new(MemStore::new());
+    store.create_repo("mono").await.expect("repo");
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let server = format!("http://{}", listener.local_addr().expect("addr"));
+    let app = App {
+        config: Arc::new(ServerConfig::default()),
+        meta: store.clone(),
+        blobs: store.clone(),
+    };
+    let (_stop_l3, rx) = oneshot::channel::<()>();
+    tokio::spawn(scion_api::serve(listener, app, async {
+        let _ = rx.await;
+    }));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = DaemonConfig {
+        redaction_ttl: Duration::ZERO,
+        ..config(dir.path())
+    };
+    let socket = cfg.socket.clone();
+    let daemon = start(cfg).await;
+    let c = via(&socket, &server).await;
+    let a = c
+        .changeset(None)
+        .put("secret.txt", "password=hunter2")
+        .put("a.txt", "a")
+        .create()
+        .await
+        .expect("create");
+    c.land("main", &a.id).await.expect("land");
+    let secret = ObjectId::of_blob(b"password=hunter2");
+    assert_eq!(
+        c.get_object(&secret).await.expect("fetch").as_ref(),
+        b"password=hunter2"
+    );
+    assert!(eventually(|| cached_files(dir.path()) >= 1).await);
+    let before = cached_files(dir.path());
+
+    let red = scion_api::redaction::Redactor::new(store.clone(), store.clone());
+    let (rid, _) = red
+        .redact("mono", &[secret], &[], "leak", "root", false, 1)
+        .await
+        .expect("redact");
+    let err = c.get_object(&secret).await.expect_err("redacted");
+    assert!(err.is_redacted(), "{err:?}");
+    assert_eq!(cached_files(dir.path()), before - 1, "local copy removed");
+    assert_eq!(
+        c.get_object(&ObjectId::of_blob(b"a")).await.expect("other").as_ref(),
+        b"a"
+    );
+    // 经由 daemon 转给服务端
+    assert_eq!(c.list_redacted_objects(0).await.expect("feed").objects.len(), 1);
+
+    red.unredact(&rid).await.expect("unredact");
+    assert_eq!(
+        c.get_object(&secret).await.expect("restored").as_ref(),
+        b"password=hunter2"
+    );
+    drop(c);
     daemon.stop().await;
 }

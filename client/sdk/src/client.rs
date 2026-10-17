@@ -152,6 +152,25 @@ impl Auth {
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// redaction 的一次变化（[`Client::list_redacted_objects`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedactedObject {
+    pub id: ObjectId,
+    pub redaction_id: String,
+    /// false 表示已撤销。
+    pub active: bool,
+    pub seq: u64,
+}
+
+/// [`Client::list_redacted_objects`] 的一页。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RedactedPage {
+    pub objects: Vec<RedactedObject>,
+    /// 下一次请求的 `after_seq`。
+    pub next_seq: u64,
+    pub more: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ClientBuilder {
     endpoint: Option<String>,
@@ -540,6 +559,37 @@ impl Client {
             }
         }
         Ok(missing)
+    }
+
+    /// 仓库中 `after_seq` 之后的 redaction 变化（一页，按 seq 升序）。总是发给服务端本身，不经只读端点。
+    pub async fn list_redacted_objects(&self, after_seq: u64) -> Result<RedactedPage> {
+        let req = scion_proto::v1::ListRedactedObjectsRequest {
+            repo: self.repo()?,
+            after_seq,
+            page_size: 0,
+        };
+        let resp = ObjectServiceClient::new(self.channel.clone())
+            .list_redacted_objects(self.request(req)?)
+            .await?
+            .into_inner();
+        let objects = resp
+            .objects
+            .into_iter()
+            .map(|o| {
+                Ok(RedactedObject {
+                    id: ObjectId::from_bytes(&o.id)
+                        .map_err(|e| Error::Protocol(format!("bad id in ListRedactedObjects response: {e}")))?,
+                    redaction_id: o.redaction_id,
+                    active: o.active,
+                    seq: o.seq,
+                })
+            })
+            .collect::<Result<_>>()?;
+        Ok(RedactedPage {
+            objects,
+            next_seq: resp.next_seq,
+            more: resp.more,
+        })
     }
 
     /// 读取一个对象的完整字节，并校验 BLAKE3（不信任任何缓存层）。

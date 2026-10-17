@@ -17,7 +17,9 @@ use futures::stream::FuturesUnordered;
 use scion_object::ObjectId;
 use scion_proto::v1::auth_service_client::AuthServiceClient;
 use scion_proto::v1::object_service_client::ObjectServiceClient;
-use scion_proto::v1::{Action, CheckAccessRequest, Encoding, GetObjectsRequest, HasObjectsRequest, ObjectWant};
+use scion_proto::v1::{
+    Action, CheckAccessRequest, Encoding, GetObjectsRequest, HasObjectsRequest, ListRedactedObjectsRequest, ObjectWant,
+};
 use tokio::sync::Semaphore;
 use tonic::Code;
 use tonic::Status;
@@ -37,6 +39,24 @@ pub struct RequestCtx {
     pub authorization: Option<MetadataValue<Ascii>>,
 }
 
+/// redaction 的一次变化（`ListRedactedObjects`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedactionChange {
+    pub id: ObjectId,
+    pub redaction_id: String,
+    /// false 表示已撤销。
+    pub active: bool,
+}
+
+/// `ListRedactedObjects` 的一页。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RedactionPage {
+    pub changes: Vec<RedactionChange>,
+    /// 下一次请求的 `after_seq`。
+    pub next_seq: u64,
+    pub more: bool,
+}
+
 #[tonic::async_trait]
 pub trait Upstream: Send + Sync {
     /// 取一批对象的完整内容，顺序与 `ids` 相同，并校验内容哈希。
@@ -47,6 +67,9 @@ pub trait Upstream: Send + Sync {
 
     /// 调用者（`ctx` 中的令牌）能否读取整个仓库（`AuthService.CheckAccess`）。上游不支持时视为允许。
     async fn can_read(&self, repo: &str, ctx: &RequestCtx) -> Result<bool, Status>;
+
+    /// `repo` 中 `after_seq` 之后的 redaction 变化（用调用者的令牌）。上游不支持时返回空页。
+    async fn redactions(&self, repo: &str, after_seq: u64, ctx: &RequestCtx) -> Result<RedactionPage, Status>;
 
     /// 日志中使用的名字（地址）。
     fn name(&self) -> &str;
@@ -185,6 +208,48 @@ impl Upstream for GrpcUpstream {
             Ok(r) => Ok(r.into_inner().allowed),
             // 没有 AuthService 的旧服务端：没有访问控制
             Err(s) if s.code() == Code::Unimplemented => Ok(true),
+            Err(s) => Err(s),
+        }
+    }
+
+    async fn redactions(&self, repo: &str, after_seq: u64, ctx: &RequestCtx) -> Result<RedactionPage, Status> {
+        let mut req = tonic::Request::new(ListRedactedObjectsRequest {
+            repo: repo.to_owned(),
+            after_seq,
+            page_size: 0,
+        });
+        if let Some(a) = &ctx.authorization {
+            req.metadata_mut().insert("authorization", a.clone());
+        }
+        match ObjectServiceClient::new(self.channel.clone())
+            .list_redacted_objects(req)
+            .await
+        {
+            Ok(r) => {
+                let r = r.into_inner();
+                let changes = r
+                    .objects
+                    .into_iter()
+                    .map(|o| {
+                        Ok(RedactionChange {
+                            id: ObjectId::from_bytes(&o.id)
+                                .map_err(|e| Status::internal(format!("upstream sent a bad object id: {e}")))?,
+                            redaction_id: o.redaction_id,
+                            active: o.active,
+                        })
+                    })
+                    .collect::<Result<_, Status>>()?;
+                Ok(RedactionPage {
+                    changes,
+                    next_seq: r.next_seq,
+                    more: r.more,
+                })
+            }
+            // 不支持 redaction 的旧服务端
+            Err(s) if s.code() == Code::Unimplemented => Ok(RedactionPage {
+                next_seq: after_seq,
+                ..RedactionPage::default()
+            }),
             Err(s) => Err(s),
         }
     }
@@ -358,6 +423,30 @@ impl UpstreamPool {
         Err(last_err.unwrap_or_else(|| Status::unavailable("all upstreams are unavailable")))
     }
 
+    /// `repo` 中 `after_seq` 之后的 redaction 变化：依次尝试可用的上游，上游故障时换下一个。
+    pub async fn redactions(&self, repo: &str, after_seq: u64, ctx: &RequestCtx) -> Result<RedactionPage, Status> {
+        let mut order = self.order().into_iter();
+        let mut last_err = None;
+        while let Some(i) = self.take_next(&mut order) {
+            let m = &self.members[i];
+            match m.up.redactions(repo, after_seq, ctx).await {
+                Ok(v) => {
+                    m.breaker.success();
+                    return Ok(v);
+                }
+                Err(e) if is_upstream_failure(&e) => {
+                    m.breaker.failure();
+                    last_err = Some(e);
+                }
+                Err(e) => {
+                    m.breaker.success();
+                    return Err(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| Status::unavailable("all upstreams are unavailable")))
+    }
+
     /// 回源一批对象。
     pub async fn fetch(&self, repo: &str, ids: &[ObjectId], ctx: &RequestCtx) -> Result<Vec<Bytes>, Status> {
         let _permit = self
@@ -426,6 +515,11 @@ pub(crate) mod tests {
         /// 不允许读取的仓库。
         pub unreadable: Vec<String>,
         pub access_calls: AtomicU32,
+        /// redaction 变化（下标 + 1 即 seq）。
+        pub redaction_log: Mutex<Vec<RedactionChange>>,
+        pub redaction_calls: AtomicU32,
+        /// 设置时 `redactions` 返回这个错误。
+        pub redaction_error: Mutex<Option<Status>>,
     }
 
     impl Fake {
@@ -439,6 +533,9 @@ pub(crate) mod tests {
                 missing_calls: AtomicU32::new(0),
                 unreadable: Vec::new(),
                 access_calls: AtomicU32::new(0),
+                redaction_log: Mutex::new(Vec::new()),
+                redaction_calls: AtomicU32::new(0),
+                redaction_error: Mutex::new(None),
                 data: objects
                     .iter()
                     .map(|o| (ObjectId::of_blob(o), Bytes::from_static(o)))
@@ -466,6 +563,15 @@ pub(crate) mod tests {
                 .get_or_insert_with(Default::default)
                 .insert(repo.into(), objects.iter().map(|o| ObjectId::of_blob(o)).collect());
             self
+        }
+
+        /// 记一次 redaction 变化。
+        pub(crate) fn redact(&self, object: &[u8], active: bool) {
+            self.redaction_log.lock().expect("lock").push(RedactionChange {
+                id: ObjectId::of_blob(object),
+                redaction_id: "rd1".into(),
+                active,
+            });
         }
 
         fn sees(&self, repo: &str, id: &ObjectId) -> bool {
@@ -520,6 +626,22 @@ pub(crate) mod tests {
                     }
                 })
                 .collect()
+        }
+
+        async fn redactions(&self, _repo: &str, after_seq: u64, _ctx: &RequestCtx) -> Result<RedactionPage, Status> {
+            self.redaction_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(e) = self.redaction_error.lock().expect("lock").clone() {
+                return Err(e);
+            }
+            // 每页最多 2 条，覆盖分页
+            let log = self.redaction_log.lock().expect("lock");
+            let start = usize::try_from(after_seq).unwrap_or(usize::MAX).min(log.len());
+            let end = (start + 2).min(log.len());
+            Ok(RedactionPage {
+                changes: log[start..end].to_vec(),
+                next_seq: end as u64,
+                more: end < log.len(),
+            })
         }
 
         fn name(&self) -> &str {

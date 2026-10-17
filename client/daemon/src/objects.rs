@@ -3,6 +3,9 @@
 //!
 //! 与服务端一致，对象只对索引中有它的仓库可见：本地缓存按 id 去重，但应答前确认 id 在调用者的仓库里
 //! 可见。回源成功的 (服务端, 仓库, id) 记入可见集；命中而可见性未知的，先向服务端 `HasObjects` 确认。
+//!
+//! redaction：按 (服务端, 仓库) 保存 redact 过的对象，最多每 [`REDACTION_TTL`] 用调用者的身份增量同步一次。
+//! redact 过的对象返回与服务端相同的 REDACTED，本地副本删除。
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -13,7 +16,10 @@ use scion_flight::{Claim, Group};
 use scion_object::ObjectId;
 use scion_proto::v1::object_service_client::ObjectServiceClient;
 use scion_proto::v1::object_service_server::ObjectService;
-use scion_proto::v1::{Encoding, GetObjectsRequest, GetObjectsResponse, HasObjectsRequest, HasObjectsResponse};
+use scion_proto::v1::{
+    Encoding, GetObjectsRequest, GetObjectsResponse, HasObjectsRequest, HasObjectsResponse, ListRedactedObjectsRequest,
+    ListRedactedObjectsResponse,
+};
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
@@ -33,6 +39,23 @@ pub type Visible = moka::sync::Cache<Key, ()>;
 
 /// 已确认能读取整个仓库的 (服务端, 仓库, 令牌摘要)。
 pub type Access = moka::sync::Cache<(Arc<str>, Arc<str>, ObjectId), ()>;
+
+/// 两次同步 redaction 的默认最长间隔。
+pub const REDACTION_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 一次同步最多读取的页数；剩下的下次请求继续。
+const MAX_REDACTION_PAGES: usize = 100;
+
+/// 一个 (服务端, 仓库) 的 redaction 状态。
+#[derive(Default)]
+pub struct RepoRedactions {
+    after_seq: u64,
+    synced_at: Option<std::time::Instant>,
+    redacted: HashMap<ObjectId, String>,
+}
+
+/// 各 (服务端, 仓库) 的 redaction 状态；锁同时让同一仓库的并发同步只做一次。
+pub type Redactions = moka::sync::Cache<(Arc<str>, Arc<str>), Arc<tokio::sync::Mutex<RepoRedactions>>>;
 
 /// 读权限确认结果的缓存时间（吊销令牌或修改策略最多延迟这么久生效）。
 pub const ACCESS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -64,6 +87,28 @@ fn object_missing(ids: &[ObjectId]) -> Status {
         metadata: HashMap::from([
             ("ids".to_string(), listed.join(",")),
             ("count".to_string(), ids.len().to_string()),
+        ]),
+    }
+    .to_status()
+}
+
+/// 与服务端相同的「对象已被 redact」错误。
+fn redacted(objects: &[(ObjectId, String)]) -> Status {
+    let shown = &objects[..objects.len().min(32)];
+    scion_client::Error::Rpc {
+        code: tonic::Code::NotFound,
+        reason: Some(scion_proto::v1::ErrorReason::Redacted),
+        message: format!("{} object(s) are redacted", objects.len()),
+        metadata: HashMap::from([
+            (
+                "ids".to_string(),
+                shown.iter().map(|(id, _)| id.to_string()).collect::<Vec<_>>().join(","),
+            ),
+            (
+                "redaction_ids".to_string(),
+                shown.iter().map(|(_, r)| r.as_str()).collect::<Vec<_>>().join(","),
+            ),
+            ("count".to_string(), objects.len().to_string()),
         ]),
     }
     .to_status()
@@ -245,6 +290,60 @@ impl Daemon {
         Ok(())
     }
 
+    /// `ids` 中有 redact 过的对象时返回 REDACTED。状态过期时先用调用者的身份向服务端同步；
+    /// 同步失败（例如离线）时沿用已有状态。
+    pub(crate) async fn check_redactions(
+        &self,
+        client: &scion_client::Client,
+        upstream: &Arc<str>,
+        repo: &Arc<str>,
+        ids: &[ObjectId],
+    ) -> Result<(), Status> {
+        let state = self
+            .redactions
+            .get_with((upstream.clone(), repo.clone()), Default::default);
+        let mut st = state.lock().await;
+        if st.synced_at.is_none_or(|t| t.elapsed() >= self.redaction_ttl) {
+            for _ in 0..MAX_REDACTION_PAGES {
+                let page = match client.list_redacted_objects(st.after_seq).await {
+                    Ok(p) => p,
+                    // 不支持 redaction 的旧服务端
+                    Err(scion_client::Error::Rpc {
+                        code: tonic::Code::Unimplemented,
+                        ..
+                    }) => {
+                        st.synced_at = Some(std::time::Instant::now());
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::debug!(%repo, error = %e, "syncing redactions failed; using the previous state");
+                        break;
+                    }
+                };
+                for o in page.objects {
+                    let key = (upstream.clone(), repo.clone(), o.id);
+                    if o.active {
+                        self.cas.remove(&o.id);
+                        self.visible.invalidate(&key);
+                        st.redacted.insert(o.id, o.redaction_id);
+                    } else {
+                        st.redacted.remove(&o.id);
+                    }
+                }
+                st.after_seq = page.next_seq;
+                if !page.more {
+                    st.synced_at = Some(std::time::Instant::now());
+                    break;
+                }
+            }
+        }
+        let hits: Vec<(ObjectId, String)> = ids
+            .iter()
+            .filter_map(|id| st.redacted.get(id).map(|r| (*id, r.clone())))
+            .collect();
+        if hits.is_empty() { Ok(()) } else { Err(redacted(&hits)) }
+    }
+
     /// 确认 `ids` 都在调用者的仓库中可见（`client` 带着仓库与调用者身份）。
     pub(crate) async fn check_visible(
         &self,
@@ -307,6 +406,7 @@ impl ObjectService for DaemonObjectSvc {
         self.daemon
             .check_access(&up.raw, &upstream, &repo, authorization.as_ref())
             .await?;
+        self.daemon.check_redactions(&client, &upstream, &repo, &unique).await?;
         let found = self.daemon.objects(&client, &upstream, &repo, &unique).await;
         let chunk = usize::try_from(limits.max_chunk_bytes).unwrap_or(usize::MAX).max(1);
         let mut parts = Vec::new();
@@ -334,6 +434,19 @@ impl ObjectService for DaemonObjectSvc {
         let up = self.daemon.upstreams.get(&upstream_of(&request)?)?;
         let fwd = forward(&request, request.get_ref().clone());
         let resp = ObjectServiceClient::new(up.raw.clone()).has_objects(fwd).await?;
+        Ok(Response::new(resp.into_inner()))
+    }
+
+    async fn list_redacted_objects(
+        &self,
+        request: Request<ListRedactedObjectsRequest>,
+    ) -> Result<Response<ListRedactedObjectsResponse>, Status> {
+        self.daemon.touch();
+        let up = self.daemon.upstreams.get(&upstream_of(&request)?)?;
+        let fwd = forward(&request, request.get_ref().clone());
+        let resp = ObjectServiceClient::new(up.raw.clone())
+            .list_redacted_objects(fwd)
+            .await?;
         Ok(Response::new(resp.into_inner()))
     }
 }

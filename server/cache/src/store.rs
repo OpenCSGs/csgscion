@@ -122,6 +122,11 @@ impl ObjectCache {
         true
     }
 
+    /// 删除（内存层与磁盘层）。
+    pub fn remove(&self, id: &ObjectId) {
+        self.inner.remove(&CacheKey(*id));
+    }
+
     /// 是否在内存层（不查磁盘）。
     pub fn in_memory(&self, id: &ObjectId) -> bool {
         self.inner.memory().contains(&CacheKey(*id))

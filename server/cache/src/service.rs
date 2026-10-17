@@ -12,7 +12,7 @@ use scion_proto::v1::object_service_server::ObjectService;
 use scion_proto::v1::server_info_service_server::ServerInfoService;
 use scion_proto::v1::{
     self, Encoding, GetObjectsRequest, GetObjectsResponse, GetServerInfoRequest, GetServerInfoResponse,
-    HasObjectsRequest, HasObjectsResponse,
+    HasObjectsRequest, HasObjectsResponse, ListRedactedObjectsRequest, ListRedactedObjectsResponse,
 };
 use tokio_stream::Stream;
 use tonic::transport::Channel;
@@ -128,6 +128,25 @@ impl ObjectService for CacheObjectSvc {
     }
 
     async fn has_objects(&self, request: Request<HasObjectsRequest>) -> Result<Response<HasObjectsResponse>, Status> {
+        let (channel, fwd) = self.forward(request)?;
+        let resp = ObjectServiceClient::new(channel).has_objects(fwd).await?;
+        Ok(Response::new(resp.into_inner()))
+    }
+
+    /// 不缓存，直接转给上游（客户端经由缓存同步 redaction 时使用）。
+    async fn list_redacted_objects(
+        &self,
+        request: Request<ListRedactedObjectsRequest>,
+    ) -> Result<Response<ListRedactedObjectsResponse>, Status> {
+        let (channel, fwd) = self.forward(request)?;
+        let resp = ObjectServiceClient::new(channel).list_redacted_objects(fwd).await?;
+        Ok(Response::new(resp.into_inner()))
+    }
+}
+
+impl CacheObjectSvc {
+    /// 选一个上游，把请求连同调用者的 `authorization` 转过去。
+    fn forward<T>(&self, request: Request<T>) -> Result<(Channel, Request<T>), Status> {
         if self.upstreams.is_empty() {
             return Err(Status::unavailable("no upstream configured"));
         }
@@ -137,10 +156,7 @@ impl ObjectService for CacheObjectSvc {
         if let Some(a) = ctx.authorization {
             fwd.metadata_mut().insert("authorization", a);
         }
-        let resp = ObjectServiceClient::new(self.upstreams[i].clone())
-            .has_objects(fwd)
-            .await?;
-        Ok(Response::new(resp.into_inner()))
+        Ok((self.upstreams[i].clone(), fwd))
     }
 }
 
@@ -151,7 +167,11 @@ pub struct CacheInfoSvc {
 impl CacheInfoSvc {
     /// 由上游的 ServerInfo 派生：限额相同，角色为 CACHE，只声明对象读取相关的能力。
     pub fn from_upstream(upstream: &v1::ServerInfo) -> Self {
-        let keep = [scion_proto::features::OBJECTS_GET, scion_proto::features::OBJECTS_HAS];
+        let keep = [
+            scion_proto::features::OBJECTS_GET,
+            scion_proto::features::OBJECTS_HAS,
+            scion_proto::features::REDACTION,
+        ];
         let info = v1::ServerInfo {
             protocol_version: scion_proto::PROTOCOL_VERSION.to_string(),
             features: upstream

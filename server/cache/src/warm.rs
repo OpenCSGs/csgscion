@@ -239,6 +239,17 @@ mod tests {
         async fn missing(&self, _: &str, ids: &[ObjectId], _: &RequestCtx) -> Result<Vec<ObjectId>, tonic::Status> {
             Ok(ids.iter().filter(|id| !self.data.contains_key(id)).copied().collect())
         }
+        async fn redactions(
+            &self,
+            _: &str,
+            after_seq: u64,
+            _: &RequestCtx,
+        ) -> Result<crate::upstream::RedactionPage, tonic::Status> {
+            Ok(crate::upstream::RedactionPage {
+                next_seq: after_seq,
+                ..Default::default()
+            })
+        }
         fn name(&self) -> &str {
             "objects"
         }

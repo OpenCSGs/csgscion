@@ -74,6 +74,17 @@ impl Cas {
         Some(data)
     }
 
+    /// 删除（对象被 redact）：内存层与磁盘层。
+    pub fn remove(&self, id: &ObjectId) {
+        self.memory.invalidate(id);
+        let path = self.path(id);
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if std::fs::remove_file(&path).is_ok() {
+                self.used.fetch_sub(meta.len(), Ordering::Relaxed);
+            }
+        }
+    }
+
     pub fn contains(&self, id: &ObjectId) -> bool {
         self.memory.contains_key(id) || self.path(id).exists()
     }
@@ -201,6 +212,20 @@ mod tests {
         let fresh = Cas::open(dir.path(), 1 << 20, 0).expect("reopen without memory");
         assert!(fresh.get(&id).is_none());
         assert!(!cas.path(&id).exists(), "removed");
+    }
+
+    #[test]
+    fn remove_deletes_memory_and_disk_copies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cas = Cas::open(dir.path(), 1 << 20, 1 << 20).expect("open");
+        let data = Bytes::from_static(b"secret");
+        let id = ObjectId::of_blob(&data);
+        cas.put(id, &data).expect("put");
+        assert!(cas.contains(&id) && cas.used() == 6);
+        cas.remove(&id);
+        assert!(!cas.contains(&id));
+        assert_eq!((cas.get(&id), cas.used()), (None, 0));
+        cas.remove(&id);
     }
 
     #[test]
