@@ -1,5 +1,6 @@
 //! Scion 服务端的 gRPC 服务实现与启动入口。
 
+pub mod auth;
 pub mod config;
 pub mod limit;
 mod service;
@@ -9,6 +10,8 @@ pub mod watch;
 use std::future::Future;
 use std::sync::Arc;
 
+use scion_proto::v1::admin_service_server::AdminServiceServer;
+use scion_proto::v1::auth_service_server::AuthServiceServer;
 use scion_proto::v1::land_service_server::LandServiceServer;
 use scion_proto::v1::object_service_server::ObjectServiceServer;
 use scion_proto::v1::query_service_server::QueryServiceServer;
@@ -20,8 +23,9 @@ use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 
 pub use config::{Limits, ReadEndpoint, ServerConfig, WriteRate};
+pub use scion_auth;
 pub use scion_proto::PROTOCOL_VERSION;
-pub use service::{FORWARDED_HEADER, LandSvc, ObjectSvc, QuerySvc, RefSvc, ServerInfoSvc, WriteSvc};
+pub use service::{AdminSvc, AuthSvc, FORWARDED_HEADER, LandSvc, ObjectSvc, QuerySvc, RefSvc, ServerInfoSvc, WriteSvc};
 
 /// 服务端依赖的全部状态。
 #[derive(Clone)]
@@ -56,6 +60,33 @@ async fn expire_once(meta: &dyn scion_store::MetaStore, ttl: std::time::Duration
         tracing::info!(expired = n, "expired request results");
     }
     Ok(n)
+}
+
+/// 按配置构建认证与鉴权。配置无效时（启动入口应已提前校验）拒绝一切，而不是放行。
+fn build_guard(config: &scion_auth::GuardConfig, meta: Arc<dyn MetaStore>) -> Arc<scion_auth::Guard> {
+    if !config.required && *config == scion_auth::GuardConfig::default() {
+        return scion_auth::Guard::disabled();
+    }
+    match scion_auth::Guard::build(config.clone(), meta, scion_auth::remote::env_lookup()) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::error!(error = %e, "invalid auth configuration; denying all requests");
+            scion_auth::Guard::deny_all()
+        }
+    }
+}
+
+/// 定期重新加载访问控制策略（其它节点的修改）。
+async fn reload_policy(guard: Arc<scion_auth::Guard>, every: std::time::Duration) {
+    let mut tick = tokio::time::interval(every.max(std::time::Duration::from_millis(10)));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        if let Err(e) = guard.reload_policy().await {
+            tracing::warn!(error = %e, "reloading the access policy failed; keeping the previous one");
+        }
+    }
 }
 
 async fn warm(cache: Arc<scion_store::CachedMeta>) {
@@ -101,6 +132,8 @@ pub async fn serve(
     health.set_serving::<LandServiceServer<LandSvc>>().await;
     health.set_serving::<RefServiceServer<RefSvc>>().await;
     health.set_serving::<QueryServiceServer<QuerySvc>>().await;
+    health.set_serving::<AuthServiceServer<AuthSvc>>().await;
+    health.set_serving::<AdminServiceServer<AdminSvc>>().await;
 
     // 所有服务共享一份提交记录缓存；启动后在后台预热，不阻塞监听
     let cached = Arc::new(scion_store::CachedMeta::new(app.meta, app.config.record_cache_capacity));
@@ -119,18 +152,28 @@ pub async fn serve(
         app.config.idempotency_ttl,
         app.config.janitor_interval,
     ));
+    let guard = build_guard(&app.config.auth, app.meta.clone());
+    if guard.required() {
+        if let Err(e) = guard.reload_policy().await {
+            tracing::error!(error = %e, "loading the access policy failed");
+        }
+        tokio::spawn(reload_policy(guard.clone(), app.config.policy_poll_interval));
+    }
     let max_msg = usize::try_from(app.config.limits.max_chunk_bytes)
         .unwrap_or(usize::MAX)
         .saturating_add(64 * 1024);
-    let info = ServerInfoServiceServer::new(ServerInfoSvc::new(app.config.clone()));
-    let objects = ObjectServiceServer::new(ObjectSvc::new(app.config.clone(), app.meta.clone(), app.blobs.clone()))
-        .max_encoding_message_size(max_msg);
+    let info = ServerInfoServiceServer::new(ServerInfoSvc::new(app.config.clone()).with_guard(guard.clone()));
+    let objects = ObjectServiceServer::new(
+        ObjectSvc::new(app.config.clone(), app.meta.clone(), app.blobs.clone()).with_guard(guard.clone()),
+    )
+    .max_encoding_message_size(max_msg);
     // 上传的分块可能和读取分块一样大
     let limiter = app
         .config
         .repo_write_rate
         .map(|r| Arc::new(limit::RateLimiter::new(r.per_second, r.burst)));
-    let mut write_svc = WriteSvc::new(app.config.clone(), app.meta.clone(), app.blobs.clone());
+    let mut write_svc =
+        WriteSvc::new(app.config.clone(), app.meta.clone(), app.blobs.clone()).with_guard(guard.clone());
     if let Some(l) = &limiter {
         write_svc = write_svc.with_rate_limit(l.clone());
     }
@@ -140,7 +183,9 @@ pub async fn serve(
         None => scion_land::Coordinator::new(write_svc.writer().clone(), app.config.land),
     };
     let hub = watch::RefHub::new(app.meta.clone(), app.config.ref_poll_interval);
-    let mut land_svc = LandSvc::new(coordinator.clone()).with_ref_hub(hub.clone());
+    let mut land_svc = LandSvc::new(coordinator.clone())
+        .with_ref_hub(hub.clone())
+        .with_guard(guard.clone());
     if let Some(l) = limiter {
         land_svc = land_svc.with_rate_limit(l);
     }
@@ -149,12 +194,16 @@ pub async fn serve(
     let max_write = write_message_limit(&app.config.limits, max_msg);
     let write = WriteServiceServer::new(write_svc).max_decoding_message_size(max_write);
     let hub_for_shutdown = hub.clone();
-    let refs = RefServiceServer::new(RefSvc::new(app.meta.clone(), hub));
-    let query = QueryServiceServer::new(QuerySvc::new(app.config.clone(), app.meta, app.blobs))
-        .max_encoding_message_size(max_msg);
+    let refs = RefServiceServer::new(RefSvc::new(app.meta.clone(), hub).with_guard(guard.clone()));
+    let query =
+        QueryServiceServer::new(QuerySvc::new(app.config.clone(), app.meta, app.blobs).with_guard(guard.clone()))
+            .max_encoding_message_size(max_msg);
+    let auth_svc = AuthServiceServer::new(AuthSvc::new(guard.clone()));
+    let admin_svc = AdminServiceServer::new(AdminSvc::new(guard.clone()));
 
     let result = tonic::transport::Server::builder()
         .layer(limit::ConcurrencyLimitLayer::new(app.config.max_concurrent_requests))
+        .layer(auth::AuthLayer::new(guard))
         .add_service(health_svc)
         .add_service(info)
         .add_service(objects)
@@ -162,6 +211,8 @@ pub async fn serve(
         .add_service(land)
         .add_service(refs)
         .add_service(query)
+        .add_service(auth_svc)
+        .add_service(admin_svc)
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
             shutdown.await;
             // 结束 WatchRefs 的长连接，否则优雅停机会一直等它们

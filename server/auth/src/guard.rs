@@ -65,7 +65,7 @@ impl From<scion_store::Error> for AuthError {
 }
 
 /// 构建 [`Guard`] 的参数。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GuardConfig {
     /// 是否要求认证。
     pub required: bool,
@@ -95,7 +95,19 @@ fn now_ms() -> i64 {
 impl Guard {
     /// 不要求认证、一切允许（Lite 模式、测试）。
     pub fn disabled() -> Arc<Self> {
+        Arc::new(Self::unconfigured())
+    }
+
+    /// 要求认证但无法验证任何令牌：拒绝一切（认证配置无效时的兜底，宁可拒绝也不放行）。
+    pub fn deny_all() -> Arc<Self> {
         Arc::new(Self {
+            required: true,
+            ..Self::unconfigured()
+        })
+    }
+
+    fn unconfigured() -> Self {
+        Self {
             required: false,
             meta: None,
             issuer: None,
@@ -104,7 +116,7 @@ impl Guard {
             webhook: None,
             oidc: None,
             policy: RwLock::new(None),
-        })
+        }
     }
 
     pub fn build(config: GuardConfig, meta: Arc<dyn MetaStore>, lookup: Lookup) -> Result<Arc<Self>, String> {
@@ -401,6 +413,22 @@ impl Guard {
         self.webhook_allows(p, req).await
     }
 
+    /// 在仓库里是否有 `action`（不论 ref 和路径的限制），见 [`Policy::allows_any`]。
+    pub async fn check_any(&self, p: &Principal, repo: &str, action: Action) -> Result<bool, AuthError> {
+        if self.current_policy().is_some_and(|pol| pol.allows_any(p, repo, action)) {
+            return Ok(true);
+        }
+        self.check(p, &Request::repo(repo, action)).await
+    }
+
+    /// 同 [`Guard::check_any`]，不允许时返回错误。
+    pub async fn authorize_any(&self, p: &Principal, repo: &str, action: Action) -> Result<(), AuthError> {
+        if self.check_any(p, repo, action).await? {
+            return Ok(());
+        }
+        self.authorize(p, &Request::repo(repo, action)).await
+    }
+
     /// 不允许时返回 [`AuthError::Denied`]（未认证的请求返回 [`AuthError::Missing`]）。
     pub async fn authorize(&self, p: &Principal, req: &Request<'_>) -> Result<(), AuthError> {
         if self.check(p, req).await? {
@@ -520,6 +548,16 @@ mod tests {
             &EncodingKey::from_secret(b"signing-key"),
         )
         .expect("sign")
+    }
+
+    #[tokio::test]
+    async fn deny_all_guard_rejects_everyone() {
+        let g = Guard::deny_all();
+        assert!(g.required());
+        let anon = g.authenticate(None).await.expect("anonymous");
+        assert!(!g.check(&anon, &Request::repo("x", Action::Read)).await.expect("ok"));
+        assert!(g.authenticate(Some("scn_pat_x")).await.is_err());
+        assert!(!g.is_admin(&anon).await.expect("ok"));
     }
 
     #[tokio::test]
@@ -665,6 +703,12 @@ mod tests {
             "{denied:?}"
         );
         assert!(g.path_visible(&alice, "mono", "src").await.expect("ok"));
+        assert!(g.check_any(&alice, "mono", Action::Write).await.expect("ok"));
+        g.authorize_any(&alice, "mono", Action::Read).await.expect("any read");
+        assert!(matches!(
+            g.authorize_any(&alice, "mono", Action::Land).await,
+            Err(AuthError::Denied { action: "land", .. })
+        ));
         assert!(!g.path_visible(&alice, "mono", "secret").await.expect("ok"));
         assert!(g.is_admin(&Principal::user("root", vec![])).await.expect("ok"));
         assert!(matches!(g.set_policy("[[rule]]").await, Err(AuthError::BadRequest(_))));

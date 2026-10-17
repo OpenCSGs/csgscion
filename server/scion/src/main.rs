@@ -2,6 +2,7 @@
 //!
 //! 目前有 `server`、`cache`、`admin` 和 `version`；`deriver`、`janitor` 按里程碑逐个加入。
 
+mod authcmd;
 mod storage;
 
 use std::net::SocketAddr;
@@ -46,6 +47,22 @@ enum AdminCmd {
     /// 为旧数据补建派生索引（父提交与跳表、PathHistory、GitSha）。可重复执行。
     /// 运行中的服务端会缓存提交记录：请在启动服务端之前运行，或运行后重启服务端。
     Reindex(ReindexArgs),
+    /// 生成签发访问令牌用的 ES256 私钥（PKCS#8 PEM，输出到标准输出）。
+    JwtKeygen,
+    /// 管理 PAT / service token。
+    Token {
+        #[command(subcommand)]
+        cmd: authcmd::TokenCmd,
+        #[command(flatten)]
+        storage: StorageArgs,
+    },
+    /// 查看或设置访问控制策略。
+    Policy {
+        #[command(subcommand)]
+        cmd: authcmd::PolicyCmd,
+        #[command(flatten)]
+        storage: StorageArgs,
+    },
 }
 
 #[derive(Debug, clap::Args)]
@@ -61,16 +78,16 @@ struct ReindexArgs {
 #[derive(Debug, clap::Args)]
 struct StorageArgs {
     /// Lite 档：SQLite + 本地目录，单进程、零外部依赖。需要 --data-dir。
-    #[arg(long, requires = "data_dir", conflicts_with_all = ["meta", "blobs"])]
+    #[arg(long, global = true, requires = "data_dir", conflicts_with_all = ["meta", "blobs"])]
     lite: bool,
     /// Lite 档的数据目录（meta.db 与 objects/）。
-    #[arg(long, value_name = "DIR", env = "SCION_DATA_DIR")]
+    #[arg(long, global = true, value_name = "DIR", env = "SCION_DATA_DIR")]
     data_dir: Option<PathBuf>,
     /// 元数据后端：mem、sqlite://PATH、postgres://…
-    #[arg(long, value_name = "URL", default_value = "mem", env = "SCION_META")]
+    #[arg(long, global = true, value_name = "URL", default_value = "mem", env = "SCION_META")]
     meta: String,
     /// 对象存储：mem、目录路径、s3://bucket[/prefix]（连接参数见 SCION_S3_* 环境变量）。
-    #[arg(long, value_name = "SPEC", default_value = "mem", env = "SCION_BLOBS")]
+    #[arg(long, global = true, value_name = "SPEC", default_value = "mem", env = "SCION_BLOBS")]
     blobs: String,
 }
 
@@ -115,6 +132,8 @@ struct ServerArgs {
     #[arg(long, value_name = "DURATION", default_value = "1s", value_parser = parse_duration,
         env = "SCION_REF_POLL_INTERVAL")]
     ref_poll_interval: std::time::Duration,
+    #[command(flatten)]
+    auth: authcmd::AuthArgs,
     #[command(flatten)]
     storage: StorageArgs,
 }
@@ -316,8 +335,17 @@ async fn build_app(args: &ServerArgs, env: impl Fn(&str) -> Option<String>) -> a
         Some(url) => anyhow::bail!("--advertise-url must be an http:// or https:// URL, got {url:?}"),
         None => None,
     };
+    let auth = args.auth.guard_config()?;
     let (meta_spec, blob_spec) = args.storage.specs()?;
     let (meta, blobs) = storage::open(&meta_spec, &blob_spec, env).await?;
+    // 提前校验认证配置（密钥、外部签发方的密钥来源），配置有误时拒绝启动
+    scion_api::scion_auth::Guard::build(auth.clone(), meta.clone(), scion_api::scion_auth::remote::env_lookup())
+        .map_err(|e| anyhow::anyhow!("invalid auth configuration: {e}"))?;
+    if auth.required && auth.signing_key_pem.is_none() {
+        tracing::warn!(
+            "authentication required but no --jwt-key: access tokens cannot be issued (PATs and external tokens still work)"
+        );
+    }
     for repo in &args.repos {
         match meta.create_repo(repo).await {
             Ok(()) | Err(scion_store::Error::RepoAlreadyExists(_)) => {}
@@ -330,6 +358,7 @@ async fn build_app(args: &ServerArgs, env: impl Fn(&str) -> Option<String>) -> a
             max_concurrent_requests: args.max_concurrent_requests,
             repo_write_rate: args.repo_write_rate,
             read_endpoints: args.read_endpoints.clone(),
+            auth,
             ref_poll_interval: args.ref_poll_interval,
             ..ServerConfig::default()
         }),
@@ -337,6 +366,13 @@ async fn build_app(args: &ServerArgs, env: impl Fn(&str) -> Option<String>) -> a
         blobs,
     };
     Ok((app, storage::describe(&meta_spec, &blob_spec)))
+}
+
+/// 只打开元数据库（管理命令用）。
+async fn open_meta(storage: &StorageArgs) -> anyhow::Result<Arc<dyn scion_store::MetaStore>> {
+    let (meta_spec, blob_spec) = storage.specs()?;
+    let (meta, _) = storage::open(&meta_spec, &blob_spec, |k| std::env::var(k).ok()).await?;
+    Ok(meta)
 }
 
 /// `scion admin reindex`：返回每个仓库的一行摘要。
@@ -428,6 +464,24 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Admin(AdminCmd::Reindex(args)) => {
             for line in reindex(&args, |k| std::env::var(k).ok()).await? {
+                println!("{line}");
+            }
+            Ok(())
+        }
+        Command::Admin(AdminCmd::JwtKeygen) => {
+            print!("{}", scion_api::scion_auth::token::generate_signing_key());
+            Ok(())
+        }
+        Command::Admin(AdminCmd::Token { cmd, storage }) => {
+            let meta = open_meta(&storage).await?;
+            for line in authcmd::token(&cmd, meta).await? {
+                println!("{line}");
+            }
+            Ok(())
+        }
+        Command::Admin(AdminCmd::Policy { cmd, storage }) => {
+            let meta = open_meta(&storage).await?;
+            for line in authcmd::policy(&cmd, meta).await? {
                 println!("{line}");
             }
             Ok(())

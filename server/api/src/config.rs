@@ -69,6 +69,10 @@ pub struct ServerConfig {
     pub ref_poll_interval: std::time::Duration,
     /// L3 进程内的对象缓存与后端读并发上限。
     pub blob_cache: scion_store::BlobCacheConfig,
+    /// 认证与鉴权（默认不要求认证）。
+    pub auth: scion_auth::GuardConfig,
+    /// 从元数据库重新加载访问控制策略的间隔（其它节点修改策略后的最大生效延迟）。
+    pub policy_poll_interval: std::time::Duration,
 }
 
 /// 令牌桶参数：每秒补充 `per_second` 个，最多积攒 `burst` 个。
@@ -94,6 +98,8 @@ impl Default for ServerConfig {
             repo_write_rate: None,
             ref_poll_interval: std::time::Duration::from_secs(1),
             blob_cache: scion_store::BlobCacheConfig::default(),
+            auth: scion_auth::GuardConfig::default(),
+            policy_poll_interval: std::time::Duration::from_secs(30),
         }
     }
 }

@@ -288,6 +288,14 @@ impl Policy {
         }) || path.is_empty()
     }
 
+    /// 在仓库里是否有 `action`（不论 ref 和路径的限制）。用于不涉及具体路径、但限定路径的身份也需要的
+    /// 操作：上传对象、读取 ref、浏览历史。
+    pub fn allows_any(&self, p: &Principal, repo: &str, action: Action) -> bool {
+        self.rules.iter().any(|r| {
+            r.action >= action && r.subjects.iter().any(|s| p.matches(s)) && r.repos.iter().any(|g| glob(g, repo))
+        })
+    }
+
     /// 在仓库里是否有任何读权限（可能只限某些路径）。
     pub fn any_read(&self, p: &Principal, repo: &str) -> bool {
         self.rules
@@ -458,6 +466,10 @@ actions = ["admin"]
         );
         assert!(!p.path_visible(&Principal::user("x", vec![]), "mono", "src"));
         assert!(p.any_read(&c, "mono") && !p.any_read(&c, "other"));
+        assert!(p.allows_any(&c, "mono", Action::Write));
+        assert!(!p.allows_any(&c, "mono", Action::Land));
+        let rel = Principal::user("rel", vec![]);
+        assert!(p.allows_any(&rel, "mono", Action::Land), "ref restriction ignored");
     }
 
     #[test]

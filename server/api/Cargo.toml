@@ -11,6 +11,7 @@ bytes.workspace = true
 scion-object.workspace = true
 scion-proto.workspace = true
 scion-store.workspace = true
+scion-auth.workspace = true
 scion-tree.workspace = true
 scion-query.workspace = true
 scion-land.workspace = true
@@ -27,6 +28,9 @@ tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+scion-client.workspace = true
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
+serde_json.workspace = true
 
 [lints]
 workspace = true

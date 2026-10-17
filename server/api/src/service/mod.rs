@@ -1,3 +1,4 @@
+mod auth;
 mod history;
 mod land;
 mod object;
@@ -7,6 +8,7 @@ mod server_info;
 mod support;
 mod write;
 
+pub use auth::{AdminSvc, AuthSvc};
 pub use land::{FORWARDED_HEADER, LandSvc};
 pub use object::ObjectSvc;
 pub use query::QuerySvc;

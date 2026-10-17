@@ -14,16 +14,19 @@ use scion_proto::v1::{
 use scion_store::{BlobStore, ChangesetRecord, MetaStore};
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::auth::{authorize, authorize_any, principal, to_status};
 use crate::config::ServerConfig;
 use crate::limit::RateLimiter;
 use crate::service::support::{check_repo, parse_id};
 use crate::status;
+use scion_auth::{Action, Guard, Request as AuthRequest};
 
 pub struct WriteSvc {
     config: Arc<ServerConfig>,
     meta: Arc<dyn MetaStore>,
     writer: Arc<ChangesetWriter>,
     limiter: Option<Arc<RateLimiter>>,
+    guard: Arc<Guard>,
 }
 
 impl WriteSvc {
@@ -34,7 +37,31 @@ impl WriteSvc {
             meta,
             writer,
             limiter: None,
+            guard: Guard::disabled(),
         }
+    }
+
+    pub fn with_guard(mut self, guard: Arc<Guard>) -> Self {
+        self.guard = guard;
+        self
+    }
+
+    /// 创建提交需要对每个改动路径有写权限（有整个仓库写权限时不再逐个检查）。
+    async fn authorize_paths(&self, p: &scion_auth::Principal, repo: &str, cs: &Changeset) -> Result<(), Status> {
+        let whole = AuthRequest::repo(repo, Action::Write);
+        if self.guard.check(p, &whole).await.map_err(to_status)? {
+            return Ok(());
+        }
+        authorize_any(&self.guard, p, repo, Action::Write).await?;
+        for c in &cs.delta {
+            authorize(
+                &self.guard,
+                p,
+                AuthRequest::repo(repo, Action::Write).with_path(&c.path),
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     /// 按仓库限制写入速率（上传与创建提交各算一次）。
@@ -215,6 +242,7 @@ impl WriteService for WriteSvc {
         &self,
         request: Request<Streaming<UploadBlobsRequest>>,
     ) -> Result<Response<UploadBlobsResponse>, Status> {
+        let p = principal(&request);
         let mut stream = request.into_inner();
         let mut asm = UploadAssembler::new(self.config.limits.max_upload_object_bytes);
         let mut checked = false;
@@ -223,6 +251,7 @@ impl WriteService for WriteSvc {
             let done = asm.push(msg)?;
             let repo = asm.repo().unwrap_or_default().to_owned();
             if !checked {
+                authorize_any(&self.guard, &p, &repo, Action::Write).await?;
                 check_repo(self.meta.as_ref(), &repo).await?;
                 RateLimiter::admit(self.limiter.as_deref(), &repo)?;
                 checked = true;
@@ -240,11 +269,13 @@ impl WriteService for WriteSvc {
         &self,
         request: Request<CreateChangesetRequest>,
     ) -> Result<Response<CreateChangesetResponse>, Status> {
+        let p = principal(&request);
         let req = request.into_inner();
         let spec = req
             .changeset
             .ok_or_else(|| Status::invalid_argument("changeset is required"))?;
         let cs = spec_to_changeset(spec, self.config.limits.max_changes_per_changeset)?;
+        self.authorize_paths(&p, &req.repo, &cs).await?;
         RateLimiter::admit(self.limiter.as_deref(), &req.repo)?;
         let rec = self.create(&req.repo, &cs).await?;
         tracing::info!(repo = %req.repo, changeset = %rec.id, request_id = %req.request_id, "changeset created");

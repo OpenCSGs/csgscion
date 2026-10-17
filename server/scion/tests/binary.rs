@@ -249,3 +249,81 @@ fn cache_requires_reachable_upstream() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("upstream"));
 }
+
+/// 认证：生成密钥、在 Lite 数据目录里创建令牌、要求认证的服务端只接受有效令牌；配置有误时拒绝启动。
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn auth_required_server_with_admin_commands() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let d = dir.path().to_str().expect("utf8");
+    let key = Command::new(env!("CARGO_BIN_EXE_scion"))
+        .args(["admin", "jwt-keygen"])
+        .output()
+        .expect("keygen");
+    assert!(key.status.success());
+    let key_file = dir.path().join("jwt.pem");
+    std::fs::write(&key_file, &key.stdout).expect("write key");
+    assert!(String::from_utf8_lossy(&key.stdout).contains("BEGIN PRIVATE KEY"));
+
+    // 先建好仓库，再离线创建令牌
+    let (srv, _) = spawn_server(&["--lite", "--data-dir", d, "--repo", "mono"]);
+    stop(srv);
+    let created = Command::new(env!("CARGO_BIN_EXE_scion"))
+        .args(["admin", "token", "create", "--subject", "ci", "--lite", "--data-dir", d])
+        .output()
+        .expect("token create");
+    assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
+    let out = String::from_utf8_lossy(&created.stdout).to_string();
+    let token = out
+        .lines()
+        .find_map(|l| l.strip_prefix("token: "))
+        .expect("token line")
+        .to_string();
+    let list = Command::new(env!("CARGO_BIN_EXE_scion"))
+        .args(["admin", "token", "list", "--lite", "--data-dir", d])
+        .output()
+        .expect("list");
+    assert!(String::from_utf8_lossy(&list.stdout).contains("ci"));
+
+    let key_path = key_file.to_str().expect("utf8");
+    let (srv, addr) = spawn_server(&["--lite", "--data-dir", d, "--auth-required", "--jwt-key", key_path]);
+    let anon = scion_client::Client::builder()
+        .endpoint(format!("http://{addr}"))
+        .repo("mono")
+        .build()
+        .await
+        .expect("connect");
+    assert!(anon.has_feature(scion_proto::features::AUTH_REQUIRED));
+    assert!(anon.list_refs().await.is_err(), "anonymous rejected");
+    let ci = scion_client::Client::builder()
+        .endpoint(format!("http://{addr}"))
+        .repo("mono")
+        .auth(scion_client::Auth::Bearer(token))
+        .build()
+        .await
+        .expect("connect");
+    ci.list_refs().await.expect("token accepted");
+    drop((anon, ci));
+    stop(srv);
+
+    // 认证配置有误：拒绝启动
+    let bad = dir.path().join("auth.toml");
+    std::fs::write(
+        &bad,
+        "[[issuer]]\nissuer = \"x\"\nhs256_secret_env = \"SCION_TEST_UNSET_SECRET\"\n",
+    )
+    .expect("write");
+    let out = Command::new(env!("CARGO_BIN_EXE_scion"))
+        .args(["server", "--listen", "127.0.0.1:0", "--lite", "--data-dir", d])
+        .arg("--auth-config")
+        .arg(&bad)
+        .env_remove("SCION_TEST_UNSET_SECRET")
+        .output()
+        .expect("run");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("auth"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
