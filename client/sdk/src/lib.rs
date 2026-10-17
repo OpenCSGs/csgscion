@@ -21,6 +21,7 @@ mod error;
 mod history;
 mod info;
 mod ops;
+mod watch;
 
 pub use client::{Auth, Client, ClientBuilder};
 pub use error::{ConflictPath, Error, MergeConflict, Result};
@@ -32,3 +33,4 @@ pub use ops::{
 pub use scion_object::{EntryMode, ObjectId, ObjectKind};
 /// gRPC 状态码，出现在 [`Error::Rpc`] 中。
 pub use tonic::Code;
+pub use watch::{RefChange, RefWatch};

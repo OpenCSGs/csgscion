@@ -4,6 +4,7 @@ pub mod config;
 pub mod limit;
 mod service;
 pub mod status;
+pub mod watch;
 
 use std::future::Future;
 use std::sync::Arc;
@@ -125,13 +126,15 @@ pub async fn serve(
         Some(c) => scion_land::Coordinator::clustered(write_svc.writer().clone(), app.config.land, c.clone()),
         None => scion_land::Coordinator::new(write_svc.writer().clone(), app.config.land),
     };
-    let mut land_svc = LandSvc::new(coordinator.clone());
+    let hub = watch::RefHub::new(app.meta.clone(), app.config.ref_poll_interval);
+    let mut land_svc = LandSvc::new(coordinator.clone()).with_ref_hub(hub.clone());
     if let Some(l) = limiter {
         land_svc = land_svc.with_rate_limit(l);
     }
     let land = LandServiceServer::new(land_svc);
     let write = WriteServiceServer::new(write_svc).max_decoding_message_size(max_msg);
-    let refs = RefServiceServer::new(RefSvc::new(app.meta.clone()));
+    let hub_for_shutdown = hub.clone();
+    let refs = RefServiceServer::new(RefSvc::new(app.meta.clone(), hub));
     let query = QueryServiceServer::new(QuerySvc::new(app.config.clone(), app.meta, app.blobs))
         .max_encoding_message_size(max_msg);
 
@@ -144,7 +147,11 @@ pub async fn serve(
         .add_service(land)
         .add_service(refs)
         .add_service(query)
-        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
+        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+            shutdown.await;
+            // 结束 WatchRefs 的长连接，否则优雅停机会一直等它们
+            hub_for_shutdown.close();
+        })
         .await;
     // 不再有请求进来：让合入任务处理完手上的批并释放租约
     coordinator.shutdown();

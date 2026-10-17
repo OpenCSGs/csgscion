@@ -6,6 +6,10 @@ package scion.v1;
 service RefService {
   rpc ResolveRef(ResolveRefRequest) returns (ResolveRefResponse);
   rpc ListRefs(ListRefsRequest) returns (ListRefsResponse);
+  // 订阅 ref 变化（daemon / 区域缓存预取、CI 触发）。先发送当前状态（快照），之后每次 ref 前进发送新状态。
+  // 只保证最终送达每个 ref 的最新状态：同一 ref 短时间内多次前进时，中间版本可能被合并掉。
+  // 断开后带上已知版本（known_versions）重新订阅即可续上，不会漏掉变化。
+  rpc WatchRefs(WatchRefsRequest) returns (stream WatchRefsResponse);
 }
 
 message ResolveRefRequest {
@@ -32,4 +36,25 @@ message RefInfo {
 message ListRefsResponse {
   // 按名字字节序。
   repeated RefInfo refs = 1;
+}
+
+message WatchRefsRequest {
+  string repo = 1;
+  // 要订阅的 ref 名；为空表示仓库中的全部 ref。
+  repeated string refs = 2;
+  // 客户端已知的版本：快照中只包含比它新的 ref。
+  map<string, uint64> known_versions = 3;
+}
+
+message RefEvent {
+  string name = 1;
+  bytes changeset_id = 2;
+  bytes root_tree = 3;
+  uint64 version = 4;
+}
+
+message WatchRefsResponse {
+  repeated RefEvent events = 1;
+  // 快照发送完毕（第一条响应即为快照，即使其中没有事件）。之后的响应都是实时变化。
+  bool snapshot = 2;
 }

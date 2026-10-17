@@ -20,6 +20,8 @@ use tonic::{Request, Response, Status};
 use crate::limit::RateLimiter;
 use crate::service::support::{check_repo, parse_id};
 use crate::status;
+use crate::watch::RefHub;
+use scion_store::RefState;
 
 /// 节点间转发的请求带上的元数据。
 pub const FORWARDED_HEADER: &str = "x-scion-forwarded";
@@ -29,6 +31,7 @@ pub struct LandSvc {
     /// 到其它节点的连接（按地址缓存）。
     peers: Mutex<HashMap<String, Channel>>,
     limiter: Option<Arc<RateLimiter>>,
+    hub: Option<Arc<RefHub>>,
 }
 
 impl LandSvc {
@@ -37,6 +40,19 @@ impl LandSvc {
             coordinator,
             peers: Mutex::new(HashMap::new()),
             limiter: None,
+            hub: None,
+        }
+    }
+
+    /// 合入成功后通知 WatchRefs 的订阅者。
+    pub fn with_ref_hub(mut self, hub: Arc<RefHub>) -> Self {
+        self.hub = Some(hub);
+        self
+    }
+
+    async fn notify(&self, repo: &str, reference: &str, state: RefState) {
+        if let Some(h) = &self.hub {
+            h.publish(repo, reference, state).await;
         }
     }
 
@@ -98,7 +114,8 @@ impl LandSvc {
         fast_forward_only: bool,
         request_id: Option<&str>,
     ) -> Result<LandOutcome, LandError> {
-        self.coordinator
+        let out = self
+            .coordinator
             .land(Request_ {
                 repo,
                 reference,
@@ -106,7 +123,9 @@ impl LandSvc {
                 fast_forward_only,
                 request_id,
             })
-            .await
+            .await?;
+        self.notify(repo, reference, out.state).await;
+        Ok(out)
     }
 }
 
@@ -157,7 +176,17 @@ impl LandService for LandSvc {
         {
             Ok(out) => out,
             // 别的节点是 leader：转给它（转发来的请求不再转发，由客户端重试）
-            Err(LandError::NotLeader { leader }) if !forwarded => return self.forward(&leader, req, auth).await,
+            Err(LandError::NotLeader { leader }) if !forwarded => {
+                let resp = self.forward(&leader, req.clone(), auth).await?;
+                if let Ok(target) = ObjectId::from_bytes(&resp.get_ref().tip) {
+                    let state = RefState {
+                        target,
+                        version: resp.get_ref().ref_version,
+                    };
+                    self.notify(&req.repo, &req.r#ref, state).await;
+                }
+                return Ok(resp);
+            }
             Err(e) => return Err(to_status(&req.r#ref, e)),
         };
         let rebased = out.landed.iter().filter(|l| l.original != l.landed).count();

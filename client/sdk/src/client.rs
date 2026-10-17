@@ -188,6 +188,27 @@ impl Client {
         ClientBuilder::default()
     }
 
+    /// 测试用：不做能力协商，直接包装一个连接。
+    #[cfg(test)]
+    pub(crate) fn for_tests(channel: Channel) -> Self {
+        let info = scion_proto::v1::ServerInfo {
+            protocol_version: scion_proto::PROTOCOL_VERSION.into(),
+            hash_algo: scion_proto::v1::HashAlgo::Blake3256.into(),
+            limits: Some(scion_proto::v1::Limits {
+                max_batch_objects: 1000,
+                max_chunk_bytes: 1 << 20,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        Self {
+            channel,
+            auth: Auth::None,
+            repo: Some("r".into()),
+            info: ServerInfo::from_proto(info).expect("test info"),
+        }
+    }
+
     /// 连接时协商得到的服务端信息。
     pub fn server_info(&self) -> &ServerInfo {
         &self.info

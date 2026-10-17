@@ -31,6 +31,8 @@ impl Node {
         let config = ServerConfig {
             cluster: Some(ClusterConfig::new(url.clone())),
             warm_record_cache: false,
+            // 不靠轮询：转发合入的节点自己通知订阅者
+            ref_poll_interval: std::time::Duration::from_secs(3600),
             ..ServerConfig::default()
         };
         let app = App {
@@ -127,6 +129,18 @@ async fn followers_forward_lands_to_the_leader() {
         .expect("a")
         .into_inner();
     assert_eq!(r.ref_version, 1);
+    let mut watch = scion_proto::v1::ref_service_client::RefServiceClient::connect(b.url.clone())
+        .await
+        .expect("connect")
+        .watch_refs(scion_proto::v1::WatchRefsRequest {
+            repo: REPO.into(),
+            refs: vec!["main".into()],
+            known_versions: [("main".to_string(), 1)].into(),
+        })
+        .await
+        .expect("watch")
+        .into_inner();
+    assert!(watch.message().await.expect("snapshot").expect("msg").snapshot);
     // 发给 b 的请求被转给 a
     let r = b
         .client()
@@ -136,6 +150,14 @@ async fn followers_forward_lands_to_the_leader() {
         .expect("forwarded")
         .into_inner();
     assert_eq!(r.ref_version, 2);
+    // b 上的订阅者立即收到（不等轮询）
+    let ev = tokio::time::timeout(std::time::Duration::from_secs(5), watch.message())
+        .await
+        .expect("timely")
+        .expect("ok")
+        .expect("event");
+    assert_eq!(ev.events[0].version, 2);
+    drop(watch);
     // 任何节点都能查询结果
     let st = b
         .client()
