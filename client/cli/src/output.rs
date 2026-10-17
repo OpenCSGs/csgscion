@@ -207,6 +207,8 @@ pub struct DoctorOut {
     pub max_batch_objects: u32,
     pub max_chunk_bytes: u64,
     pub read_endpoints: Vec<String>,
+    /// 读取对象经过的地址：daemon、区域缓存或服务端本身。
+    pub objects: String,
 }
 
 pub fn role_str(r: Role) -> &'static str {
@@ -234,6 +236,7 @@ pub fn doctor_out(endpoint: &str, info: &ServerInfo) -> DoctorOut {
             .iter()
             .map(|e| format!("{} ({})", e.url, e.region))
             .collect(),
+        objects: endpoint.to_string(),
     }
 }
 
@@ -256,6 +259,7 @@ impl Render for DoctorOut {
         for e in &self.read_endpoints {
             s.push_str(&format!("\nread via:  {e}"));
         }
+        s.push_str(&format!("\nobjects:   {}", self.objects));
         s
     }
 }

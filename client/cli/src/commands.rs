@@ -36,6 +36,7 @@ impl Ctx {
     }
 }
 
+/// 连接服务端：默认经本机 daemon（必要时拉起它），daemon 不可用时直连。
 pub async fn connect(endpoint: &str, repo: Option<&str>) -> Result<Client, CliError> {
     let mut b = Client::builder()
         .endpoint(endpoint)
@@ -44,6 +45,13 @@ pub async fn connect(endpoint: &str, repo: Option<&str>) -> Result<Client, CliEr
         .connect_timeout(Duration::from_secs(5));
     if let Some(r) = repo {
         b = b.repo(r);
+    }
+    let env = |k: &str| std::env::var(k).ok();
+    if crate::daemon::enabled(env) {
+        let socket = crate::daemon::config(env).socket;
+        if let Some(c) = crate::daemon::connect(b.clone(), &socket).await {
+            return Ok(c);
+        }
     }
     Ok(b.build().await?)
 }
@@ -58,7 +66,16 @@ async fn open_wc(ctx: &Ctx) -> Result<(WorkingCopy, Client), CliError> {
 pub async fn doctor(ctx: &Ctx) -> Result<DoctorOut, CliError> {
     let endpoint = ctx.endpoint_or(ctx.working_copy().as_ref());
     let client = connect(&endpoint, None).await?;
-    Ok(doctor_out(&endpoint, client.server_info()))
+    let mut out = doctor_out(&endpoint, client.server_info());
+    out.objects = if client.via_daemon() {
+        format!(
+            "daemon ({})",
+            crate::daemon::config(|k| std::env::var(k).ok()).socket.display()
+        )
+    } else {
+        client.object_endpoint().to_owned()
+    };
+    Ok(out)
 }
 
 /// 解析 `Name <email>`。

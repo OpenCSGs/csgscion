@@ -19,6 +19,7 @@ members = [
     # 客户端
     "client/sdk",
     "client/wc",
+    "client/daemon",
     "client/gitimport",
     "client/cli",
     # 开发工具（依赖分层检查等）
@@ -46,6 +47,7 @@ scion-cache = { path = "server/cache" }
 scion-api = { path = "server/api" }
 scion-client = { path = "client/sdk" }
 scion-wc = { path = "client/wc" }
+scion-daemon = { path = "client/daemon" }
 scion-gitimport = { path = "client/gitimport" }
 
 anyhow = "1"

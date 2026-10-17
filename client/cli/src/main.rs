@@ -4,6 +4,7 @@
 //! 4 可重试错误（已用尽重试）、5 认证失败。
 
 mod commands;
+mod daemon;
 mod history;
 mod output;
 
@@ -88,6 +89,26 @@ enum Command {
     /// 导入外部历史。
     #[command(subcommand)]
     Import(ImportCmd),
+    /// 本机 daemon（L1 缓存）：通常由其它命令自动拉起，`SCION_NO_DAEMON=1` 关闭。
+    #[command(subcommand)]
+    Daemon(DaemonCmd),
+}
+
+#[derive(Debug, Subcommand)]
+enum DaemonCmd {
+    /// 在前台运行 daemon。
+    Run {
+        /// 磁盘缓存上限（字节）。
+        #[arg(long, value_name = "BYTES")]
+        max_disk: Option<u64>,
+        /// 没有请求多少秒后退出；0 表示一直运行。
+        #[arg(long, value_name = "SECS")]
+        idle_timeout: Option<u64>,
+    },
+    /// 查看 daemon 是否在运行。
+    Status,
+    /// 停止 daemon。
+    Stop,
 }
 
 #[derive(Debug, Subcommand)]
@@ -172,6 +193,25 @@ async fn run(cli: Cli) -> ExitCode {
             path,
             name_only,
         } => emit(history::diff(&ctx, &revisions, path.as_deref(), name_only).await, json),
+        Command::Daemon(cmd) => {
+            let mut cfg = daemon::config(|k| std::env::var(k).ok());
+            match cmd {
+                DaemonCmd::Run { max_disk, idle_timeout } => {
+                    if let Some(b) = max_disk {
+                        cfg.disk_bytes = b;
+                    }
+                    if let Some(t) = idle_timeout {
+                        cfg.idle_timeout = (t > 0).then(|| std::time::Duration::from_secs(t));
+                    }
+                    match daemon::run(cfg).await {
+                        Ok(()) => ExitCode::SUCCESS,
+                        Err(e) => fail(&e, json),
+                    }
+                }
+                DaemonCmd::Status => emit(Ok(daemon::status(&cfg).await), json),
+                DaemonCmd::Stop => emit(daemon::stop(&cfg).await, json),
+            }
+        }
         Command::Import(ImportCmd::Git {
             path,
             git_ref,
@@ -232,6 +272,16 @@ mod tests {
         assert!(matches!(cli.command, Command::Diff { ref revisions, name_only: true, .. } if revisions.len() == 2));
         let cli = Cli::try_parse_from(["scn", "ls"]).expect("parse");
         assert!(matches!(cli.command, Command::Ls { spec: None }));
+        let cli = Cli::try_parse_from(["scn", "daemon", "run", "--idle-timeout", "0"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Command::Daemon(DaemonCmd::Run {
+                idle_timeout: Some(0),
+                ..
+            })
+        ));
+        let cli = Cli::try_parse_from(["scn", "daemon", "stop"]).expect("parse");
+        assert!(matches!(cli.command, Command::Daemon(DaemonCmd::Stop)));
     }
 
     #[test]

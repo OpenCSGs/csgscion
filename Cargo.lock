@@ -2779,8 +2779,10 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "clap",
+ "hyper-util",
  "scion-api",
  "scion-client",
+ "scion-daemon",
  "scion-gitimport",
  "scion-proto",
  "scion-store",
@@ -2790,6 +2792,9 @@ dependencies = [
  "similar",
  "tempfile",
  "tokio",
+ "tonic",
+ "tower",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2811,6 +2816,31 @@ dependencies = [
  "tonic-types",
  "tower",
  "uuid",
+]
+
+[[package]]
+name = "scion-daemon"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "hex",
+ "http",
+ "hyper-util",
+ "moka",
+ "scion-api",
+ "scion-client",
+ "scion-flight",
+ "scion-object",
+ "scion-proto",
+ "scion-store",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tower",
+ "tracing",
 ]
 
 [[package]]

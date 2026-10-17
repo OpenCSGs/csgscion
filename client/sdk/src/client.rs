@@ -358,6 +358,19 @@ impl Client {
         make_request(&self.auth, self.upstream.as_ref(), msg)
     }
 
+    /// 同一连接、换一个默认仓库（克隆开销很小）。
+    pub fn with_repo(&self, repo: impl Into<String>) -> Client {
+        Client {
+            repo: Some(repo.into()),
+            ..self.clone()
+        }
+    }
+
+    /// 同一连接、换一个身份（例如 daemon 按每个请求的调用者转发）。
+    pub fn with_auth(&self, auth: Auth) -> Client {
+        Client { auth, ..self.clone() }
+    }
+
     /// 读取对象的地址：服务端推荐的只读端点，或服务端本身。
     pub fn object_endpoint(&self) -> &str {
         &self.objects_endpoint
@@ -593,6 +606,18 @@ mod tests {
             make_request(&Auth::Bearer("bad\ntoken".into()), None, ()),
             Err(Error::Protocol(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn with_repo_and_auth_keep_the_connection() {
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let c = Client::for_tests(channel);
+        let other = c.with_repo("other").with_auth(Auth::Bearer("t".into()));
+        assert_eq!(other.repo().expect("repo"), "other");
+        assert_eq!(c.repo().expect("repo"), "r");
+        let req = other.request(()).expect("req");
+        assert!(req.metadata().get("authorization").is_some());
+        assert_eq!(other.object_endpoint(), c.object_endpoint());
     }
 
     #[test]

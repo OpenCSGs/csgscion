@@ -145,10 +145,63 @@ impl From<tonic::Status> for Error {
     }
 }
 
+impl Error {
+    /// 转回 gRPC 状态（daemon 等代理把上游错误原样交给自己的调用方）：保留状态码、消息、
+    /// `ErrorInfo` 的 reason 与 metadata；非服务端错误映射为相应的状态码。
+    pub fn to_status(&self) -> tonic::Status {
+        match self {
+            Error::Rpc {
+                code,
+                reason,
+                message,
+                metadata,
+            } => match reason {
+                Some(r) => tonic::Status::with_error_details(
+                    *code,
+                    message.clone(),
+                    tonic_types::ErrorDetails::with_error_info(
+                        scion_proto::reason_name(*r),
+                        scion_proto::ERROR_DOMAIN,
+                        metadata.clone(),
+                    ),
+                ),
+                None => tonic::Status::new(*code, message.clone()),
+            },
+            Error::Connect { .. } => tonic::Status::unavailable(self.to_string()),
+            Error::Corrupt(_) => tonic::Status::data_loss(self.to_string()),
+            Error::MissingRepo | Error::InvalidEndpoint(_) => tonic::Status::invalid_argument(self.to_string()),
+            Error::IncompatibleProtocol { .. } | Error::Protocol(_) => tonic::Status::internal(self.to_string()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tonic_types::ErrorDetails;
+
+    #[test]
+    fn to_status_round_trips() {
+        let e = Error::from(status(Code::FailedPrecondition, "OBJECT_MISSING", "scion.dev"));
+        let back = Error::from(e.to_status());
+        assert_eq!(back.reason(), Some(ErrorReason::ObjectMissing));
+        assert_eq!(e.to_status().code(), Code::FailedPrecondition);
+        assert_eq!(
+            Error::from(tonic::Status::not_found("x")).to_status().code(),
+            Code::NotFound
+        );
+        let connect = Error::Connect {
+            endpoint: "e".into(),
+            message: "m".into(),
+        };
+        assert_eq!(connect.to_status().code(), Code::Unavailable);
+        assert_eq!(
+            Error::Corrupt(ObjectId::of_blob(b"")).to_status().code(),
+            Code::DataLoss
+        );
+        assert_eq!(Error::MissingRepo.to_status().code(), Code::InvalidArgument);
+        assert_eq!(Error::Protocol("p".into()).to_status().code(), Code::Internal);
+    }
 
     fn status(code: Code, reason: &str, domain: &str) -> tonic::Status {
         let details =
