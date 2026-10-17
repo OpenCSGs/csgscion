@@ -14,24 +14,38 @@
 - [从 git 导入](docs/guide/git-import.md)：把已有的 git 仓库连同全部历史导入 Scion
 - [对象存储](docs/guide/object-storage.md)：SeaweedFS、MinIO 与其他 S3 兼容服务；服务识别与启动检查
 - [多节点部署与合入](docs/guide/cluster.md)：合入语义（rebase、恰好一次）、`--advertise-url` 集群模式、故障切换与过载保护
+- [缓存](docs/guide/cache.md)：区域缓存 `scion cache`（分片、对冲、预热）与本机 daemon `scn daemon`
 
 **设计与规范**
 - 设计文档：[服务端](docs/design/rust-server-architecture.md) · [客户端](docs/design/rust-client-architecture.md) · [接入 starhub / CSGLite](docs/design/starhub-integration.md)
 - 对象格式规范：[`SPEC.md`](SPEC.md)，golden 测试向量在 [`testdata/vectors/`](testdata/vectors/)
 - 协议：[`proto/scion/v1/`](proto/scion/v1/)
 
-当前进度：**M3 高并发**已完成：
-- **服务端 rebase**：落后的提交在合入时自动三方合并，冲突时返回 base / ours / theirs 三个版本的 id。
-- **恰好一次合入**：request id 幂等，同一 ref 上每个 change 只合入一次。
-- **LandCoordinator**：同一个 ref 上的合入合成批次处理。
-- **多节点集群**：按 ref 的 leader 租约，非 leader 节点转发请求。
-- **过载保护**：过载丢弃与按仓库的写入限流。
+当前进度：**M4 缓存层**已完成：
+- **区域缓存 `scion cache`（L2）**：
+  - 存储：foyer 内存加 NVMe；
+  - 多节点按 rendezvous 哈希分片，整个区域对同一对象只回源一次；
+  - 并发未命中合并（single-flight），回源时对冲与熔断；
+  - 按 WatchRefs 预热，只沿变化的目录树下钻。
+- **本机 daemon `scn daemon`（L1）**：
+  - 校验过的本机对象缓存；
+  - 其余 RPC 透明转发；
+  - 预取工作副本跟随的 ref；
+  - `scn` 按需自动拉起。
+- **WatchRefs**：订阅 ref 变化（先快照，之后每次前进），断开后可续上。
+- **服务端读路径**：
+  - 进程内对象缓存；
+  - 合并并发读并限制后端并发；
+  - `--read-endpoint` 向客户端推荐缓存。
 
-PostgreSQL 下单个 ref 每秒合入 885 次（p99 379 ms）。线性一致性测试覆盖并发合入与合入中途杀掉 leader。
+缓存 99.5% 的读取不回源，单节点每秒 161 万个对象，详见下文「性能」。
 
-之前的里程碑：M2 实现了历史查询（log / blame / diff / merge-base，10 万提交 p99 低于 20 ms）；M1 实现了写入路径、Lite 模式、`scn` 工作副本与 git 导入。
+之前的里程碑：
+- M3 实现了服务端 rebase、恰好一次合入、批量合入（单 ref 每秒 885 次）、集群与过载保护；
+- M2 实现了历史查询（10 万提交 p99 低于 20 ms）；
+- M1 实现了写入路径、Lite 模式、`scn` 工作副本与 git 导入。
 
-下一步 M4：缓存层。
+下一步 M5：生产化（YugabyteDB、ACL / OIDC、redaction、OpenTelemetry、Helm）。
 
 ## 性能
 
@@ -42,6 +56,7 @@ PostgreSQL 下单个 ref 每秒合入 885 次（p99 379 ms）。线性一致性�
 | 缓存命中率（[`server/cache/tests/bench.rs`](server/cache/tests/bench.rs)） | 冷缓存，200 个客户端检出同一组 20000 个对象（1–4 KiB） | 99.5% 的读取不回源 L3；每个对象只从 L3 取一次 | ≥ 99% |
 | 缓存吞吐（同上） | 热缓存，64 个客户端，gRPC 每批 64 个对象 | 单节点每秒 161 万个对象 | ≥ 每秒 20 万 |
 | 缓存吞吐（同上） | 热缓存，64 个客户端，每次请求 1 个对象 | 单节点每秒 16.6 万次请求 | — |
+| 检出（[`client/daemon/tests/bench.rs`](client/daemon/tests/bench.rs)） | `scn clone` 1000 个目录、10 万个文件 | 经热 daemon 5.4 秒；本机磁盘上不经网络直接创建这些文件需要 5.5 秒，daemon 没有可测出的额外开销 | < 5 秒（受磁盘限制） |
 | 合入（[`server/land/tests/bench.rs`](server/land/tests/bench.rs)） | 200 个并发客户端向同一个 ref 合入 2000 次 | PostgreSQL 每秒 885 次（p99 379 ms）；SQLite 每秒 1921 次（p99 173 ms） | 每秒 ≥ 200 次，p99 < 500 ms |
 | 历史查询（[`server/query/tests/bench.rs`](server/query/tests/bench.rs)） | 10 万提交：log、diff、祖先判断、merge-base、blame | SQLite 与 PostgreSQL 下 p99 均低于 20 ms（冷 blame 13.6 ms，`log --path` 15.6 ms） | p99 < 100 ms |
 
@@ -55,6 +70,7 @@ testdata/vectors/    golden 测试向量，任何语言的实现都应通过
 common/              服务端和客户端共用（只能依赖 common）
   protocol/          scion-proto   由 proto 生成的 Rust 代码
   object/            scion-object  ObjectId、规范编码、Tree / Changeset（纯计算，无 IO）
+  flight/            scion-flight  合并并发请求（single-flight），服务端缓存与 daemon 共用
 
 server/              服务端（可依赖 common 与更低层的 server crate）
   store/             scion-store       MetaStore / BlobStore trait、内存实现、后端一致性测试套件
@@ -64,12 +80,14 @@ server/              服务端（可依赖 common 与更低层的 server crate�
   merge/             scion-merge       服务端 rebase：把 delta 重放到更新的目录树上，三方合并
   land/              scion-land        创建提交、提交栈 rebase、LandCoordinator、租约
   query/             scion-query       历史查询（log / diff / blame / merge-base）与重建索引
+  cache/             scion-cache       区域对象缓存（scion cache）：foyer、rendezvous、对冲、预热
   api/               scion-api         gRPC 服务实现与启动入口
-  scion/             scion             服务端二进制（scion server --lite / --meta / --blobs）
+  scion/             scion             服务端二进制（scion server / scion cache / scion admin）
 
 client/              客户端（只能依赖 common 与 client，禁止依赖 server）
   sdk/               scion-client  Rust SDK
   wc/                scion-wc      工作副本（clone / status / commit / land / sync）
+  daemon/            scion-daemon  本机 L1 缓存（scn daemon）：对象缓存、透明转发、预取
   gitimport/         scion-gitimport  git 历史导入
   cli/               scion-cli     命令行二进制 scn
 
@@ -108,6 +126,12 @@ scn log --path src -n 10            # 历史，从新到旧，可按路径过滤
 scn diff                            # 本地未提交的改动（unified diff）
 scn diff main                       # main 最新提交引入的改动；`scn diff A B` 比较两个版本
 scn blame src/lib.rs                # 每一行最后被哪个提交改动
+
+# scn 经本机 daemon（scn daemon）连接服务端，按需自动拉起；SCION_NO_DAEMON=1 关闭
+scn daemon status
+
+# 在一个或多个服务端前部署区域缓存，并用 scion server --read-endpoint 推荐给客户端（详见 docs/guide/cache.md）
+cargo run -p scion -- cache --upstream http://127.0.0.1:7080 --listen 127.0.0.1:7090 --warm mono:main
 
 # 导入已有的 git 仓库（保留全部历史、作者与时间），详见 docs/guide/git-import.md
 scn import git ~/src/my-repo --repo mono

@@ -14,6 +14,7 @@ A server-first source control system: history, merges and rebases are computed o
 - [Importing from git](docs/guide/git-import.md) (Chinese): import an existing git repository with its full history
 - [Object storage](docs/guide/object-storage.md) (Chinese): SeaweedFS, MinIO and other S3-compatible services; provider detection and startup checks
 - [Clusters and landing](docs/guide/cluster.md) (Chinese): land semantics (rebase, exactly once), multi-node mode with `--advertise-url`, failover and overload protection
+- [Caching](docs/guide/cache.md) (Chinese): the regional cache `scion cache` (sharding, hedging, warm-up) and the local daemon `scn daemon`
 
 **Design and specifications** (Chinese)
 - Design docs: [server](docs/design/rust-server-architecture.md) · [client](docs/design/rust-client-architecture.md) · [starhub / CSGLite integration](docs/design/starhub-integration.md)
@@ -22,18 +23,31 @@ A server-first source control system: history, merges and rebases are computed o
 
 ## Status
 
-**M3 (high concurrency) is complete**:
-- **Server-side rebase:** a stale commit is rebased with three-way merge when it lands, and conflicts are reported with base/ours/theirs ids.
-- **Exactly-once lands:** idempotent request ids, plus one landing per change id per ref.
-- **LandCoordinator:** lands to the same ref are batched.
-- **Multi-node clusters:** per-ref leader leases and forwarding.
-- **Overload protection:** load shedding and per-repo write rate limits.
+**M4 (cache layer) is complete**:
+- **Regional cache `scion cache` (L2):**
+  - storage: foyer memory plus NVMe;
+  - rendezvous sharding across nodes, so the region fetches each object from the server once;
+  - single-flight coalescing, plus hedged reads and circuit breakers toward the servers;
+  - warm-up from WatchRefs that only walks changed trees.
+- **Local daemon `scn daemon` (L1):**
+  - a verified on-disk object cache;
+  - all other RPCs forwarded transparently;
+  - prefetch of refs the working copy follows;
+  - started on demand by `scn`.
+- **WatchRefs:** streams ref changes to subscribers (snapshot first, then each advance), resumable after disconnects.
+- **Server read path:**
+  - in-process object cache;
+  - coalesced, concurrency-limited backend reads;
+  - `--read-endpoint` advertises caches to clients.
 
-One ref sustains 885 lands/s on PostgreSQL (p99 379 ms). Linearizability tests cover concurrent lands and killing the leader mid-run.
+The cache serves 99.5% of reads without the server and 1.61M objects/s per node; see [Performance](#performance).
 
-Earlier milestones: M2 added history queries (log / blame / diff / merge-base, p99 under 20 ms on 100k commits). M1 added the write path, Lite mode, the `scn` working copy and git import.
+Earlier milestones:
+- M3 added server-side rebase, exactly-once lands, batched landing (885 lands/s on one ref), clusters and overload protection.
+- M2 added history queries (p99 under 20 ms on 100k commits).
+- M1 added the write path, Lite mode, the `scn` working copy and git import.
 
-Next is M4: the cache layer.
+Next is M5: production hardening (YugabyteDB, ACL / OIDC, redaction, OpenTelemetry, Helm).
 
 ## Performance
 
@@ -44,6 +58,7 @@ Benchmarks run on one machine (Apple M5, 10 cores) with objects in memory; clien
 | Cache hit rate ([`server/cache/tests/bench.rs`](server/cache/tests/bench.rs)) | 200 clients check out the same 20,000 objects (1–4 KiB) from a cold cache | 99.5% of reads served without L3; each object fetched from L3 exactly once | ≥ 99% |
 | Cache throughput (same) | 64 clients, warm cache, batches of 64 objects over gRPC | 1.61M objects/s per node | ≥ 200k/s |
 | Cache throughput (same) | 64 clients, warm cache, one object per request | 166k requests/s per node | — |
+| Checkout ([`client/daemon/tests/bench.rs`](client/daemon/tests/bench.rs)) | `scn clone` of 100,000 files in 1,000 directories | Through a warm daemon 5.4 s; creating the same files without any network takes 5.5 s on this disk, so the daemon adds no measurable overhead | < 5 s, disk permitting |
 | Landing ([`server/land/tests/bench.rs`](server/land/tests/bench.rs)) | 2,000 lands on one ref from 200 concurrent clients | PostgreSQL 885/s (p99 379 ms); SQLite 1,921/s (p99 173 ms) | ≥ 200/s, p99 < 500 ms |
 | History queries ([`server/query/tests/bench.rs`](server/query/tests/bench.rs)) | 100,000 commits: log, diff, ancestry, merge-base, blame | p99 < 20 ms on SQLite and PostgreSQL (cold blame 13.6 ms, `log --path` 15.6 ms) | p99 < 100 ms |
 
@@ -75,6 +90,13 @@ scn diff                            # uncommitted local changes (unified diff)
 scn diff main                       # what the tip of main changed; `scn diff A B` compares two revisions
 scn blame src/lib.rs                # the commit that last changed each line
 
+# scn talks to the server through a local daemon (scn daemon), started on demand; SCION_NO_DAEMON=1 opts out
+scn daemon status
+
+# A regional cache in front of one or more servers; advertise it with scion server --read-endpoint
+# (see docs/guide/cache.md)
+cargo run -p scion -- cache --upstream http://127.0.0.1:7080 --listen 127.0.0.1:7090 --warm mono:main
+
 # Import an existing git repository with its history, authors and timestamps
 # (see docs/guide/git-import.md)
 scn import git ~/src/my-repo --repo mono
@@ -93,6 +115,7 @@ testdata/vectors/    golden test vectors every implementation must pass
 common/              shared by server and client (may depend only on common)
   protocol/          scion-proto       Rust code generated from the protos
   object/            scion-object      ObjectId, canonical encoding, Tree / Changeset (pure, no IO)
+  flight/            scion-flight      single-flight request coalescing (server caches and the daemon)
 
 server/              server side (may depend on common and lower server crates)
   store/             scion-store       MetaStore / BlobStore traits, in-memory backend, conformance suite
@@ -102,12 +125,14 @@ server/              server side (may depend on common and lower server crates)
   merge/             scion-merge       server-side rebase: replay a delta onto a newer tree with three-way merge
   land/              scion-land        changeset creation, stack rebase, LandCoordinator, leases
   query/             scion-query       history queries (log / diff / blame / merge-base) and reindexing
+  cache/             scion-cache       regional object cache (scion cache): foyer, rendezvous, hedging, warm-up
   api/               scion-api         gRPC services and server bootstrap
-  scion/             scion             server binary (scion server --lite / --meta / --blobs)
+  scion/             scion             server binary (scion server / scion cache / scion admin)
 
 client/              client side (may depend on common and client, never on server)
   sdk/               scion-client      Rust SDK
   wc/                scion-wc          working copy (clone / status / commit / land / sync)
+  daemon/            scion-daemon      local L1 cache (scn daemon): object cache, transparent forwarding, prefetch
   gitimport/         scion-gitimport   git history import
   cli/               scion-cli         the scn binary
 

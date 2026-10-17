@@ -624,6 +624,15 @@ SDK、工作副本、daemon 和 CLI 的完整设计见 [`rust-client-architectur
 > - **验收**：`server/land/tests/bench.rs`（2000 个请求、200 个并发客户端、同一个 ref、对象在内存）：PostgreSQL 885 次/秒（p99 379 ms），SQLite 1921 次/秒（p99 173 ms）。`server/land/tests/lincheck.rs` 检查不重复、不丢失、不凭空出现和实时顺序，覆盖单节点并发冲突、两节点转发、合入进行中杀掉 leader（SQLite 元数据，客户端用同一个 request id 重试）。
 > - **推迟**：冷 ref 不启用 leader 的自动判定（目前所有 ref 都走批处理任务，空闲退出）；按租户限流与 deadline 传递在 M5 与认证一起做。
 | **M4 缓存层** | 3 周 | `scion cache`(foyer + rendezvous + singleflight + 对冲)、WatchRefs、预热 | L2 命中率不低于 99%；单节点 20 万对象读/秒以上 |
+> **M4 实现说明**（2026-10-17）：
+> - **WatchRefs**（`RefService.WatchRefs`）：先发快照，之后每次前进发送新状态；只保证送达每个 ref 的最新状态，断开后带上 `known_versions` 重新订阅即可续上。本节点合入后立即推送；集群中其它节点的合入由按仓库的轮询发现（只轮询有订阅者的仓库，`--ref-poll-interval`，默认 1 秒），未使用 NATS。停机时主动结束订阅流，避免优雅停机被长连接挡住。
+> - **`scion cache`**（`server/cache`）：foyer 混合缓存（内存层淘汰写入磁盘层），rendezvous 哈希分片（BLAKE3 打分，节点之间只转发一跳，负责节点不可达时自己回源），single-flight 放在新的共用 crate `common/flight`（领取与完成分开，一批未命中合成一次回源请求）。上游池：p95 对冲、按上游熔断（连续 5 次失败冷却 5 秒）、业务错误不换上游、回源结果逐个校验哈希。预热订阅上游的 WatchRefs，只沿变化的子树下钻。命中时不做仓库鉴权（对象 id 即凭据，§9）。
+> - **L3 读路径**（§7.3）：`CachedBlobs` 包在 BlobStore 外，小对象（≤1 MiB）进按字节计权的 moka 缓存，同一对象的并发读只读一次后端，后端并发上限 256。`--read-endpoint URL@REGION` 在 ServerInfo 中推荐缓存。
+> - **`scn daemon`**（`client/daemon`）：Unix socket（0600）。`GetObjects` 由本地 CAS（磁盘文件 + 内存层，读取校验哈希，按修改时间回收）应答，未命中按调用者身份经 SDK 回源（会使用服务端推荐的区域缓存）；`RefService` 转发并在 `ResolveRef` 时登记预取；其余 RPC 在 HTTP/2 层原样转发（axum fallback），daemon 不需要理解它们。SDK 经 daemon 时每个请求带 `x-scion-upstream`，一个 daemon 可服务多个服务端。`scn` 默认经 daemon，按需拉起，失败时直连，`SCION_NO_DAEMON=1` 关闭。
+> - **SDK**：`get_objects` 批量读取（工作副本的检出与同步改用它，检出时 8 批并发下载、后台线程写文件）；按区域选择只读端点，连接时不可达则直连服务端。
+> - **修复**：WriteService 的请求大小上限原先等于上传分块（约 1.1 MB），10 万个改动的 `CreateChangeset` 会被拒绝；现在按 `max_changes_per_changeset` 留足空间（每条 256 字节，最多 256 MiB）。
+> - **验收**：`server/cache/tests/bench.rs`（Apple M5、对象在内存、客户端与缓存同机）：200 个客户端冷启动检出同一组 2 万个对象，命中率 99.5%（理论上限），每个对象只回源一次；热缓存单节点每秒 161 万个对象（gRPC，每批 64 个），每次 1 个对象时每秒 16.6 万次请求。`client/daemon/tests/bench.rs`：10 万个文件经热 daemon 检出 5.4 秒，与本机直接创建这些文件的 5.5 秒相同（客户端目标 5 秒受本机文件系统限制，多线程创建文件反而更慢）。
+> - **推迟**：缓存层的敏感前缀隔离与 L2 的 token 校验随 M5 的 ACL 一起做；daemon 的 `/metrics` 与 systemd / launchd 托管放到 M5；`GetTrees` 递归 RPC 未实现（预热与检出用按层批量的 `GetObjects`）。
 | **M5 生产化** | 4 周 | YugabyteDB 档与 `migrate-meta` 工具、ACL/OIDC/JWT、redaction、OTel、Helm、混沌测试、多区域 follower read、`conformance` 发布 | 全部 SLO 达标；单 AZ 故障演练通过 |
 
 ---
