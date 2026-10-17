@@ -1,0 +1,31 @@
+[package]
+name = "scion-auth"
+description = "Scion authentication and authorization: JWT / opaque tokens, external issuers (JWKS), OIDC device flow, ACL policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+base64 = "0.22"
+hex.workspace = true
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
+moka = { workspace = true, features = ["future"] }
+p256 = { version = "0.13", features = ["pem", "pkcs8"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+reqwest = { workspace = true, features = ["json", "form"] }
+scion-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+thiserror.workspace = true
+tokio.workspace = true
+toml = "0.9"
+tracing.workspace = true
+
+[dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "json", "form"] }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

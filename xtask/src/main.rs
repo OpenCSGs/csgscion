@@ -35,7 +35,7 @@ fn area_of(rel_dir: &Path) -> Option<Area> {
 fn server_rank(name: &str) -> Option<u32> {
     Some(match name {
         "scion-store" => 1,
-        "scion-store-sql" | "scion-store-blob" | "scion-cache" => 2,
+        "scion-store-sql" | "scion-store-blob" | "scion-cache" | "scion-auth" => 2,
         "scion-tree" => 3,
         "scion-merge" | "scion-derive" | "scion-query" => 4,
         "scion-land" => 5,
