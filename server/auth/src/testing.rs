@@ -23,8 +23,9 @@ struct Shared {
     calls: HashMap<String, usize>,
 }
 
+/// 测试用的身份提供方。
 #[derive(Clone)]
-pub(crate) struct FakeIdp {
+pub struct FakeIdp {
     shared: Arc<Mutex<Shared>>,
 }
 
@@ -94,7 +95,10 @@ async fn token(State(st): State<St>, uri: Uri, Form(form): Form<HashMap<String, 
     if !approved {
         return error("authorization_pending");
     }
-    let now = crate::external::tests::now();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     let claims = json!({
         "iss": b, "aud": "scn", "sub": "u-123", "preferred_username": "alice",
         "groups": ["eng"], "iat": now, "exp": now + 300,
@@ -146,7 +150,7 @@ async fn authz(State(st): State<St>, uri: Uri, headers: HeaderMap, Json(body): J
 }
 
 impl FakeIdp {
-    pub(crate) async fn start() -> Self {
+    pub async fn start() -> Self {
         let pem = generate_signing_key();
         let issuer = Issuer::from_pem(&pem, "fake", 60).expect("key");
         let jwk = issuer.jwk().clone();
@@ -182,29 +186,29 @@ impl FakeIdp {
         Self { shared }
     }
 
-    pub(crate) fn base(&self) -> String {
+    pub fn base(&self) -> String {
         base(&self.shared)
     }
 
-    pub(crate) fn url(&self, path: &str) -> String {
+    pub fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base())
     }
 
-    pub(crate) fn calls(&self, path: &str) -> usize {
+    pub fn calls(&self, path: &str) -> usize {
         self.shared
             .lock()
             .map(|s| s.calls.get(path).copied().unwrap_or(0))
             .unwrap_or(0)
     }
 
-    pub(crate) fn approve(&self, device_code: &str) {
+    pub fn approve(&self, device_code: &str) {
         if let Ok(mut s) = self.shared.lock() {
             s.approved.insert(device_code.to_owned());
         }
     }
 
     /// 签一个本 IdP 的令牌（JWKS 里的密钥）。
-    pub(crate) fn sign(&self, claims: &Value) -> String {
+    pub fn sign(&self, claims: &Value) -> String {
         let (pem, kid) = self
             .shared
             .lock()

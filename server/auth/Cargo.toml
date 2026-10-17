@@ -6,7 +6,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# 对外提供测试用的身份提供方（OIDC / JWKS / 内省 / OPA），供其它 crate 的测试使用
+testing = ["dep:axum"]
+
 [dependencies]
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "json", "form"], optional = true }
 base64 = "0.22"
 hex.workspace = true
 jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use bytes::Bytes;
-use scion_client::{Auth, Client, EntryMode};
+use scion_client::{Client, EntryMode};
 use scion_wc::{Status, SyncOutcome, WorkingCopy};
 use serde::Serialize;
 
@@ -27,6 +27,11 @@ impl Ctx {
         WorkingCopy::open(&self.cwd).ok()
     }
 
+    /// 服务端地址：命令行或环境变量 > 当前工作副本记录 > 默认值。
+    pub fn endpoint_or_default(&self) -> String {
+        self.endpoint_or(self.working_copy().as_ref())
+    }
+
     /// 服务端地址：命令行或环境变量 > 工作副本记录 > 默认值。
     fn endpoint_or(&self, wc: Option<&WorkingCopy>) -> String {
         self.endpoint
@@ -40,7 +45,7 @@ impl Ctx {
 pub async fn connect(endpoint: &str, repo: Option<&str>) -> Result<Client, CliError> {
     let mut b = Client::builder()
         .endpoint(endpoint)
-        .auth(Auth::from_env())
+        .auth(crate::login::auth_for(endpoint, |k| std::env::var(k).ok()))
         .client_name("scn")
         .connect_timeout(Duration::from_secs(5));
     if let Some(r) = repo {

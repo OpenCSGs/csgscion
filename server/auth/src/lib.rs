@@ -8,8 +8,8 @@ pub mod policy;
 pub mod remote;
 pub mod token;
 
-#[cfg(test)]
-mod testing;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 pub use config::AuthConfig;
 pub use guard::{AuthError, Guard, GuardConfig, POLICY_KEY};

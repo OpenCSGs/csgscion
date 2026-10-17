@@ -433,3 +433,134 @@ async fn daemon_is_started_on_demand_and_can_be_stopped() {
     let out = run(&["daemon", "stop"]);
     assert!(String::from_utf8_lossy(&out.stdout).contains("not running"));
 }
+
+/// 要求认证的服务端（可选 OIDC 登录）：返回地址与用来创建令牌的 Guard。
+async fn auth_server(oidc_issuer: Option<String>) -> (String, Arc<scion_api::scion_auth::Guard>) {
+    use scion_api::scion_auth::{AuthConfig, Guard, GuardConfig};
+    let store = Arc::new(MemStore::new());
+    scion_store::MetaStore::create_repo(store.as_ref(), "mono")
+        .await
+        .expect("repo");
+    let toml = oidc_issuer
+        .map(|i| format!("[oidc]\nissuer = \"{i}\"\nclient_id = \"scn\"\nsubject_claim = \"preferred_username\"\n"))
+        .unwrap_or_default();
+    let auth = GuardConfig {
+        required: true,
+        auth: AuthConfig::parse(&toml).expect("auth"),
+        signing_key_pem: Some(scion_api::scion_auth::token::generate_signing_key()),
+    };
+    let guard = Guard::build(auth.clone(), store.clone(), Arc::new(|_: &str| None)).expect("guard");
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("addr"));
+    let app = App {
+        config: Arc::new(ServerConfig {
+            auth,
+            ..ServerConfig::default()
+        }),
+        meta: store.clone(),
+        blobs: store,
+    };
+    tokio::spawn(serve(listener, app, std::future::pending()));
+    (url, guard)
+}
+
+fn scn_auth(url: &str, creds: &std::path::Path, args: &[&str], stdin: Option<&str>) -> std::process::Output {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_scn"))
+        .args(args)
+        .env("SCION_ENDPOINT", url)
+        .env("SCION_CREDENTIALS_FILE", creds)
+        .env("SCION_NO_DAEMON", "1")
+        .env_remove("SCION_TOKEN")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    if let Some(input) = stdin {
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(input.as_bytes())
+            .expect("write");
+    }
+    drop(child.stdin.take());
+    child.wait_with_output().expect("wait")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn login_with_token_whoami_and_logout() {
+    let (url, guard) = auth_server(None).await;
+    let (pat, _) = guard
+        .create_token("pat", "ci", vec!["eng".into()], "", None)
+        .await
+        .expect("pat");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let creds = dir.path().join("credentials.json");
+    let run = |args: &[&str], stdin: Option<&str>| {
+        let (url, creds) = (url.clone(), creds.clone());
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let stdin = stdin.map(str::to_owned);
+        std::thread::spawn(move || {
+            let a: Vec<&str> = args.iter().map(String::as_str).collect();
+            scn_auth(&url, &creds, &a, stdin.as_deref())
+        })
+        .join()
+        .expect("thread")
+    };
+    let out = run(&["whoami", "--json"], None);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(
+        (v["subject"].as_str(), v["auth_required"].as_bool()),
+        (Some("anonymous"), Some(true))
+    );
+    // 无效令牌：认证失败，退出码 5
+    let out = run(&["login", "--token", "scn_pat_nope"], None);
+    assert_eq!(out.status.code(), Some(5), "{}", String::from_utf8_lossy(&out.stderr));
+    // 从标准输入读取令牌
+    let out = run(&["login", "--with-token", "--json"], Some(&format!("{pat}\n")));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(v["subject"], "ci");
+    let out = run(&["whoami"], None);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("ci on"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let out = run(&["logout"], None);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("logged out"));
+    let out = run(&["logout"], None);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("no saved credentials"));
+    let out = run(&["login", "--token", " "], None);
+    assert_eq!(out.status.code(), Some(2));
+    // 服务端没有配置浏览器登录
+    let out = run(&["login"], None);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--token"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn browser_login_saves_a_refresh_token() {
+    let idp = scion_api::scion_auth::testing::FakeIdp::start().await;
+    let (url, _) = auth_server(Some(idp.base())).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let creds = dir.path().join("credentials.json");
+    let (u, c) = (url.clone(), creds.clone());
+    let login = std::thread::spawn(move || scn_auth(&u, &c, &["login", "--json"], None));
+    // 用户在浏览器里完成登录
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    idp.approve("dc-1");
+    let out = login.join().expect("thread");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("ABCD-EFGH"));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(v["subject"], "alice");
+    let saved = std::fs::read_to_string(&creds).expect("saved");
+    assert!(saved.contains("scn_refresh_"));
+    let out = std::thread::spawn(move || scn_auth(&url, &creds, &["whoami", "--json"], None))
+        .join()
+        .expect("thread");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(v["subject"], "alice");
+}

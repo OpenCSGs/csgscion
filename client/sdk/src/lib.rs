@@ -19,6 +19,7 @@
 mod client;
 mod error;
 mod history;
+mod identity;
 mod info;
 mod ops;
 mod watch;
@@ -26,6 +27,7 @@ mod watch;
 pub use client::{Auth, Client, ClientBuilder, ReadEndpoints, UPSTREAM_HEADER};
 pub use error::{ConflictPath, Error, MergeConflict, Result};
 pub use history::{BlameCommitInfo, BlameInfo, FileChangeInfo, LogItem, LogPage, Revision};
+pub use identity::{DeviceLogin, DeviceLoginPoll, Identity};
 pub use info::{Limits, ProtocolVersion, ReadEndpoint, Role, ServerInfo};
 pub use ops::{
     ChangesetBuilder, CreatedChangeset, DirEntry, LAND_ATTEMPTS, Landed, LandedChangeset, Person, RefTip, Signature,

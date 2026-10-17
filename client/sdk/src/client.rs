@@ -1,5 +1,6 @@
 //! 连接、能力协商与对象读取。
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -18,8 +19,12 @@ use crate::info::ServerInfo;
 pub enum Auth {
     #[default]
     None,
-    /// `authorization: Bearer <token>`。
+    /// 直接作为 `authorization: Bearer <token>` 发送。
     Bearer(String),
+    /// 长期凭据（PAT、`scn login` 得到的刷新令牌、受信任签发方的 JWT）：连接时用它向服务端换取短期
+    /// 访问令牌（`AuthService.ExchangeToken`），并在过期前 2 分钟自动重新换取。服务端不签发访问令牌时
+    /// 直接把凭据作为 Bearer 发送。
+    Exchange(String),
 }
 
 impl std::fmt::Debug for Auth {
@@ -27,8 +32,108 @@ impl std::fmt::Debug for Auth {
         match self {
             Auth::None => f.write_str("Auth::None"),
             Auth::Bearer(_) => f.write_str("Auth::Bearer(<redacted>)"),
+            Auth::Exchange(_) => f.write_str("Auth::Exchange(<redacted>)"),
         }
     }
+}
+
+/// 换取得到的访问令牌，后台任务在过期前刷新。
+struct Session {
+    credential: String,
+    token: std::sync::RwLock<String>,
+    expires_at_ms: std::sync::atomic::AtomicI64,
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
+}
+
+impl Session {
+    fn current(&self) -> String {
+        self.token.read().map(|t| t.clone()).unwrap_or_default()
+    }
+
+    fn set(&self, token: String, expires_at_ms: i64) {
+        if let Ok(mut t) = self.token.write() {
+            *t = token;
+        }
+        self.expires_at_ms
+            .store(expires_at_ms, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// 提前多久刷新访问令牌。
+const REFRESH_AHEAD: Duration = Duration::from_secs(120);
+
+/// 用凭据换取访问令牌。服务端不支持（旧版本或没有签名密钥）时返回 `None`。
+async fn exchange(
+    channel: &Channel,
+    upstream: Option<&MetadataValue<tonic::metadata::Ascii>>,
+    credential: &str,
+) -> Result<Option<(String, i64)>> {
+    let req = scion_proto::v1::ExchangeTokenRequest {
+        subject_token: credential.to_owned(),
+    };
+    match scion_proto::v1::auth_service_client::AuthServiceClient::new(channel.clone())
+        .exchange_token(make_request(None, upstream, req)?)
+        .await
+    {
+        Ok(r) => {
+            let r = r.into_inner();
+            Ok(Some((r.access_token, r.expires_at_ms)))
+        }
+        Err(s) if matches!(s.code(), tonic::Code::Unimplemented | tonic::Code::Unavailable) => Ok(None),
+        Err(s) => Err(s.into()),
+    }
+}
+
+/// 在访问令牌过期前重新换取；所有 [`Client`] 都释放后结束。
+fn spawn_refresh(
+    session: std::sync::Weak<Session>,
+    channel: Channel,
+    upstream: Option<MetadataValue<tonic::metadata::Ascii>>,
+) {
+    tokio::spawn(async move {
+        let mut retry = Duration::from_secs(5);
+        loop {
+            let wait = match session.upgrade() {
+                Some(s) => {
+                    let left = s.expires_at_ms.load(std::sync::atomic::Ordering::Relaxed) - now_ms();
+                    Duration::from_millis(u64::try_from(left).unwrap_or(0))
+                        .saturating_sub(REFRESH_AHEAD)
+                        .max(Duration::from_secs(1))
+                }
+                None => return,
+            };
+            tokio::time::sleep(wait).await;
+            let Some(s) = session.upgrade() else {
+                return;
+            };
+            match exchange(&channel, upstream.as_ref(), &s.credential).await {
+                Ok(Some((token, exp))) => {
+                    s.set(token, exp);
+                    retry = Duration::from_secs(5);
+                }
+                Ok(None) => return,
+                Err(_) => {
+                    drop(s);
+                    tokio::time::sleep(retry).await;
+                    retry = (retry * 2).min(Duration::from_secs(60));
+                }
+            }
+        }
+    });
 }
 
 impl Auth {
@@ -39,7 +144,7 @@ impl Auth {
 
     fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
         match lookup("SCION_TOKEN") {
-            Some(t) if !t.trim().is_empty() => Auth::Bearer(t.trim().to_string()),
+            Some(t) if !t.trim().is_empty() => Auth::Exchange(t.trim().to_string()),
             _ => Auth::None,
         }
     }
@@ -170,8 +275,22 @@ impl ClientBuilder {
                 None,
             ),
         };
-        let auth = self.auth.clone();
-        let info = fetch_info(&channel, &auth, upstream.as_ref(), &self.client_name).await?;
+        let info = fetch_info(&channel, None, upstream.as_ref(), &self.client_name).await?;
+        let session = match &self.auth {
+            Auth::Exchange(credential) => match exchange(&channel, upstream.as_ref(), credential).await? {
+                Some((token, exp)) => {
+                    let s = Arc::new(Session {
+                        credential: credential.clone(),
+                        token: std::sync::RwLock::new(token),
+                        expires_at_ms: std::sync::atomic::AtomicI64::new(exp),
+                    });
+                    spawn_refresh(Arc::downgrade(&s), channel.clone(), upstream.clone());
+                    Some(s)
+                }
+                None => None,
+            },
+            _ => None,
+        };
         // 经 daemon 时由 daemon 决定从哪里读对象
         let (objects, objects_endpoint) = match (&upstream, pick_read_endpoint(&info, &self.read_endpoints)) {
             (None, Some(read)) => match self.read_channel(&read).await {
@@ -186,6 +305,7 @@ impl ClientBuilder {
             objects_endpoint,
             upstream,
             auth: self.auth,
+            session,
             repo: self.repo,
             info,
         })
@@ -199,14 +319,14 @@ impl ClientBuilder {
         };
         let (_, ep) = builder.endpoint_config().ok()?;
         let ch = ep.connect().await.ok()?;
-        fetch_info(&ch, &self.auth, None, &self.client_name).await.ok()?;
+        fetch_info(&ch, None, None, &self.client_name).await.ok()?;
         Some(ch)
     }
 }
 
 async fn fetch_info(
     channel: &Channel,
-    auth: &Auth,
+    bearer: Option<&str>,
     upstream: Option<&MetadataValue<tonic::metadata::Ascii>>,
     client_name: &str,
 ) -> Result<ServerInfo> {
@@ -216,7 +336,7 @@ async fn fetch_info(
         protocol_version: scion_proto::PROTOCOL_VERSION.to_string(),
     };
     let resp = ServerInfoServiceClient::new(channel.clone())
-        .get_server_info(make_request(auth, upstream, req)?)
+        .get_server_info(make_request(bearer, upstream, req)?)
         .await?
         .into_inner();
     let info = resp
@@ -270,7 +390,7 @@ async fn connect_daemon(path: &std::path::Path, _timeout: Duration) -> Result<Ch
 
 /// 构造请求并附加认证头（经 daemon 时还附加服务端地址）。
 fn make_request<T>(
-    auth: &Auth,
+    bearer: Option<&str>,
     upstream: Option<&MetadataValue<tonic::metadata::Ascii>>,
     msg: T,
 ) -> Result<tonic::Request<T>> {
@@ -278,7 +398,7 @@ fn make_request<T>(
     if let Some(u) = upstream {
         req.metadata_mut().insert(UPSTREAM_HEADER, u.clone());
     }
-    if let Auth::Bearer(token) = auth {
+    if let Some(token) = bearer {
         let v = MetadataValue::try_from(format!("Bearer {token}"))
             .map_err(|_| Error::Protocol("token contains invalid header characters".into()))?;
         req.metadata_mut().insert("authorization", v);
@@ -302,6 +422,8 @@ fn source_chain(e: &dyn std::error::Error) -> String {
 #[derive(Debug, Clone)]
 pub struct Client {
     pub(crate) channel: Channel,
+    /// 换取得到的访问令牌（[`Auth::Exchange`]）。
+    session: Option<Arc<Session>>,
     /// 读取对象用的连接：只读端点（区域缓存）或与 `channel` 相同。
     objects: Channel,
     objects_endpoint: String,
@@ -331,6 +453,7 @@ impl Client {
             ..Default::default()
         };
         Self {
+            session: None,
             objects: channel.clone(),
             objects_endpoint: "test".into(),
             upstream: None,
@@ -355,7 +478,12 @@ impl Client {
     }
 
     pub(crate) fn request<T>(&self, msg: T) -> Result<tonic::Request<T>> {
-        make_request(&self.auth, self.upstream.as_ref(), msg)
+        let bearer = match (&self.session, &self.auth) {
+            (Some(s), _) => Some(s.current()),
+            (None, Auth::Bearer(t) | Auth::Exchange(t)) => Some(t.clone()),
+            (None, Auth::None) => None,
+        };
+        make_request(bearer.as_deref(), self.upstream.as_ref(), msg)
     }
 
     /// 同一连接、换一个默认仓库（克隆开销很小）。
@@ -368,7 +496,18 @@ impl Client {
 
     /// 同一连接、换一个身份（例如 daemon 按每个请求的调用者转发）。
     pub fn with_auth(&self, auth: Auth) -> Client {
-        Client { auth, ..self.clone() }
+        Client {
+            auth,
+            session: None,
+            ..self.clone()
+        }
+    }
+
+    /// 当前使用的访问令牌的过期时间（Unix 毫秒）；没有换取令牌时为 `None`。
+    pub fn token_expires_at_ms(&self) -> Option<i64> {
+        self.session
+            .as_ref()
+            .map(|s| s.expires_at_ms.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// 读取对象的地址：服务端推荐的只读端点，或服务端本身。
@@ -533,7 +672,7 @@ mod tests {
         assert_eq!(Auth::from_lookup(|_| Some("  ".into())), Auth::None);
         assert_eq!(
             Auth::from_lookup(|_| Some(" t0k \n".into())),
-            Auth::Bearer("t0k".into())
+            Auth::Exchange("t0k".into())
         );
     }
 
@@ -544,6 +683,10 @@ mod tests {
             "Auth::Bearer(<redacted>)"
         );
         assert_eq!(format!("{:?}", Auth::None), "Auth::None");
+        assert_eq!(
+            format!("{:?}", Auth::Exchange("s".into())),
+            "Auth::Exchange(<redacted>)"
+        );
     }
 
     #[test]
@@ -590,20 +733,20 @@ mod tests {
 
     #[test]
     fn make_request_sets_bearer_header() {
-        let req = make_request(&Auth::Bearer("abc".into()), None, ()).expect("ok");
+        let req = make_request(Some("abc"), None, ()).expect("ok");
         assert_eq!(
             req.metadata().get("authorization").map(|v| v.to_str().ok()),
             Some(Some("Bearer abc"))
         );
         let up = MetadataValue::from_static("http://server:7080");
-        let req = make_request(&Auth::None, Some(&up), ()).expect("ok");
+        let req = make_request(None, Some(&up), ()).expect("ok");
         assert!(req.metadata().get("authorization").is_none());
         assert_eq!(
             req.metadata().get(UPSTREAM_HEADER).map(|v| v.to_str().ok()),
             Some(Some("http://server:7080"))
         );
         assert!(matches!(
-            make_request(&Auth::Bearer("bad\ntoken".into()), None, ()),
+            make_request(Some("bad\ntoken"), None, ()),
             Err(Error::Protocol(_))
         ));
     }
