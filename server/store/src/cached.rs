@@ -11,7 +11,7 @@ use moka::sync::Cache;
 use scion_object::ObjectId;
 
 use crate::{
-    ChangesetRecord, IdempotencyRecord, IndexedObject, LandedChange, MetaStore, PathChange, PathHistoryEntry,
+    ChangesetRecord, IdempotencyRecord, IndexedObject, LandedChange, Lease, MetaStore, PathChange, PathHistoryEntry,
     RefExpect, RefState, Result,
 };
 
@@ -104,6 +104,14 @@ impl MetaStore for CachedMeta {
 
     async fn expire_idempotency(&self, before_ms: i64) -> Result<u64> {
         self.inner.expire_idempotency(before_ms).await
+    }
+
+    async fn acquire_lease(&self, scope: &str, holder: &str, ttl_ms: i64, now_ms: i64) -> Result<Lease> {
+        self.inner.acquire_lease(scope, holder, ttl_ms, now_ms).await
+    }
+
+    async fn release_lease(&self, scope: &str, holder: &str) -> Result<()> {
+        self.inner.release_lease(scope, holder).await
     }
 
     async fn index_objects(&self, repo: &str, objects: &[IndexedObject]) -> Result<()> {
@@ -243,6 +251,11 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_leases() {
+        testsuite::leases(&cached()).await;
+    }
+
+    #[tokio::test]
     async fn conformance_batch_writes() {
         testsuite::batch_writes(&cached()).await;
     }
@@ -306,6 +319,14 @@ mod tests {
 
         async fn expire_idempotency(&self, before_ms: i64) -> Result<u64> {
             self.inner.expire_idempotency(before_ms).await
+        }
+
+        async fn acquire_lease(&self, scope: &str, holder: &str, ttl_ms: i64, now_ms: i64) -> Result<Lease> {
+            self.inner.acquire_lease(scope, holder, ttl_ms, now_ms).await
+        }
+
+        async fn release_lease(&self, scope: &str, holder: &str) -> Result<()> {
+            self.inner.release_lease(scope, holder).await
         }
         async fn index_objects(&self, repo: &str, objects: &[IndexedObject]) -> Result<()> {
             self.inner.index_objects(repo, objects).await

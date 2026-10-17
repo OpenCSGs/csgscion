@@ -183,6 +183,12 @@ pub fn from_land(err: scion_land::LandError) -> Status {
         E::RequestIdReused(id) => {
             Status::invalid_argument(format!("request_id {id:?} was already used for a different request"))
         }
+        E::NotLeader { leader } => with_reason(
+            Code::Unavailable,
+            ErrorReason::LandContention,
+            "the land leader for this ref moved; retry",
+            HashMap::from([("leader".to_string(), leader)]),
+        ),
         E::Overloaded => with_reason(
             Code::ResourceExhausted,
             ErrorReason::RateLimited,
@@ -379,6 +385,13 @@ mod tests {
             assert_eq!(from_land(e).code(), Code::FailedPrecondition);
         }
         assert_eq!(from_land(E::RequestIdReused("r".into())).code(), Code::InvalidArgument);
+        let s = from_land(E::NotLeader {
+            leader: "http://n2".into(),
+        });
+        assert_eq!(
+            (s.code(), info(&s).2["leader"].as_str()),
+            (Code::Unavailable, "http://n2")
+        );
         let s = from_land(E::Overloaded);
         assert_eq!(
             (s.code(), info(&s).0.as_str()),

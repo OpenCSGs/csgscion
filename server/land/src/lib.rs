@@ -13,7 +13,7 @@ mod pending;
 mod record;
 mod stack;
 
-pub use coordinator::{Coordinator, CoordinatorConfig};
+pub use coordinator::{ClusterConfig, Coordinator, CoordinatorConfig};
 pub use create::{Built, ChangesetWriter};
 pub use land::{LandOutcome, LandRequest, Lander};
 pub use stack::{Landed, Prepared, StackOptions, prepare};
@@ -57,6 +57,9 @@ pub enum LandError {
     /// 同一个 request id 被用于参数不同的请求。
     #[error("request id {0:?} was already used for a different land request")]
     RequestIdReused(String),
+    /// 集群模式下这个 ref 由另一个节点（`leader`，即它的地址）处理，请求应转给它。
+    #[error("ref is handled by {leader}")]
+    NotLeader { leader: String },
     /// 合入队列已满（过载保护），稍后重试。
     #[error("land queue for the ref is full")]
     Overloaded,

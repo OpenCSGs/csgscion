@@ -1,24 +1,71 @@
 //! LandService：把 ref 移到指定提交，落后时在服务端 rebase（实现在 `scion-land`）。
+//!
+//! 集群模式下每个 ref 由持有租约的节点（leader）处理：本节点不是 leader 时把请求原样转给它，
+//! 转发的请求带上 [`FORWARDED_HEADER`]，收到的节点不会再转发（避免环路），而是返回可重试的错误。
+
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 use bytes::Bytes;
 use scion_land::{Coordinator, LandError, LandOutcome, LandRequest as Request_, Landed};
 use scion_object::ObjectId;
+use scion_proto::v1::land_service_client::LandServiceClient;
 use scion_proto::v1::land_service_server::LandService;
 use scion_proto::v1::{
     GetLandStatusRequest, GetLandStatusResponse, LandRequest, LandResponse, LandState, LandedChangeset,
 };
+use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
 
 use crate::service::support::{check_repo, parse_id};
 use crate::status;
 
+/// 节点间转发的请求带上的元数据。
+pub const FORWARDED_HEADER: &str = "x-scion-forwarded";
+
 pub struct LandSvc {
     coordinator: Coordinator,
+    /// 到其它节点的连接（按地址缓存）。
+    peers: Mutex<HashMap<String, Channel>>,
 }
 
 impl LandSvc {
     pub fn new(coordinator: Coordinator) -> Self {
-        Self { coordinator }
+        Self {
+            coordinator,
+            peers: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn peer(&self, addr: &str) -> Result<Channel, Status> {
+        let mut peers = self.peers.lock().map_err(|_| Status::internal("peer cache poisoned"))?;
+        if let Some(c) = peers.get(addr) {
+            return Ok(c.clone());
+        }
+        let channel = Endpoint::from_shared(addr.to_owned())
+            .map_err(|e| Status::internal(format!("invalid peer address {addr:?}: {e}")))?
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .connect_lazy();
+        peers.insert(addr.to_owned(), channel.clone());
+        Ok(channel)
+    }
+
+    /// 把请求转给 leader，原样返回它的结果。
+    async fn forward(
+        &self,
+        leader: &str,
+        req: LandRequest,
+        auth: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
+    ) -> Result<Response<LandResponse>, Status> {
+        let mut fwd = Request::new(req);
+        fwd.metadata_mut()
+            .insert(FORWARDED_HEADER, tonic::metadata::MetadataValue::from_static("1"));
+        if let Some(a) = auth {
+            fwd.metadata_mut().insert("authorization", a);
+        }
+        tracing::debug!(leader, "forwarding land to the ref's leader");
+        let resp = LandServiceClient::new(self.peer(leader)?).land(fwd).await?;
+        Ok(Response::new(resp.into_inner()))
     }
 
     #[cfg(test)]
@@ -29,7 +76,9 @@ impl LandSvc {
         tip: ObjectId,
         fast_forward_only: bool,
     ) -> Result<LandOutcome, Status> {
-        self.land_with_id(repo, reference, tip, fast_forward_only, None).await
+        self.land_with_id(repo, reference, tip, fast_forward_only, None)
+            .await
+            .map_err(|e| to_status(reference, e))
     }
 
     async fn land_with_id(
@@ -39,7 +88,7 @@ impl LandSvc {
         tip: ObjectId,
         fast_forward_only: bool,
         request_id: Option<&str>,
-    ) -> Result<LandOutcome, Status> {
+    ) -> Result<LandOutcome, LandError> {
         self.coordinator
             .land(Request_ {
                 repo,
@@ -49,10 +98,13 @@ impl LandSvc {
                 request_id,
             })
             .await
-            .map_err(|e| match e {
-                LandError::NotFastForward { tip } => status::not_fast_forward(reference, &tip),
-                e => status::from_land(e),
-            })
+    }
+}
+
+fn to_status(reference: &str, e: LandError) -> Status {
+    match e {
+        LandError::NotFastForward { tip } => status::not_fast_forward(reference, &tip),
+        e => status::from_land(e),
     }
 }
 
@@ -82,12 +134,20 @@ fn response(out: &LandOutcome) -> LandResponse {
 #[tonic::async_trait]
 impl LandService for LandSvc {
     async fn land(&self, request: Request<LandRequest>) -> Result<Response<LandResponse>, Status> {
+        let forwarded = request.metadata().contains_key(FORWARDED_HEADER);
+        let auth = request.metadata().get("authorization").cloned();
         let req = request.into_inner();
         let cs_id = parse_id(&req.changeset_id)?;
         let request_id = Some(req.request_id.as_str()).filter(|id| !id.is_empty());
-        let out = self
+        let out = match self
             .land_with_id(&req.repo, &req.r#ref, cs_id, req.fast_forward_only, request_id)
-            .await?;
+            .await
+        {
+            Ok(out) => out,
+            // 别的节点是 leader：转给它（转发来的请求不再转发，由客户端重试）
+            Err(LandError::NotLeader { leader }) if !forwarded => return self.forward(&leader, req, auth).await,
+            Err(e) => return Err(to_status(&req.r#ref, e)),
+        };
         let rebased = out.landed.iter().filter(|l| l.original != l.landed).count();
         tracing::info!(repo = %req.repo, r#ref = %req.r#ref, tip = %out.state.target, version = out.state.version,
             landed = out.landed.len(), rebased, previously_landed = out.previously_landed.len(),

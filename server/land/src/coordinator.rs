@@ -8,6 +8,10 @@
 //! - 整批原子提交：ref、landed 行与每个请求的幂等记录在同一个事务里写入。
 //! - 条件更新失败（其它节点或外部写入移动了 ref）时重新读 ref，整批重做。
 //! - ref 空闲一段时间后任务退出，下次请求时重新创建。
+//! - 集群模式（[`ClusterConfig`]）：每个 ref 的任务持有一个租约，只有持有者处理该 ref 的合入，
+//!   其它节点得到 [`LandError::NotLeader`] 后把请求转给 leader。租约定期续约，丢失时排队中的请求
+//!   同样得到 `NotLeader`；空闲退出时释放租约。租约只用来避免多个节点争抢同一个 ref，正确性仍由
+//!   ref 的条件更新保证（版本号就是 fencing token）。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -52,6 +56,32 @@ impl Default for CoordinatorConfig {
     }
 }
 
+/// 集群模式参数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterConfig {
+    /// 本节点的地址（其它节点用它转发请求），写入租约的持有者。
+    pub node: String,
+    /// 租约有效期。
+    pub lease_ttl: Duration,
+    /// 续约间隔，应明显小于有效期。
+    pub renew_every: Duration,
+}
+
+impl ClusterConfig {
+    pub fn new(node: impl Into<String>) -> Self {
+        Self {
+            node: node.into(),
+            lease_ttl: Duration::from_secs(5),
+            renew_every: Duration::from_secs(2),
+        }
+    }
+}
+
+/// ref 的租约名。长度前缀避免仓库名和 ref 名中的分隔符造成歧义。
+fn lease_scope(repo: &str, reference: &str) -> String {
+    format!("land:{}:{repo}:{reference}", repo.len())
+}
+
 struct Job {
     reference: String,
     tip: ObjectId,
@@ -66,7 +96,66 @@ type Key = (String, String);
 struct Shared {
     writer: Arc<ChangesetWriter>,
     config: CoordinatorConfig,
+    cluster: Option<ClusterConfig>,
     queues: Mutex<HashMap<Key, mpsc::Sender<Job>>>,
+    /// 集群模式下本节点持有的租约：ref → 到期时间（毫秒）。
+    leases: Mutex<HashMap<Key, i64>>,
+}
+
+impl Shared {
+    fn lease_until(&self, key: &Key) -> Option<i64> {
+        self.leases.lock().ok().and_then(|l| l.get(key).copied())
+    }
+
+    fn set_lease(&self, key: &Key, until: Option<i64>) {
+        if let Ok(mut l) = self.leases.lock() {
+            match until {
+                Some(u) => {
+                    l.insert(key.clone(), u);
+                }
+                None => {
+                    l.remove(key);
+                }
+            }
+        }
+    }
+
+    /// 申请或续约 ref 的租约；别人持有时返回 [`LandError::NotLeader`]。
+    async fn acquire(&self, key: &Key) -> Result<()> {
+        let Some(c) = &self.cluster else { return Ok(()) };
+        let ttl = i64::try_from(c.lease_ttl.as_millis()).unwrap_or(i64::MAX);
+        let lease = self
+            .writer
+            .meta()
+            .acquire_lease(&lease_scope(&key.0, &key.1), &c.node, ttl, now_ms())
+            .await?;
+        if lease.holder == c.node {
+            self.set_lease(key, Some(lease.expires_at_ms));
+            Ok(())
+        } else {
+            self.set_lease(key, None);
+            Err(LandError::NotLeader { leader: lease.holder })
+        }
+    }
+
+    /// 租约剩余时间不足一半时续约。
+    async fn ensure_lease(&self, key: &Key) -> Result<()> {
+        let Some(c) = &self.cluster else { return Ok(()) };
+        let margin = i64::try_from(c.lease_ttl.as_millis() / 2).unwrap_or(i64::MAX);
+        match self.lease_until(key) {
+            Some(until) if now_ms() < until.saturating_sub(margin) => Ok(()),
+            _ => self.acquire(key).await,
+        }
+    }
+
+    async fn release(&self, key: &Key) {
+        let Some(c) = &self.cluster else { return };
+        self.set_lease(key, None);
+        let scope = lease_scope(&key.0, &key.1);
+        if let Err(e) = self.writer.meta().release_lease(&scope, &c.node).await {
+            tracing::warn!(error = %e, scope, "releasing land lease failed; it will expire");
+        }
+    }
 }
 
 /// 每个 (仓库, ref) 一个批处理任务。可以在多个请求之间共享（内部是 `Arc`）。
@@ -77,17 +166,36 @@ pub struct Coordinator {
 
 impl Coordinator {
     pub fn new(writer: Arc<ChangesetWriter>, config: CoordinatorConfig) -> Self {
+        Self::build(writer, config, None)
+    }
+
+    /// 集群模式：多个节点共享同一个存储，每个 ref 由持有租约的节点处理。
+    pub fn clustered(writer: Arc<ChangesetWriter>, config: CoordinatorConfig, cluster: ClusterConfig) -> Self {
+        Self::build(writer, config, Some(cluster))
+    }
+
+    fn build(writer: Arc<ChangesetWriter>, config: CoordinatorConfig, cluster: Option<ClusterConfig>) -> Self {
         Self {
             shared: Arc::new(Shared {
                 writer,
                 config,
+                cluster,
                 queues: Mutex::new(HashMap::new()),
+                leases: Mutex::new(HashMap::new()),
             }),
         }
     }
 
     pub fn writer(&self) -> &Arc<ChangesetWriter> {
         &self.shared.writer
+    }
+
+    /// 停止接收：关闭所有 ref 的队列。任务处理完手上的批后退出并释放租约（集群模式下其它节点可以
+    /// 立即接管）。之后再有请求时会重新创建任务。
+    pub fn shutdown(&self) {
+        if let Ok(mut q) = self.shared.queues.lock() {
+            q.clear();
+        }
     }
 
     /// 当前活跃的 ref 任务数。
@@ -109,6 +217,8 @@ impl Coordinator {
                 return Ok(done);
             }
         }
+        let key = (req.repo.to_owned(), req.reference.to_owned());
+        self.shared.ensure_lease(&key).await?;
         let (tx, rx) = oneshot::channel();
         let job = Job {
             reference: req.reference.to_owned(),
@@ -118,7 +228,7 @@ impl Coordinator {
             fingerprint,
             reply: tx,
         };
-        self.enqueue((req.repo.to_owned(), req.reference.to_owned()), job)?;
+        self.enqueue(key, job)?;
         rx.await
             .map_err(|_| LandError::Unavailable("land coordinator stopped".into()))?
     }
@@ -174,21 +284,42 @@ async fn replay(
 /// 一个 ref 的批处理循环。
 async fn run(shared: Arc<Shared>, key: Key, mut rx: mpsc::Receiver<Job>) {
     let cfg = shared.config;
+    // 集群模式下按续约间隔醒来续约，空闲判断按最后一次处理的时间
+    let tick = match &shared.cluster {
+        Some(c) => c.renew_every.min(cfg.idle_timeout),
+        None => cfg.idle_timeout,
+    };
+    let mut last_active = tokio::time::Instant::now();
     loop {
-        let first = match tokio::time::timeout(cfg.idle_timeout, rx.recv()).await {
+        let first = match tokio::time::timeout(tick, rx.recv()).await {
             Ok(Some(job)) => job,
-            Ok(None) => return,
+            // 队列已关闭（shutdown）
+            Ok(None) => {
+                shared.release(&key).await;
+                return;
+            }
             Err(_) => {
-                // 空闲：在持锁状态下确认没有新请求后退出，避免与 enqueue 竞争
-                let Ok(mut queues) = shared.queues.lock() else { return };
-                match rx.try_recv() {
-                    Ok(job) => {
-                        drop(queues);
-                        process(&shared, &key.0, vec![job]).await;
-                        continue;
+                if last_active.elapsed() < cfg.idle_timeout {
+                    if let Err(e) = shared.acquire(&key).await {
+                        return stop(&shared, &key, rx, e).await;
                     }
-                    Err(_) => {
-                        queues.remove(&key);
+                    continue;
+                }
+                // 空闲：在持锁状态下确认没有新请求后退出，避免与 enqueue 竞争
+                let exiting = {
+                    let Ok(mut queues) = shared.queues.lock() else { return };
+                    match rx.try_recv() {
+                        Ok(job) => Some(job),
+                        Err(_) => {
+                            queues.remove(&key);
+                            None
+                        }
+                    }
+                };
+                match exiting {
+                    Some(job) => job,
+                    None => {
+                        shared.release(&key).await;
                         return;
                     }
                 }
@@ -202,7 +333,25 @@ async fn run(shared: Arc<Shared>, key: Key, mut rx: mpsc::Receiver<Job>) {
                 Ok(None) | Err(_) => break,
             }
         }
+        if let Err(e) = shared.ensure_lease(&key).await {
+            fail_all(batch, e.clone());
+            return stop(&shared, &key, rx, e).await;
+        }
         process(&shared, &key.0, batch).await;
+        last_active = tokio::time::Instant::now();
+    }
+}
+
+/// 失去租约（或续约失败）：不再接收新请求，排队中的请求都得到同样的错误，由调用方转给新的 leader。
+async fn stop(shared: &Shared, key: &Key, mut rx: mpsc::Receiver<Job>, err: LandError) {
+    tracing::info!(repo = %key.0, reference = %key.1, error = %err, "land coordinator stepping down");
+    if let Ok(mut queues) = shared.queues.lock() {
+        queues.remove(key);
+    }
+    shared.set_lease(key, None);
+    rx.close();
+    while let Ok(job) = rx.try_recv() {
+        let _ = job.reply.send(Err(err.clone()));
     }
 }
 

@@ -58,6 +58,8 @@ pub struct ServerConfig {
     pub janitor_interval: std::time::Duration,
     /// 合入批处理参数（每个 ref 一个批处理任务）。
     pub land: scion_land::CoordinatorConfig,
+    /// 集群模式（多个节点共享存储）：每个 ref 由持有租约的节点处理，其它节点转发。`None` 为单节点。
+    pub cluster: Option<scion_land::ClusterConfig>,
 }
 
 impl Default for ServerConfig {
@@ -71,6 +73,7 @@ impl Default for ServerConfig {
             idempotency_ttl: std::time::Duration::from_secs(24 * 3600),
             janitor_interval: std::time::Duration::from_secs(600),
             land: scion_land::CoordinatorConfig::default(),
+            cluster: None,
         }
     }
 }

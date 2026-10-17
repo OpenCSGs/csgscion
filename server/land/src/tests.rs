@@ -605,6 +605,12 @@ impl MetaStore for Hooked {
     async fn expire_idempotency(&self, before: i64) -> scion_store::Result<u64> {
         self.inner.expire_idempotency(before).await
     }
+    async fn acquire_lease(&self, s: &str, h: &str, ttl: i64, now: i64) -> scion_store::Result<scion_store::Lease> {
+        self.inner.acquire_lease(s, h, ttl, now).await
+    }
+    async fn release_lease(&self, s: &str, h: &str) -> scion_store::Result<()> {
+        self.inner.release_lease(s, h).await
+    }
     async fn index_objects(&self, r: &str, o: &[IndexedObject]) -> scion_store::Result<()> {
         self.inner.index_objects(r, o).await
     }
@@ -1035,4 +1041,157 @@ async fn coordinator_tasks_exit_when_idle_and_restart() {
     assert_eq!(c.active_refs(), 0);
     let b = fx.commit(&[a], &[]).await;
     assert_eq!(c.land(req(REPO, "main", b, false)).await.expect("b").state.version, 2);
+}
+
+// ---- 集群模式 ----
+
+fn cluster(node: &str, ttl_ms: u64) -> ClusterConfig {
+    ClusterConfig {
+        node: node.into(),
+        lease_ttl: Duration::from_millis(ttl_ms),
+        renew_every: Duration::from_millis(ttl_ms / 4),
+    }
+}
+
+#[tokio::test]
+async fn clustered_nodes_split_refs_by_lease() {
+    let fx = Fx::new().await;
+    let a = Coordinator::clustered(fx.w.clone(), CoordinatorConfig::default(), cluster("http://a", 5_000));
+    let b = Coordinator::clustered(fx.w.clone(), CoordinatorConfig::default(), cluster("http://b", 5_000));
+    let base = fx.commit(&[], &[]).await;
+    a.land(req(REPO, "main", base, false)).await.expect("a leads main");
+    let x = fx.commit(&[base], &[("x", Some("x"))]).await;
+    assert_eq!(
+        b.land(req(REPO, "main", x, false)).await,
+        Err(LandError::NotLeader {
+            leader: "http://a".into()
+        })
+    );
+    b.land(req(REPO, "dev", base, false)).await.expect("b leads dev");
+    assert_eq!(
+        a.land(req(REPO, "dev", x, false)).await,
+        Err(LandError::NotLeader {
+            leader: "http://b".into()
+        })
+    );
+    // 已成功的请求在任意节点都能重放和查询
+    a.land(with_id(x, "rx")).await.expect("x via leader");
+    let replay = b.land(with_id(x, "rx")).await.expect("replay on another node");
+    assert_eq!(replay.state.version, 2);
+    assert!(b.status(REPO, "rx").await.expect("status").is_some());
+}
+
+#[tokio::test]
+async fn idle_leader_releases_lease_for_others() {
+    let fx = Fx::new().await;
+    let idle = CoordinatorConfig {
+        idle_timeout: Duration::from_millis(40),
+        ..CoordinatorConfig::default()
+    };
+    let a = Coordinator::clustered(fx.w.clone(), idle, cluster("http://a", 5_000));
+    let b = Coordinator::clustered(fx.w.clone(), idle, cluster("http://b", 5_000));
+    let base = fx.commit(&[], &[]).await;
+    a.land(req(REPO, "main", base, false)).await.expect("a");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(a.active_refs(), 0);
+    let x = fx.commit(&[base], &[("x", Some("x"))]).await;
+    b.land(req(REPO, "main", x, false)).await.expect("b takes over at once");
+}
+
+/// leader 进程被杀（租约没有释放）：租约到期前其它节点被告知 leader，到期后接管；
+/// 客户端用同一个 request id 重试，已提交的结果被重放，不会重复合入。
+#[test]
+fn crashed_leader_is_replaced_after_lease_expiry() {
+    let main_rt = tokio::runtime::Runtime::new().expect("runtime");
+    let fx = main_rt.block_on(Fx::new());
+    let (base, x) = main_rt.block_on(async {
+        let base = fx.commit(&[], &[]).await;
+        let x = fx.commit(&[base], &[("x", Some("x"))]).await;
+        (base, x)
+    });
+    let ttl = 300;
+    let leader_rt = tokio::runtime::Runtime::new().expect("runtime");
+    let a = Coordinator::clustered(fx.w.clone(), CoordinatorConfig::default(), cluster("http://a", ttl));
+    let first = leader_rt
+        .block_on(async {
+            a.land(req(REPO, "main", base, false)).await?;
+            a.land(with_id(x, "rx")).await
+        })
+        .expect("a lands");
+    // 杀掉 leader：任务随运行时一起消失，租约留在存储里
+    drop(leader_rt);
+    main_rt.block_on(async {
+        let b = Coordinator::clustered(fx.w.clone(), CoordinatorConfig::default(), cluster("http://b", ttl));
+        let y = fx.commit(&[base], &[("y", Some("y"))]).await;
+        assert_eq!(
+            b.land(req(REPO, "main", y, false)).await,
+            Err(LandError::NotLeader {
+                leader: "http://a".into()
+            })
+        );
+        tokio::time::sleep(Duration::from_millis(ttl + 100)).await;
+        // 客户端没收到 a 的回复，用同一个 request id 在新 leader 上重试：返回同一结果
+        assert_eq!(b.land(with_id(x, "rx")).await, Ok(first));
+        let o = b.land(req(REPO, "main", y, false)).await.expect("b leads");
+        assert_eq!(o.state.version, 3);
+        assert_eq!(fx.chain(o.state.target).await.len(), 3, "base, x, y' — x landed once");
+    });
+}
+
+/// 租约被别人拿走（例如本节点长时间停顿）：下一次续约时让位，之后的请求得到 NotLeader。
+#[tokio::test]
+async fn leader_steps_down_when_lease_is_taken() {
+    let fx = Fx::new().await;
+    let ttl = 200;
+    let a = Coordinator::clustered(fx.w.clone(), CoordinatorConfig::default(), cluster("http://a", ttl));
+    let base = fx.commit(&[], &[]).await;
+    a.land(req(REPO, "main", base, false)).await.expect("a");
+    let scope = format!("land:{}:{REPO}:main", REPO.len());
+    fx.store.release_lease(&scope, "http://a").await.expect("revoke");
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis(),
+    )
+    .expect("ms");
+    let l = fx
+        .store
+        .acquire_lease(&scope, "http://b", 60_000, now)
+        .await
+        .expect("b grabs");
+    assert_eq!(l.holder, "http://b");
+    // a 的任务在下一次续约时发现租约已易主
+    tokio::time::sleep(Duration::from_millis(ttl)).await;
+    assert_eq!(a.active_refs(), 0);
+    let x = fx.commit(&[base], &[("x", Some("x"))]).await;
+    assert_eq!(
+        a.land(req(REPO, "main", x, false)).await,
+        Err(LandError::NotLeader {
+            leader: "http://b".into()
+        })
+    );
+}
+
+#[tokio::test]
+async fn shutdown_releases_leases_for_immediate_takeover() {
+    let fx = Fx::new().await;
+    let a = Coordinator::clustered(fx.w.clone(), CoordinatorConfig::default(), cluster("http://a", 60_000));
+    let b = Coordinator::clustered(fx.w.clone(), CoordinatorConfig::default(), cluster("http://b", 60_000));
+    let base = fx.commit(&[], &[]).await;
+    a.land(req(REPO, "main", base, false)).await.expect("a");
+    a.shutdown();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let x = fx.commit(&[base], &[("x", Some("x"))]).await;
+    b.land(req(REPO, "main", x, false))
+        .await
+        .expect("b takes over without waiting for the ttl");
+    // 关闭后的节点再收到请求时重新申请租约（此时属于 b）
+    let y = fx.commit(&[base], &[("y", Some("y"))]).await;
+    assert_eq!(
+        a.land(req(REPO, "main", y, false)).await,
+        Err(LandError::NotLeader {
+            leader: "http://b".into()
+        })
+    );
 }

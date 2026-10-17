@@ -9,7 +9,7 @@ use bytes::Bytes;
 use scion_object::{ObjectId, ObjectKind};
 
 use crate::{
-    BlobStore, ChangesetRecord, Error, IdempotencyRecord, IndexedObject, LandedChange, MetaStore, PathChange,
+    BlobStore, ChangesetRecord, Error, IdempotencyRecord, IndexedObject, LandedChange, Lease, MetaStore, PathChange,
     PathHistoryEntry, RefExpect, RefState,
 };
 
@@ -540,6 +540,62 @@ pub async fn batch_writes<S: MetaStore + ?Sized>(s: &S) {
     ] {
         assert!(matches!(r, Some(Error::RepoNotFound(_))), "{r:?}");
     }
+}
+
+/// 租约：空闲时可以申请、持有者续约不换 token、未过期时别人申请不到、过期后被接管（token 加 1）、释放后立即可被接管。
+pub async fn leases<S: MetaStore + ?Sized>(s: &S) {
+    let l = s
+        .acquire_lease("land/r/main", "node-a", 1_000, 10_000)
+        .await
+        .expect("acquire");
+    assert_eq!(
+        l,
+        Lease {
+            holder: "node-a".into(),
+            token: 1,
+            expires_at_ms: 11_000
+        }
+    );
+    // 续约
+    let l = s
+        .acquire_lease("land/r/main", "node-a", 1_000, 10_500)
+        .await
+        .expect("renew");
+    assert_eq!((l.token, l.expires_at_ms), (1, 11_500));
+    // 未过期：别人申请到的是现有租约
+    let l = s
+        .acquire_lease("land/r/main", "node-b", 1_000, 11_000)
+        .await
+        .expect("contend");
+    assert_eq!((l.holder.as_str(), l.token, l.expires_at_ms), ("node-a", 1, 11_500));
+    // 其它 scope 互不影响
+    let other = s
+        .acquire_lease("land/r/dev", "node-b", 1_000, 11_000)
+        .await
+        .expect("other scope");
+    assert_eq!((other.holder.as_str(), other.token), ("node-b", 1));
+    // 到期（含边界）后被接管
+    let l = s
+        .acquire_lease("land/r/main", "node-b", 1_000, 11_500)
+        .await
+        .expect("take over");
+    assert_eq!((l.holder.as_str(), l.token, l.expires_at_ms), ("node-b", 2, 12_500));
+    // 非持有者释放无效；持有者释放后立即可被接管
+    s.release_lease("land/r/main", "node-a").await.expect("noop release");
+    let l = s
+        .acquire_lease("land/r/main", "node-a", 1_000, 11_600)
+        .await
+        .expect("still b");
+    assert_eq!(l.holder, "node-b");
+    s.release_lease("land/r/main", "node-b").await.expect("release");
+    let l = s
+        .acquire_lease("land/r/main", "node-a", 1_000, 11_700)
+        .await
+        .expect("after release");
+    assert_eq!((l.holder.as_str(), l.token), ("node-a", 3));
+    s.release_lease("missing", "node-a")
+        .await
+        .expect("release missing scope");
 }
 
 /// 合入的原子提交：ref CAS、landed 行与幂等记录同成同败；已存在的记录保留第一次的值。

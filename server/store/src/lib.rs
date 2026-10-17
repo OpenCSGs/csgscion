@@ -44,6 +44,15 @@ pub struct LandedChange {
     pub ref_version: u64,
 }
 
+/// 租约（`leases` 表）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lease {
+    pub holder: String,
+    /// 每换一次持有者加 1。
+    pub token: u64,
+    pub expires_at_ms: i64,
+}
+
 /// 写请求的结果（`idempotency` 表），按 (仓库, request id) 保存一段时间。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdempotencyRecord {
@@ -104,6 +113,17 @@ pub trait MetaStore: Send + Sync + 'static {
 
     /// 删除 `created_at_ms` 早于 `before_ms` 的请求结果，返回删除的条数。
     async fn expire_idempotency(&self, before_ms: i64) -> Result<u64>;
+
+    /// 申请或续约租约（服务端设计文档 §6.2、§10）：租约不存在、已过期（`expires_at_ms <= now_ms`）或
+    /// 已由 `holder` 持有时，把它交给 `holder`，有效期到 `now_ms + ttl_ms`；换了持有者时 `token` 加 1。
+    /// 返回申请之后的租约（持有者可能是别人）。
+    ///
+    /// 时间由调用方给出，节点间的时钟偏差会让两个节点短暂地都认为自己持有租约；租约只用来减少
+    /// 竞争，正确性由 ref 的条件更新保证。
+    async fn acquire_lease(&self, scope: &str, holder: &str, ttl_ms: i64, now_ms: i64) -> Result<Lease>;
+
+    /// 释放 `holder` 持有的租约（让它立即过期）；别人持有时不做任何事。
+    async fn release_lease(&self, scope: &str, holder: &str) -> Result<()>;
 
     /// 把对象登记到仓库的对象索引（幂等）。调用前对象字节必须已写入 [`BlobStore`]：
     /// 索引里有的对象一定可读，这是写入顺序不变式（服务端设计文档 §4.5）。

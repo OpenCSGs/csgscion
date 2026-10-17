@@ -2411,6 +2411,7 @@ dependencies = [
  "clap",
  "scion-api",
  "scion-client",
+ "scion-land",
  "scion-object",
  "scion-query",
  "scion-store",

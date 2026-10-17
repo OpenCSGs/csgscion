@@ -19,7 +19,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 
 pub use config::{Limits, ReadEndpoint, ServerConfig};
 pub use scion_proto::PROTOCOL_VERSION;
-pub use service::{LandSvc, ObjectSvc, QuerySvc, RefSvc, ServerInfoSvc, WriteSvc};
+pub use service::{FORWARDED_HEADER, LandSvc, ObjectSvc, QuerySvc, RefSvc, ServerInfoSvc, WriteSvc};
 
 /// 服务端依赖的全部状态。
 #[derive(Clone)]
@@ -113,14 +113,17 @@ pub async fn serve(
     // 上传的分块可能和读取分块一样大
     let write_svc = WriteSvc::new(app.config.clone(), app.meta.clone(), app.blobs.clone());
     // 合入与创建提交共用同一个写入器
-    let coordinator = scion_land::Coordinator::new(write_svc.writer().clone(), app.config.land);
-    let land = LandServiceServer::new(LandSvc::new(coordinator));
+    let coordinator = match &app.config.cluster {
+        Some(c) => scion_land::Coordinator::clustered(write_svc.writer().clone(), app.config.land, c.clone()),
+        None => scion_land::Coordinator::new(write_svc.writer().clone(), app.config.land),
+    };
+    let land = LandServiceServer::new(LandSvc::new(coordinator.clone()));
     let write = WriteServiceServer::new(write_svc).max_decoding_message_size(max_msg);
     let refs = RefServiceServer::new(RefSvc::new(app.meta.clone()));
     let query = QueryServiceServer::new(QuerySvc::new(app.config.clone(), app.meta, app.blobs))
         .max_encoding_message_size(max_msg);
 
-    tonic::transport::Server::builder()
+    let result = tonic::transport::Server::builder()
         .add_service(health_svc)
         .add_service(info)
         .add_service(objects)
@@ -129,7 +132,10 @@ pub async fn serve(
         .add_service(refs)
         .add_service(query)
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
-        .await
+        .await;
+    // 不再有请求进来：让合入任务处理完手上的批并释放租约
+    coordinator.shutdown();
+    result
 }
 
 #[cfg(test)]

@@ -7,8 +7,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use scion_object::ObjectId;
 use scion_store::{
-    ChangesetRecord, Error, IdempotencyRecord, IndexedObject, LandedChange, MetaStore, PathChange, PathHistoryEntry,
-    RefExpect, RefState, Result, validate_repo_name,
+    ChangesetRecord, Error, IdempotencyRecord, IndexedObject, LandedChange, Lease, MetaStore, PathChange,
+    PathHistoryEntry, RefExpect, RefState, Result, validate_repo_name,
 };
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 
@@ -271,6 +271,45 @@ impl MetaStore for PgMetaStore {
             response,
             created_at_ms,
         }))
+    }
+
+    async fn acquire_lease(&self, scope: &str, holder: &str, ttl_ms: i64, now_ms: i64) -> Result<Lease> {
+        // 条件 upsert：没有、已过期或自己持有时写入；否则不变。随后读出当前租约
+        sqlx::query(
+            "INSERT INTO leases (scope, holder, token, expires_at_ms) VALUES ($1, $2, 1, $3) \
+             ON CONFLICT (scope) DO UPDATE SET \
+               token = CASE WHEN leases.holder = excluded.holder THEN leases.token ELSE leases.token + 1 END, \
+               holder = excluded.holder, expires_at_ms = excluded.expires_at_ms \
+             WHERE leases.holder = excluded.holder OR leases.expires_at_ms <= $4",
+        )
+        .bind(scope)
+        .bind(holder)
+        .bind(now_ms.saturating_add(ttl_ms))
+        .bind(now_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| backend("acquire lease", e))?;
+        let (holder, token, expires_at_ms): (String, i64, i64) =
+            sqlx::query_as("SELECT holder, token, expires_at_ms FROM leases WHERE scope = $1")
+                .bind(scope)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| backend("read lease", e))?;
+        Ok(Lease {
+            holder,
+            token: version_from_db(token)?,
+            expires_at_ms,
+        })
+    }
+
+    async fn release_lease(&self, scope: &str, holder: &str) -> Result<()> {
+        sqlx::query("UPDATE leases SET expires_at_ms = 0 WHERE scope = $1 AND holder = $2")
+            .bind(scope)
+            .bind(holder)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| backend("release lease", e))?;
+        Ok(())
     }
 
     async fn expire_idempotency(&self, before_ms: i64) -> Result<u64> {
@@ -829,6 +868,12 @@ mod tests {
     async fn conformance_landing() {
         let s = pg_or_skip!();
         testsuite::landing(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_leases() {
+        let s = pg_or_skip!();
+        testsuite::leases(&s).await;
     }
 
     #[tokio::test]

@@ -10,7 +10,7 @@ use scion_object::ObjectId;
 use crate::error::{Error, Result};
 use crate::repo::validate_repo_name;
 use crate::{
-    BlobStore, ChangesetRecord, IdempotencyRecord, IndexedObject, LandedChange, MetaStore, PathChange,
+    BlobStore, ChangesetRecord, IdempotencyRecord, IndexedObject, LandedChange, Lease, MetaStore, PathChange,
     PathHistoryEntry, RefExpect, RefState, path_within,
 };
 
@@ -32,6 +32,7 @@ struct RepoData {
 struct Inner {
     repos: BTreeMap<String, RepoData>,
     blobs: HashMap<ObjectId, Bytes>,
+    leases: HashMap<String, Lease>,
 }
 
 /// 同时实现 [`MetaStore`] 与 [`BlobStore`] 的内存存储。
@@ -149,6 +150,40 @@ impl MetaStore for MemStore {
     async fn get_idempotency(&self, repo: &str, request_id: &str) -> Result<Option<IdempotencyRecord>> {
         let inner = self.read()?;
         Ok(repo_ref(&inner, repo)?.idempotency.get(request_id).cloned())
+    }
+
+    async fn acquire_lease(&self, scope: &str, holder: &str, ttl_ms: i64, now_ms: i64) -> Result<Lease> {
+        let mut inner = self.write()?;
+        let expires_at_ms = now_ms.saturating_add(ttl_ms);
+        let lease = match inner.leases.get(scope) {
+            None => Lease {
+                holder: holder.to_owned(),
+                token: 1,
+                expires_at_ms,
+            },
+            Some(l) if l.holder == holder => Lease {
+                expires_at_ms,
+                ..l.clone()
+            },
+            Some(l) if l.expires_at_ms <= now_ms => Lease {
+                holder: holder.to_owned(),
+                token: l.token + 1,
+                expires_at_ms,
+            },
+            Some(l) => return Ok(l.clone()),
+        };
+        inner.leases.insert(scope.to_owned(), lease.clone());
+        Ok(lease)
+    }
+
+    async fn release_lease(&self, scope: &str, holder: &str) -> Result<()> {
+        let mut inner = self.write()?;
+        if let Some(l) = inner.leases.get_mut(scope) {
+            if l.holder == holder {
+                l.expires_at_ms = 0;
+            }
+        }
+        Ok(())
     }
 
     async fn expire_idempotency(&self, before_ms: i64) -> Result<u64> {
@@ -359,6 +394,11 @@ mod tests {
     #[tokio::test]
     async fn conformance_landing() {
         testsuite::landing(&MemStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_leases() {
+        testsuite::leases(&MemStore::new()).await;
     }
 
     #[tokio::test]

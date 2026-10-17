@@ -89,6 +89,10 @@ struct ServerArgs {
     /// 启动时确保存在的仓库（已存在则跳过），可重复指定。
     #[arg(long = "repo", value_name = "NAME")]
     repos: Vec<String>,
+    /// 集群模式：本节点供其它节点访问的地址（如 http://10.0.0.5:7080）。多个节点共享同一个元数据库与
+    /// 对象存储时，每个 ref 的合入由持有租约的节点处理，其它节点转发给它。
+    #[arg(long, value_name = "URL", env = "SCION_ADVERTISE_URL", conflicts_with = "lite")]
+    advertise_url: Option<String>,
     #[command(flatten)]
     storage: StorageArgs,
 }
@@ -123,6 +127,13 @@ fn scion_proto_version() -> &'static str {
 
 /// 打开存储并确保 `--repo` 指定的仓库存在。
 async fn build_app(args: &ServerArgs, env: impl Fn(&str) -> Option<String>) -> anyhow::Result<(App, String)> {
+    let cluster = match &args.advertise_url {
+        Some(url) if url.starts_with("http://") || url.starts_with("https://") => {
+            Some(scion_land::ClusterConfig::new(url.trim_end_matches('/')))
+        }
+        Some(url) => anyhow::bail!("--advertise-url must be an http:// or https:// URL, got {url:?}"),
+        None => None,
+    };
     let (meta_spec, blob_spec) = args.storage.specs()?;
     let (meta, blobs) = storage::open(&meta_spec, &blob_spec, env).await?;
     for repo in &args.repos {
@@ -132,7 +143,10 @@ async fn build_app(args: &ServerArgs, env: impl Fn(&str) -> Option<String>) -> a
         }
     }
     let app = App {
-        config: Arc::new(ServerConfig::default()),
+        config: Arc::new(ServerConfig {
+            cluster,
+            ..ServerConfig::default()
+        }),
         meta,
         blobs,
     };
@@ -295,6 +309,34 @@ mod tests {
         // 重启时仓库已存在，不应失败
         let (app, _) = build_app(&a, no_env).await.expect("restart");
         assert_eq!(app.meta.list_repos().await.expect("list"), ["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn build_app_cluster_mode_from_advertise_url() {
+        let (app, _) = build_app(&args(&["--advertise-url", "http://10.0.0.5:7080/"]), no_env)
+            .await
+            .expect("app");
+        assert_eq!(
+            app.config.cluster.as_ref().map(|c| c.node.as_str()),
+            Some("http://10.0.0.5:7080")
+        );
+        let (app, _) = build_app(&args(&[]), no_env).await.expect("app");
+        assert!(app.config.cluster.is_none());
+        assert!(
+            build_app(&args(&["--advertise-url", "10.0.0.5:7080"]), no_env)
+                .await
+                .is_err()
+        );
+        let lite = Cli::try_parse_from([
+            "scion",
+            "server",
+            "--lite",
+            "--data-dir",
+            "/d",
+            "--advertise-url",
+            "http://x",
+        ]);
+        assert!(lite.is_err(), "lite mode is single-node");
     }
 
     #[tokio::test]
