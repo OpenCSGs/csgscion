@@ -11,9 +11,11 @@ use scion_store::{BlobStore, MetaStore};
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
+use crate::auth::{authorize, principal};
 use crate::config::ServerConfig;
 use crate::service::support::{check_repo, parse_id};
 use crate::status;
+use scion_auth::{Action, Guard, Request as AuthRequest};
 
 pub type GetObjectsStream = Pin<Box<dyn Stream<Item = Result<GetObjectsResponse, Status>> + Send>>;
 
@@ -21,11 +23,22 @@ pub struct ObjectSvc {
     config: Arc<ServerConfig>,
     meta: Arc<dyn MetaStore>,
     blobs: Arc<dyn BlobStore>,
+    guard: Arc<Guard>,
 }
 
 impl ObjectSvc {
     pub fn new(config: Arc<ServerConfig>, meta: Arc<dyn MetaStore>, blobs: Arc<dyn BlobStore>) -> Self {
-        Self { config, meta, blobs }
+        Self {
+            config,
+            meta,
+            blobs,
+            guard: Guard::disabled(),
+        }
+    }
+
+    pub fn with_guard(mut self, guard: Arc<Guard>) -> Self {
+        self.guard = guard;
+        self
     }
 
     fn check_batch(&self, n: usize) -> Result<(), Status> {
@@ -79,7 +92,10 @@ impl ObjectService for ObjectSvc {
         &self,
         request: Request<GetObjectsRequest>,
     ) -> Result<Response<Self::GetObjectsStream>, Status> {
+        let p = principal(&request);
         let req = request.into_inner();
+        // 按 id 读对象无法按路径限制：需要整个仓库的读权限
+        authorize(&self.guard, &p, AuthRequest::repo(&req.repo, Action::Read)).await?;
         check_repo(self.meta.as_ref(), &req.repo).await?;
         self.check_batch(req.wants.len())?;
         negotiate_encoding(&req.accept_encodings)?;
@@ -133,7 +149,17 @@ impl ObjectService for ObjectSvc {
     }
 
     async fn has_objects(&self, request: Request<HasObjectsRequest>) -> Result<Response<HasObjectsResponse>, Status> {
+        let p = principal(&request);
         let req = request.into_inner();
+        // 写入前查询缺失对象：只限某些路径的写入者也需要
+        if !self
+            .guard
+            .check_any(&p, &req.repo, Action::Write)
+            .await
+            .map_err(crate::auth::to_status)?
+        {
+            authorize(&self.guard, &p, AuthRequest::repo(&req.repo, Action::Read)).await?;
+        }
         check_repo(self.meta.as_ref(), &req.repo).await?;
         self.check_batch(req.ids.len())?;
         let ids = req.ids.iter().map(|b| parse_id(b)).collect::<Result<Vec<_>, _>>()?;

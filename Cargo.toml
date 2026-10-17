@@ -9,6 +9,7 @@ members = [
     "server/store",
     "server/store-sql",
     "server/store-blob",
+    "server/auth",
     "server/tree",
     "server/merge",
     "server/land",
@@ -39,6 +40,7 @@ scion-flight = { path = "common/flight" }
 scion-store = { path = "server/store" }
 scion-store-sql = { path = "server/store-sql" }
 scion-store-blob = { path = "server/store-blob" }
+scion-auth = { path = "server/auth" }
 scion-tree = { path = "server/tree" }
 scion-merge = { path = "server/merge" }
 scion-land = { path = "server/land" }

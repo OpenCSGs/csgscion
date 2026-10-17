@@ -216,7 +216,7 @@ pub async fn serve_node(
                 node.clone(),
                 ch.clone(),
                 t.clone(),
-                config.warm_options,
+                config.warm_options.clone(),
                 stop_rx.clone(),
             )));
         }

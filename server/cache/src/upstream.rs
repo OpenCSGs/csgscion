@@ -15,8 +15,9 @@ use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use scion_object::ObjectId;
+use scion_proto::v1::auth_service_client::AuthServiceClient;
 use scion_proto::v1::object_service_client::ObjectServiceClient;
-use scion_proto::v1::{Encoding, GetObjectsRequest, HasObjectsRequest, ObjectWant};
+use scion_proto::v1::{Action, CheckAccessRequest, Encoding, GetObjectsRequest, HasObjectsRequest, ObjectWant};
 use tokio::sync::Semaphore;
 use tonic::Code;
 use tonic::Status;
@@ -43,6 +44,9 @@ pub trait Upstream: Send + Sync {
 
     /// `ids` 中在 `repo` 里不可见的对象（`HasObjects`）。
     async fn missing(&self, repo: &str, ids: &[ObjectId], ctx: &RequestCtx) -> Result<Vec<ObjectId>, Status>;
+
+    /// 调用者（`ctx` 中的令牌）能否读取整个仓库（`AuthService.CheckAccess`）。上游不支持时视为允许。
+    async fn can_read(&self, repo: &str, ctx: &RequestCtx) -> Result<bool, Status>;
 
     /// 日志中使用的名字（地址）。
     fn name(&self) -> &str;
@@ -165,6 +169,24 @@ impl Upstream for GrpcUpstream {
             }
         }
         Ok(out)
+    }
+
+    async fn can_read(&self, repo: &str, ctx: &RequestCtx) -> Result<bool, Status> {
+        let mut req = tonic::Request::new(CheckAccessRequest {
+            repo: repo.to_owned(),
+            action: Action::Read.into(),
+            r#ref: String::new(),
+            path: String::new(),
+        });
+        if let Some(a) = &ctx.authorization {
+            req.metadata_mut().insert("authorization", a.clone());
+        }
+        match AuthServiceClient::new(self.channel.clone()).check_access(req).await {
+            Ok(r) => Ok(r.into_inner().allowed),
+            // 没有 AuthService 的旧服务端：没有访问控制
+            Err(s) if s.code() == Code::Unimplemented => Ok(true),
+            Err(s) => Err(s),
+        }
     }
 
     fn name(&self) -> &str {
@@ -312,6 +334,30 @@ impl UpstreamPool {
         Err(last_err.unwrap_or_else(|| Status::unavailable("all upstreams are unavailable")))
     }
 
+    /// 调用者能否读取整个仓库：依次尝试可用的上游，上游故障时换下一个。
+    pub async fn can_read(&self, repo: &str, ctx: &RequestCtx) -> Result<bool, Status> {
+        let mut order = self.order().into_iter();
+        let mut last_err = None;
+        while let Some(i) = self.take_next(&mut order) {
+            let m = &self.members[i];
+            match m.up.can_read(repo, ctx).await {
+                Ok(v) => {
+                    m.breaker.success();
+                    return Ok(v);
+                }
+                Err(e) if is_upstream_failure(&e) => {
+                    m.breaker.failure();
+                    last_err = Some(e);
+                }
+                Err(e) => {
+                    m.breaker.success();
+                    return Err(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| Status::unavailable("all upstreams are unavailable")))
+    }
+
     /// 回源一批对象。
     pub async fn fetch(&self, repo: &str, ids: &[ObjectId], ctx: &RequestCtx) -> Result<Vec<Bytes>, Status> {
         let _permit = self
@@ -377,6 +423,9 @@ pub(crate) mod tests {
         /// 每个仓库可见的对象；`None` 表示所有仓库都能看到全部对象。
         pub repos: Option<std::collections::HashMap<String, Vec<ObjectId>>>,
         pub missing_calls: AtomicU32,
+        /// 不允许读取的仓库。
+        pub unreadable: Vec<String>,
+        pub access_calls: AtomicU32,
     }
 
     impl Fake {
@@ -388,6 +437,8 @@ pub(crate) mod tests {
                 calls: AtomicU32::new(0),
                 repos: None,
                 missing_calls: AtomicU32::new(0),
+                unreadable: Vec::new(),
+                access_calls: AtomicU32::new(0),
                 data: objects
                     .iter()
                     .map(|o| (ObjectId::of_blob(o), Bytes::from_static(o)))
@@ -428,6 +479,23 @@ pub(crate) mod tests {
 
     #[tonic::async_trait]
     impl Upstream for Fake {
+        async fn can_read(&self, repo: &str, ctx: &RequestCtx) -> Result<bool, Status> {
+            self.access_calls.fetch_add(1, Ordering::SeqCst);
+            let step = {
+                let mut s = self.script.lock().expect("lock");
+                if s.len() > 1 { s.remove(0) } else { s[0].clone() }
+            };
+            step?;
+            if ctx
+                .authorization
+                .as_ref()
+                .is_some_and(|a| a.as_bytes() == b"Bearer invalid")
+            {
+                return Err(Status::unauthenticated("invalid token"));
+            }
+            Ok(!self.unreadable.iter().any(|r| r == repo))
+        }
+
         async fn missing(&self, repo: &str, ids: &[ObjectId], _ctx: &RequestCtx) -> Result<Vec<ObjectId>, Status> {
             self.missing_calls.fetch_add(1, Ordering::SeqCst);
             let step = self.script.lock().expect("lock").last().cloned().unwrap_or(Ok(()));
@@ -609,6 +677,34 @@ pub(crate) mod tests {
         let p = pool(vec![down], no_hedge());
         assert_eq!(
             p.missing("r", &[id()], &RequestCtx::default())
+                .await
+                .map_err(|e| e.code()),
+            Err(Code::Unavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn can_read_fails_over_and_passes_business_errors() {
+        let down = Arc::new(Fake::new("down", &[]).script(vec![Err(Status::unavailable("down"))]));
+        let mut f = Fake::new("up", &[]);
+        f.unreadable = vec!["secret".into()];
+        let up = Arc::new(f);
+        let p = pool(vec![down.clone(), up], no_hedge());
+        for _ in 0..2 {
+            assert!(p.can_read("open", &RequestCtx::default()).await.expect("ok"));
+        }
+        assert!(!p.can_read("secret", &RequestCtx::default()).await.expect("ok"));
+        let invalid = RequestCtx {
+            authorization: Some(MetadataValue::from_static("Bearer invalid")),
+        };
+        assert_eq!(
+            p.can_read("open", &invalid).await.map_err(|e| e.code()),
+            Err(Code::Unauthenticated)
+        );
+        let only_down = pool(vec![down], no_hedge());
+        assert_eq!(
+            only_down
+                .can_read("x", &RequestCtx::default())
                 .await
                 .map_err(|e| e.code()),
             Err(Code::Unavailable)

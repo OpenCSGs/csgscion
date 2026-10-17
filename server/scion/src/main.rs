@@ -2,6 +2,7 @@
 //!
 //! 目前有 `server`、`cache`、`admin` 和 `version`；`deriver`、`janitor` 按里程碑逐个加入。
 
+mod authcmd;
 mod storage;
 
 use std::net::SocketAddr;
@@ -46,6 +47,22 @@ enum AdminCmd {
     /// 为旧数据补建派生索引（父提交与跳表、PathHistory、GitSha）。可重复执行。
     /// 运行中的服务端会缓存提交记录：请在启动服务端之前运行，或运行后重启服务端。
     Reindex(ReindexArgs),
+    /// 生成签发访问令牌用的 ES256 私钥（PKCS#8 PEM，输出到标准输出）。
+    JwtKeygen,
+    /// 管理 PAT / service token。
+    Token {
+        #[command(subcommand)]
+        cmd: authcmd::TokenCmd,
+        #[command(flatten)]
+        storage: StorageArgs,
+    },
+    /// 查看或设置访问控制策略。
+    Policy {
+        #[command(subcommand)]
+        cmd: authcmd::PolicyCmd,
+        #[command(flatten)]
+        storage: StorageArgs,
+    },
 }
 
 #[derive(Debug, clap::Args)]
@@ -61,16 +78,16 @@ struct ReindexArgs {
 #[derive(Debug, clap::Args)]
 struct StorageArgs {
     /// Lite 档：SQLite + 本地目录，单进程、零外部依赖。需要 --data-dir。
-    #[arg(long, requires = "data_dir", conflicts_with_all = ["meta", "blobs"])]
+    #[arg(long, global = true, requires = "data_dir", conflicts_with_all = ["meta", "blobs"])]
     lite: bool,
     /// Lite 档的数据目录（meta.db 与 objects/）。
-    #[arg(long, value_name = "DIR", env = "SCION_DATA_DIR")]
+    #[arg(long, global = true, value_name = "DIR", env = "SCION_DATA_DIR")]
     data_dir: Option<PathBuf>,
     /// 元数据后端：mem、sqlite://PATH、postgres://…
-    #[arg(long, value_name = "URL", default_value = "mem", env = "SCION_META")]
+    #[arg(long, global = true, value_name = "URL", default_value = "mem", env = "SCION_META")]
     meta: String,
     /// 对象存储：mem、目录路径、s3://bucket[/prefix]（连接参数见 SCION_S3_* 环境变量）。
-    #[arg(long, value_name = "SPEC", default_value = "mem", env = "SCION_BLOBS")]
+    #[arg(long, global = true, value_name = "SPEC", default_value = "mem", env = "SCION_BLOBS")]
     blobs: String,
 }
 
@@ -115,6 +132,8 @@ struct ServerArgs {
     #[arg(long, value_name = "DURATION", default_value = "1s", value_parser = parse_duration,
         env = "SCION_REF_POLL_INTERVAL")]
     ref_poll_interval: std::time::Duration,
+    #[command(flatten)]
+    auth: authcmd::AuthArgs,
     #[command(flatten)]
     storage: StorageArgs,
 }
@@ -171,6 +190,9 @@ struct CacheArgs {
     /// 关闭对冲（慢请求向另一个上游重发）。
     #[arg(long)]
     no_hedge: bool,
+    /// 预热时使用的令牌（服务端要求认证时需要），建议用环境变量传入。
+    #[arg(long, value_name = "TOKEN", env = "SCION_CACHE_WARM_TOKEN", hide_env_values = true)]
+    warm_token: Option<String>,
 }
 
 /// 字节数：纯数字，或带 K/M/G/T（KiB/MiB/…，均按 1024 进位）后缀。
@@ -246,6 +268,14 @@ fn cache_config(args: &CacheArgs) -> anyhow::Result<scion_cache::CacheConfig> {
         },
         warm: args.warm.clone(),
         warm_options: scion_cache::WarmOptions {
+            token: match &args.warm_token {
+                Some(t) => Some(
+                    format!("Bearer {}", t.trim())
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("--warm-token contains invalid characters"))?,
+                ),
+                None => None,
+            },
             max_blob_bytes: args.warm_blob_max,
             ..scion_cache::WarmOptions::default()
         },
@@ -316,8 +346,24 @@ async fn build_app(args: &ServerArgs, env: impl Fn(&str) -> Option<String>) -> a
         Some(url) => anyhow::bail!("--advertise-url must be an http:// or https:// URL, got {url:?}"),
         None => None,
     };
+    let auth = args.auth.guard_config()?;
     let (meta_spec, blob_spec) = args.storage.specs()?;
     let (meta, blobs) = storage::open(&meta_spec, &blob_spec, env).await?;
+    // 提前校验认证配置（密钥、外部签发方的密钥来源）和库里的访问控制策略，有误时拒绝启动
+    let guard =
+        scion_api::scion_auth::Guard::build(auth.clone(), meta.clone(), scion_api::scion_auth::remote::env_lookup())
+            .map_err(|e| anyhow::anyhow!("invalid auth configuration: {e}"))?;
+    if auth.required {
+        guard
+            .reload_policy()
+            .await
+            .map_err(|e| anyhow::anyhow!("loading the access policy: {e}"))?;
+    }
+    if auth.required && auth.signing_key_pem.is_none() {
+        tracing::warn!(
+            "authentication required but no --jwt-key: access tokens cannot be issued (PATs and external tokens still work)"
+        );
+    }
     for repo in &args.repos {
         match meta.create_repo(repo).await {
             Ok(()) | Err(scion_store::Error::RepoAlreadyExists(_)) => {}
@@ -330,6 +376,7 @@ async fn build_app(args: &ServerArgs, env: impl Fn(&str) -> Option<String>) -> a
             max_concurrent_requests: args.max_concurrent_requests,
             repo_write_rate: args.repo_write_rate,
             read_endpoints: args.read_endpoints.clone(),
+            auth,
             ref_poll_interval: args.ref_poll_interval,
             ..ServerConfig::default()
         }),
@@ -337,6 +384,13 @@ async fn build_app(args: &ServerArgs, env: impl Fn(&str) -> Option<String>) -> a
         blobs,
     };
     Ok((app, storage::describe(&meta_spec, &blob_spec)))
+}
+
+/// 只打开元数据库（管理命令用）。
+async fn open_meta(storage: &StorageArgs) -> anyhow::Result<Arc<dyn scion_store::MetaStore>> {
+    let (meta_spec, blob_spec) = storage.specs()?;
+    let (meta, _) = storage::open(&meta_spec, &blob_spec, |k| std::env::var(k).ok()).await?;
+    Ok(meta)
 }
 
 /// `scion admin reindex`：返回每个仓库的一行摘要。
@@ -357,26 +411,35 @@ async fn reindex(args: &ReindexArgs, env: impl Fn(&str) -> Option<String>) -> an
     Ok(out)
 }
 
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
+/// 立即注册 SIGINT / SIGTERM（在打印「listening」之前，避免信号在注册前到达时进程被默认处理杀掉），
+/// 返回收到信号时完成的 future。
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
     #[cfg(unix)]
-    let term = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut s) => {
-                s.recv().await;
+    let term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    #[cfg(unix)]
+    let int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
+    async move {
+        #[cfg(unix)]
+        {
+            let wait = |s: Option<tokio::signal::unix::Signal>| async move {
+                match s {
+                    Some(mut s) => {
+                        s.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                () = wait(term) => {},
+                () = wait(int) => {},
             }
-            Err(_) => std::future::pending::<()>().await,
         }
-    };
-    #[cfg(not(unix))]
-    let term = std::future::pending::<()>();
-    tokio::select! {
-        () = ctrl_c => {},
-        () = term => {},
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        tracing::info!("shutdown signal received, draining");
     }
-    tracing::info!("shutdown signal received, draining");
 }
 
 async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
@@ -388,9 +451,10 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
     if backends.contains("meta=mem") || backends.contains("blobs=mem") {
         tracing::warn!("in-memory storage in use; data is lost on exit");
     }
+    let shutdown = shutdown_signal();
     // 集成测试按这一行解析实际监听地址，修改时同步 tests/
     tracing::info!(%addr, repos = ?args.repos, %backends, "scion server listening");
-    scion_api::serve(listener, app, shutdown_signal()).await?;
+    scion_api::serve(listener, app, shutdown).await?;
     tracing::info!("scion server stopped");
     Ok(())
 }
@@ -402,10 +466,11 @@ async fn run_cache(args: CacheArgs) -> anyhow::Result<()> {
         .with_context(|| format!("bind {}", args.listen))?;
     let addr = listener.local_addr()?;
     let (node, info, channels) = scion_cache::build(&config).await?;
+    let shutdown = shutdown_signal();
     // 集成测试按这一行解析实际监听地址
     tracing::info!(%addr, upstreams = ?config.upstreams, peers = ?config.peers,
         disk = ?config.storage.disk.as_ref().map(|d| d.dir.display().to_string()), "scion cache listening");
-    scion_cache::serve_node(listener, node, info, channels, &config, shutdown_signal()).await?;
+    scion_cache::serve_node(listener, node, info, channels, &config, shutdown).await?;
     tracing::info!("scion cache stopped");
     Ok(())
 }
@@ -428,6 +493,24 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Admin(AdminCmd::Reindex(args)) => {
             for line in reindex(&args, |k| std::env::var(k).ok()).await? {
+                println!("{line}");
+            }
+            Ok(())
+        }
+        Command::Admin(AdminCmd::JwtKeygen) => {
+            print!("{}", scion_api::scion_auth::token::generate_signing_key());
+            Ok(())
+        }
+        Command::Admin(AdminCmd::Token { cmd, storage }) => {
+            let meta = open_meta(&storage).await?;
+            for line in authcmd::token(&cmd, meta).await? {
+                println!("{line}");
+            }
+            Ok(())
+        }
+        Command::Admin(AdminCmd::Policy { cmd, storage }) => {
+            let meta = open_meta(&storage).await?;
+            for line in authcmd::policy(&cmd, meta).await? {
                 println!("{line}");
             }
             Ok(())
@@ -643,6 +726,29 @@ mod tests {
             "http://x",
         ]);
         assert!(lite.is_err(), "lite mode is single-node");
+    }
+
+    #[tokio::test]
+    async fn build_app_refuses_an_unloadable_policy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let d = dir.path().to_str().expect("utf8");
+        let (app, _) = build_app(&args(&["--lite", "--data-dir", d]), no_env)
+            .await
+            .expect("app");
+        app.meta
+            .put_setting(scion_api::scion_auth::POLICY_KEY, b"broken [")
+            .await
+            .expect("store");
+        drop(app);
+        let err = build_app(&args(&["--lite", "--data-dir", d, "--auth-required"]), no_env)
+            .await
+            .err()
+            .expect("refused");
+        assert!(err.to_string().contains("access policy"), "{err}");
+        // 不要求认证时不加载策略
+        build_app(&args(&["--lite", "--data-dir", d]), no_env)
+            .await
+            .expect("auth not required");
     }
 
     #[test]

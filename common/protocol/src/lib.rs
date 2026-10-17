@@ -48,6 +48,14 @@ pub mod features {
     pub const QUERY_RESOLVE: &str = "query.resolve_revision";
     pub const QUERY_STAT: &str = "query.stat";
     pub const QUERY_DERIVED: &str = "query.derived";
+    /// AuthService 的 WhoAmI / ExchangeToken / CheckAccess。
+    pub const AUTH: &str = "auth";
+    /// 服务端要求认证（未带有效令牌的请求返回 UNAUTHENTICATED）。
+    pub const AUTH_REQUIRED: &str = "auth.required";
+    /// OIDC device flow 登录（StartDeviceLogin / PollDeviceLogin）。
+    pub const AUTH_DEVICE: &str = "auth.device";
+    /// AdminService：策略与令牌管理。
+    pub const ADMIN: &str = "admin";
 }
 
 #[cfg(test)]

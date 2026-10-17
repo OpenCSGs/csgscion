@@ -4,8 +4,10 @@
 //! 4 可重试错误（已用尽重试）、5 认证失败。
 
 mod commands;
+mod creds;
 mod daemon;
 mod history;
+mod login;
 mod output;
 
 use std::io::Write;
@@ -89,6 +91,19 @@ enum Command {
     /// 导入外部历史。
     #[command(subcommand)]
     Import(ImportCmd),
+    /// 登录服务端：默认在浏览器中完成（OIDC device flow），也可以用已有的令牌（PAT）。
+    Login {
+        /// 用这个令牌登录，而不是在浏览器中登录。
+        #[arg(long, value_name = "TOKEN", conflicts_with = "with_token")]
+        token: Option<String>,
+        /// 从标准输入读取令牌（避免出现在 shell 历史中）。
+        #[arg(long)]
+        with_token: bool,
+    },
+    /// 删除保存的登录凭据。
+    Logout,
+    /// 显示当前身份。
+    Whoami,
     /// 本机 daemon（L1 缓存）：通常由其它命令自动拉起，`SCION_NO_DAEMON=1` 关闭。
     #[command(subcommand)]
     Daemon(DaemonCmd),
@@ -193,6 +208,23 @@ async fn run(cli: Cli) -> ExitCode {
             path,
             name_only,
         } => emit(history::diff(&ctx, &revisions, path.as_deref(), name_only).await, json),
+        Command::Login { token, with_token } => {
+            let token = if with_token {
+                let mut s = String::new();
+                match std::io::Read::read_to_string(&mut std::io::stdin(), &mut s) {
+                    Ok(_) => Some(s),
+                    Err(e) => return fail(&CliError::Usage(format!("read stdin: {e}")), json),
+                }
+            } else {
+                token
+            };
+            match token {
+                Some(t) => emit(login::login_with_token(&ctx, &t).await, json),
+                None => emit(login::login_device(&ctx, |m| eprintln!("{m}")).await, json),
+            }
+        }
+        Command::Logout => emit(login::logout(&ctx), json),
+        Command::Whoami => emit(login::whoami(&ctx).await, json),
         Command::Daemon(cmd) => {
             let mut cfg = daemon::config(|k| std::env::var(k).ok());
             match cmd {
@@ -280,6 +312,15 @@ mod tests {
                 ..
             })
         ));
+        let cli = Cli::try_parse_from(["scn", "login", "--token", "t"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Command::Login {
+                token: Some(_),
+                with_token: false
+            }
+        ));
+        assert!(Cli::try_parse_from(["scn", "login", "--token", "t", "--with-token"]).is_err());
         let cli = Cli::try_parse_from(["scn", "daemon", "stop"]).expect("parse");
         assert!(matches!(cli.command, Command::Daemon(DaemonCmd::Stop)));
     }

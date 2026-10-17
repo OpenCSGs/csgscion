@@ -92,6 +92,36 @@ pub(crate) fn record_from_row(row: ChangesetRow) -> Result<scion_store::Changese
 }
 
 /// URL 中的密码替换为 `***`，用于错误信息和日志。
+/// tokens 表的一行。
+pub(crate) type TokenRow = (String, Vec<u8>, String, String, String, String, i64, Option<i64>);
+
+/// 组名按行保存（组名不能包含换行）。
+pub(crate) fn join_groups(groups: &[String]) -> String {
+    groups.join("\n")
+}
+
+pub(crate) fn token_from_row(row: TokenRow) -> Result<scion_store::TokenRecord> {
+    let (id, hash, kind, subject, groups, description, created_at_ms, expires_at_ms) = row;
+    let hash: [u8; 32] = hash
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::Backend(format!("token {id} has a malformed hash")))?;
+    Ok(scion_store::TokenRecord {
+        id,
+        hash,
+        kind,
+        subject,
+        groups: groups
+            .split('\n')
+            .filter(|g| !g.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        description,
+        created_at_ms,
+        expires_at_ms,
+    })
+}
+
 pub(crate) fn redact_url(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         return url.to_string();
@@ -196,5 +226,28 @@ mod tests {
     #[test]
     fn unique_violation_false_for_non_db_errors() {
         assert!(!is_unique_violation(&sqlx::Error::RowNotFound));
+    }
+
+    #[test]
+    fn token_rows_round_trip_and_reject_bad_hashes() {
+        let groups = vec!["a".to_string(), "b".to_string()];
+        let row: TokenRow = (
+            "t".into(),
+            vec![1; 32],
+            "pat".into(),
+            "alice".into(),
+            join_groups(&groups),
+            "d".into(),
+            5,
+            None,
+        );
+        let t = token_from_row(row.clone()).expect("ok");
+        assert_eq!((t.groups, t.hash), (groups, [1; 32]));
+        let mut no_groups = row.clone();
+        no_groups.4 = String::new();
+        assert!(token_from_row(no_groups).expect("ok").groups.is_empty());
+        let mut bad = row;
+        bad.1 = vec![1; 3];
+        assert!(token_from_row(bad).is_err());
     }
 }

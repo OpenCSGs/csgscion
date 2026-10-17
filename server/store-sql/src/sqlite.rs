@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use scion_object::ObjectId;
 use scion_store::{
     ChangesetRecord, Error, IdempotencyRecord, IndexedObject, LandedChange, Lease, MetaStore, PathChange,
-    PathHistoryEntry, RefExpect, RefState, Result, validate_repo_name,
+    PathHistoryEntry, RefExpect, RefState, Result, TokenRecord, validate_repo_name,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous};
 
@@ -309,6 +309,80 @@ impl MetaStore for SqliteMetaStore {
             token: version_from_db(token)?,
             expires_at_ms,
         })
+    }
+
+    async fn put_token(&self, t: &TokenRecord) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO tokens (id, hash, kind, subject, groups_text, description, created_at_ms, expires_at_ms) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&t.id)
+        .bind(&t.hash[..])
+        .bind(&t.kind)
+        .bind(&t.subject)
+        .bind(crate::common::join_groups(&t.groups))
+        .bind(&t.description)
+        .bind(t.created_at_ms)
+        .bind(t.expires_at_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| backend("put token", e))?;
+        Ok(())
+    }
+
+    async fn get_token(&self, hash: &[u8; 32]) -> Result<Option<TokenRecord>> {
+        let row: Option<crate::common::TokenRow> = sqlx::query_as(
+            "SELECT id, hash, kind, subject, groups_text, description, created_at_ms, expires_at_ms \
+             FROM tokens WHERE hash = ?",
+        )
+        .bind(&hash[..])
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| backend("get token", e))?;
+        row.map(crate::common::token_from_row).transpose()
+    }
+
+    async fn list_tokens(&self, subject: Option<&str>) -> Result<Vec<TokenRecord>> {
+        let rows: Vec<crate::common::TokenRow> = sqlx::query_as(
+            "SELECT id, hash, kind, subject, groups_text, description, created_at_ms, expires_at_ms \
+             FROM tokens WHERE ? IS NULL OR subject = ? ORDER BY created_at_ms, id",
+        )
+        .bind(subject)
+        .bind(subject)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| backend("list tokens", e))?;
+        rows.into_iter().map(crate::common::token_from_row).collect()
+    }
+
+    async fn delete_token(&self, id: &str) -> Result<bool> {
+        let r = sqlx::query("DELETE FROM tokens WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| backend("delete token", e))?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    async fn get_setting(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        let row: Option<(Vec<u8>,)> = sqlx::query_as("SELECT value FROM settings WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| backend("get setting", e))?;
+        Ok(row.map(|(v,)| v))
+    }
+
+    async fn put_setting(&self, key: &str, value: &[u8]) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| backend("put setting", e))?;
+        Ok(())
     }
 
     async fn release_lease(&self, scope: &str, holder: &str) -> Result<()> {
@@ -784,6 +858,7 @@ mod tests {
     async fn conformance_leases() {
         let (_dir, s) = fresh().await;
         testsuite::leases(&s).await;
+        testsuite::tokens_and_settings(&s).await;
     }
 
     #[tokio::test]

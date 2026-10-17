@@ -50,6 +50,10 @@ enum ErrorReason {
   ERROR_REASON_NOT_FAST_FORWARD = 12;
   ERROR_REASON_REF_NOT_FOUND = 13;
   ERROR_REASON_PATH_NOT_FOUND = 14;
+  // 令牌已过期（UNAUTHENTICATED）。客户端用刷新凭据换一个新令牌后重试。
+  ERROR_REASON_TOKEN_EXPIRED = 15;
+  // 没有权限（PERMISSION_DENIED）。metadata：repo、action（read / write / land / admin），以及 ref、path（如有）。
+  ERROR_REASON_PERMISSION_DENIED = 16;
 }
 
 // 目录条目类型，取值与 SPEC.md §4 的 mode 字节一致。

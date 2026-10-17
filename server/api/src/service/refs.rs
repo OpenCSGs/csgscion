@@ -16,20 +16,32 @@ use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
+use crate::auth::{authorize_any, principal};
 use crate::service::support::{check_repo, resolve_revision};
 use crate::status;
 use crate::watch::{RefHub, RefUpdate};
+use scion_auth::{Action, Guard};
 
 pub type WatchRefsStream = Pin<Box<dyn Stream<Item = Result<WatchRefsResponse, Status>> + Send>>;
 
 pub struct RefSvc {
     meta: Arc<dyn MetaStore>,
     hub: Arc<RefHub>,
+    guard: Arc<Guard>,
 }
 
 impl RefSvc {
     pub fn new(meta: Arc<dyn MetaStore>, hub: Arc<RefHub>) -> Self {
-        Self { meta, hub }
+        Self {
+            meta,
+            hub,
+            guard: Guard::disabled(),
+        }
+    }
+
+    pub fn with_guard(mut self, guard: Arc<Guard>) -> Self {
+        self.guard = guard;
+        self
     }
 }
 
@@ -127,7 +139,9 @@ impl RefService for RefSvc {
     type WatchRefsStream = WatchRefsStream;
 
     async fn resolve_ref(&self, request: Request<ResolveRefRequest>) -> Result<Response<ResolveRefResponse>, Status> {
+        let p = principal(&request);
         let req = request.into_inner();
+        authorize_any(&self.guard, &p, &req.repo, Action::Read).await?;
         let state = self
             .meta
             .get_ref(&req.repo, &req.r#ref)
@@ -143,7 +157,9 @@ impl RefService for RefSvc {
     }
 
     async fn list_refs(&self, request: Request<ListRefsRequest>) -> Result<Response<ListRefsResponse>, Status> {
+        let p = principal(&request);
         let req = request.into_inner();
+        authorize_any(&self.guard, &p, &req.repo, Action::Read).await?;
         check_repo(self.meta.as_ref(), &req.repo).await?;
         let refs = self.meta.list_refs(&req.repo).await.map_err(status::from_store)?;
         Ok(Response::new(ListRefsResponse {
@@ -159,7 +175,9 @@ impl RefService for RefSvc {
     }
 
     async fn watch_refs(&self, request: Request<WatchRefsRequest>) -> Result<Response<Self::WatchRefsStream>, Status> {
+        let p = principal(&request);
         let req = request.into_inner();
+        authorize_any(&self.guard, &p, &req.repo, Action::Read).await?;
         check_repo(self.meta.as_ref(), &req.repo).await?;
         // 先订阅再取快照：两者之间的变化会出现在通道里，按版本去重
         let rx = self.hub.subscribe(&req.repo);

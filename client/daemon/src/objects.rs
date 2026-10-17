@@ -31,6 +31,29 @@ pub type Flight = Group<Key, Result<Bytes, Status>>;
 /// 已确认可见的 (服务端, 仓库, 对象)。
 pub type Visible = moka::sync::Cache<Key, ()>;
 
+/// 已确认能读取整个仓库的 (服务端, 仓库, 令牌摘要)。
+pub type Access = moka::sync::Cache<(Arc<str>, Arc<str>, ObjectId), ()>;
+
+/// 读权限确认结果的缓存时间（吊销令牌或修改策略最多延迟这么久生效）。
+pub const ACCESS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 服务端不可达（而不是拒绝）时，这段时间内确认过的读权限仍然有效，daemon 可以离线读本地缓存。
+pub const OFFLINE_GRACE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+pub fn new_access_cache() -> Access {
+    moka::sync::Cache::builder()
+        .max_capacity(100_000)
+        .time_to_live(ACCESS_TTL)
+        .build()
+}
+
+pub fn new_offline_cache() -> Access {
+    moka::sync::Cache::builder()
+        .max_capacity(100_000)
+        .time_to_live(OFFLINE_GRACE)
+        .build()
+}
+
 /// 与服务端相同的「对象不存在」错误。
 fn object_missing(ids: &[ObjectId]) -> Status {
     let listed: Vec<String> = ids.iter().take(32).map(ToString::to_string).collect();
@@ -165,6 +188,63 @@ impl Daemon {
         out
     }
 
+    /// 确认调用者（`authorization`）能读取整个仓库：本地命中也不例外。用调用者的令牌向服务端
+    /// `CheckAccess`，结果按 (服务端, 仓库, 令牌) 缓存；没有 AuthService 的旧服务端视为允许。
+    pub(crate) async fn check_access(
+        &self,
+        raw: &tonic::transport::Channel,
+        upstream: &Arc<str>,
+        repo: &Arc<str>,
+        authorization: Option<&tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
+    ) -> Result<(), Status> {
+        let token = authorization.map_or(&[][..], |a| a.as_bytes());
+        let key = (upstream.clone(), repo.clone(), ObjectId::of_blob(token));
+        if self.access.contains_key(&key) {
+            return Ok(());
+        }
+        let mut req = tonic::Request::new(scion_proto::v1::CheckAccessRequest {
+            repo: repo.to_string(),
+            action: scion_proto::v1::Action::Read.into(),
+            r#ref: String::new(),
+            path: String::new(),
+        });
+        if let Some(a) = authorization {
+            req.metadata_mut().insert("authorization", a.clone());
+        }
+        let allowed = match scion_proto::v1::auth_service_client::AuthServiceClient::new(raw.clone())
+            .check_access(req)
+            .await
+        {
+            Ok(r) => r.into_inner().allowed,
+            Err(s) if s.code() == tonic::Code::Unimplemented => true,
+            // 服务端不可达：最近确认过的身份可以继续离线读本地缓存
+            Err(s) if s.code() == tonic::Code::Unavailable && self.offline_access.contains_key(&key) => {
+                tracing::debug!(%repo, "server unreachable; using the offline access grace");
+                return Ok(());
+            }
+            Err(s) => return Err(s),
+        };
+        if !allowed {
+            return Err(if authorization.is_none() {
+                Status::unauthenticated("authentication required")
+            } else {
+                scion_client::Error::Rpc {
+                    code: tonic::Code::PermissionDenied,
+                    reason: Some(scion_proto::v1::ErrorReason::PermissionDenied),
+                    message: format!("permission denied: read on {repo}"),
+                    metadata: HashMap::from([
+                        ("repo".to_string(), repo.to_string()),
+                        ("action".to_string(), "read".to_string()),
+                    ]),
+                }
+                .to_status()
+            });
+        }
+        self.offline_access.insert(key.clone(), ());
+        self.access.insert(key, ());
+        Ok(())
+    }
+
     /// 确认 `ids` 都在调用者的仓库中可见（`client` 带着仓库与调用者身份）。
     pub(crate) async fn check_visible(
         &self,
@@ -201,6 +281,7 @@ impl ObjectService for DaemonObjectSvc {
         self.daemon.touch();
         let url = upstream_of(&request)?;
         let auth = auth_of(&request);
+        let authorization = request.metadata().get("authorization").cloned();
         let req = request.into_inner();
         let up = self.daemon.upstreams.get(&url)?;
         let client = up.client().await?.with_repo(req.repo.clone()).with_auth(auth);
@@ -223,6 +304,9 @@ impl ObjectService for DaemonObjectSvc {
         unique.sort_unstable_by_key(|id| id.to_bytes());
         unique.dedup();
         let (upstream, repo): (Arc<str>, Arc<str>) = (Arc::from(url.as_str()), Arc::from(req.repo.as_str()));
+        self.daemon
+            .check_access(&up.raw, &upstream, &repo, authorization.as_ref())
+            .await?;
         let found = self.daemon.objects(&client, &upstream, &repo, &unique).await;
         let chunk = usize::try_from(limits.max_chunk_bytes).unwrap_or(usize::MAX).max(1);
         let mut parts = Vec::new();

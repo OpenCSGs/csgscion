@@ -17,10 +17,12 @@ use scion_tree::{BlobTreeSource, TreeSource, lookup};
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
+use crate::auth::{authorize, authorize_any, principal, to_status};
 use crate::config::ServerConfig;
 use crate::service::history;
 use crate::service::support::resolve_revision;
 use crate::status;
+use scion_auth::{Action, Guard, Principal, Request as AuthRequest};
 
 pub type ReadFileStream = Pin<Box<dyn Stream<Item = Result<ReadFileResponse, Status>> + Send>>;
 pub type DiffStream = Pin<Box<dyn Stream<Item = Result<DiffResponse, Status>> + Send>>;
@@ -29,6 +31,7 @@ pub struct QuerySvc {
     config: Arc<ServerConfig>,
     meta: Arc<dyn MetaStore>,
     blobs: Arc<dyn BlobStore>,
+    guard: Arc<Guard>,
 }
 
 pub(crate) fn proto_mode(m: EntryMode) -> v1::EntryMode {
@@ -82,7 +85,34 @@ fn chunk_file(entry: &TreeEntry, data: Bytes, start: usize, chunk: usize) -> Vec
 
 impl QuerySvc {
     pub fn new(config: Arc<ServerConfig>, meta: Arc<dyn MetaStore>, blobs: Arc<dyn BlobStore>) -> Self {
-        Self { config, meta, blobs }
+        Self {
+            config,
+            meta,
+            blobs,
+            guard: Guard::disabled(),
+        }
+    }
+
+    pub fn with_guard(mut self, guard: Arc<Guard>) -> Self {
+        self.guard = guard;
+        self
+    }
+
+    /// 按路径的读：路径为空表示整个仓库中有任何读权限即可（例如不限路径的 log）。
+    async fn authorize_read(&self, p: &Principal, repo: &str, path: &str) -> Result<(), Status> {
+        if path.is_empty() {
+            authorize_any(&self.guard, p, repo, Action::Read).await
+        } else {
+            authorize(&self.guard, p, AuthRequest::repo(repo, Action::Read).with_path(path)).await
+        }
+    }
+
+    /// 是否有整个仓库的读权限（有则不需要逐个过滤路径）。
+    async fn reads_everything(&self, p: &Principal, repo: &str) -> Result<bool, Status> {
+        self.guard
+            .check(p, &AuthRequest::repo(repo, Action::Read))
+            .await
+            .map_err(to_status)
     }
 
     fn source(&self) -> BlobTreeSource {
@@ -141,7 +171,13 @@ impl QueryService for QuerySvc {
     type ReadFileStream = ReadFileStream;
 
     async fn read_file(&self, request: Request<ReadFileRequest>) -> Result<Response<Self::ReadFileStream>, Status> {
+        let p = principal(&request);
         let req = request.into_inner();
+        check_path(&req.path)?;
+        if req.path.is_empty() {
+            return Err(Status::failed_precondition("path is required"));
+        }
+        self.authorize_read(&p, &req.repo, &req.path).await?;
         let (entry, data) = QuerySvc::read_file(self, &req.repo, &req.revision, &req.path).await?;
         if req.offset > data.len() as u64 {
             return Err(Status::out_of_range(format!(
@@ -158,40 +194,82 @@ impl QueryService for QuerySvc {
     }
 
     async fn list_dir(&self, request: Request<ListDirRequest>) -> Result<Response<ListDirResponse>, Status> {
+        let p = principal(&request);
         let req = request.into_inner();
-        Ok(Response::new(
-            QuerySvc::list_dir(self, &req.repo, &req.revision, &req.path).await?,
-        ))
+        check_path(&req.path)?;
+        self.authorize_read(&p, &req.repo, "").await?;
+        let mut resp = QuerySvc::list_dir(self, &req.repo, &req.revision, &req.path).await?;
+        // 只限某些路径的读者只看到可读的条目，以及通向可读路径的上级目录
+        if !self.reads_everything(&p, &req.repo).await? {
+            let mut kept = Vec::with_capacity(resp.entries.len());
+            for e in resp.entries {
+                let full = if req.path.is_empty() {
+                    e.name.clone()
+                } else {
+                    format!("{}/{}", req.path.trim_end_matches('/'), e.name)
+                };
+                if self.guard.path_visible(&p, &req.repo, &full).await.map_err(to_status)? {
+                    kept.push(e);
+                }
+            }
+            resp.entries = kept;
+        }
+        Ok(Response::new(resp))
     }
 
     async fn log(&self, request: Request<LogRequest>) -> Result<Response<LogResponse>, Status> {
+        let p = principal(&request);
+        let req = request.into_inner();
+        self.authorize_read(&p, &req.repo, &req.path).await?;
         Ok(Response::new(
-            history::log(self.meta.as_ref(), self.blobs.as_ref(), request.into_inner()).await?,
+            history::log(self.meta.as_ref(), self.blobs.as_ref(), req).await?,
         ))
     }
 
     async fn is_ancestor(&self, request: Request<IsAncestorRequest>) -> Result<Response<IsAncestorResponse>, Status> {
-        Ok(Response::new(
-            history::is_ancestor(self.meta.as_ref(), request.into_inner()).await?,
-        ))
+        let p = principal(&request);
+        let req = request.into_inner();
+        self.authorize_read(&p, &req.repo, "").await?;
+        Ok(Response::new(history::is_ancestor(self.meta.as_ref(), req).await?))
     }
 
     async fn merge_base(&self, request: Request<MergeBaseRequest>) -> Result<Response<MergeBaseResponse>, Status> {
-        Ok(Response::new(
-            history::merge_base(self.meta.as_ref(), request.into_inner()).await?,
-        ))
+        let p = principal(&request);
+        let req = request.into_inner();
+        self.authorize_read(&p, &req.repo, "").await?;
+        Ok(Response::new(history::merge_base(self.meta.as_ref(), req).await?))
     }
 
     async fn blame(&self, request: Request<BlameRequest>) -> Result<Response<BlameResponse>, Status> {
+        let p = principal(&request);
+        let req = request.into_inner();
+        if req.path.is_empty() {
+            return Err(Status::invalid_argument("path is required"));
+        }
+        self.authorize_read(&p, &req.repo, &req.path).await?;
         Ok(Response::new(
-            history::blame(self.meta.as_ref(), self.blobs.as_ref(), request.into_inner()).await?,
+            history::blame(self.meta.as_ref(), self.blobs.as_ref(), req).await?,
         ))
     }
 
     type DiffStream = DiffStream;
 
     async fn diff(&self, request: Request<DiffRequest>) -> Result<Response<Self::DiffStream>, Status> {
-        let resp = history::diff(self.meta.as_ref(), self.blobs.clone(), request.into_inner()).await?;
+        let p = principal(&request);
+        let req = request.into_inner();
+        self.authorize_read(&p, &req.repo, &req.path).await?;
+        let repo = req.repo.clone();
+        let mut resp = history::diff(self.meta.as_ref(), self.blobs.clone(), req).await?;
+        if !self.reads_everything(&p, &repo).await? {
+            let mut kept = Vec::with_capacity(resp.files.len());
+            for f in resp.files {
+                let req = AuthRequest::repo(&repo, Action::Read).with_path(&f.path);
+                if self.guard.check(&p, &req).await.map_err(to_status)? {
+                    kept.push(f);
+                }
+            }
+            resp.files = kept;
+        }
         let batches = history::diff_batches(resp, history::DIFF_BATCH);
         Ok(Response::new(Box::pin(tokio_stream::iter(batches.into_iter().map(Ok)))))
     }
@@ -200,20 +278,27 @@ impl QueryService for QuerySvc {
         &self,
         request: Request<ResolveRevisionRequest>,
     ) -> Result<Response<ResolveRevisionResponse>, Status> {
-        Ok(Response::new(
-            history::resolve(self.meta.as_ref(), request.into_inner()).await?,
-        ))
+        let p = principal(&request);
+        let req = request.into_inner();
+        self.authorize_read(&p, &req.repo, "").await?;
+        Ok(Response::new(history::resolve(self.meta.as_ref(), req).await?))
     }
 
     async fn stat(&self, request: Request<StatRequest>) -> Result<Response<StatResponse>, Status> {
+        let p = principal(&request);
+        let req = request.into_inner();
+        self.authorize_read(&p, &req.repo, &req.path).await?;
         Ok(Response::new(
-            history::stat(self.meta.as_ref(), self.blobs.clone(), request.into_inner()).await?,
+            history::stat(self.meta.as_ref(), self.blobs.clone(), req).await?,
         ))
     }
 
     async fn get_derived(&self, request: Request<GetDerivedRequest>) -> Result<Response<GetDerivedResponse>, Status> {
+        let p = principal(&request);
+        let req = request.into_inner();
+        self.authorize_read(&p, &req.repo, "").await?;
         Ok(Response::new(
-            history::get_derived(self.meta.as_ref(), self.blobs.as_ref(), request.into_inner()).await?,
+            history::get_derived(self.meta.as_ref(), self.blobs.as_ref(), req).await?,
         ))
     }
 }

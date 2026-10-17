@@ -17,10 +17,12 @@ use scion_proto::v1::{
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
 
+use crate::auth::{authorize, authorize_any, principal};
 use crate::limit::RateLimiter;
 use crate::service::support::{check_repo, parse_id};
 use crate::status;
 use crate::watch::RefHub;
+use scion_auth::{Action, Guard, Request as AuthRequest};
 use scion_store::RefState;
 
 /// 节点间转发的请求带上的元数据。
@@ -32,6 +34,7 @@ pub struct LandSvc {
     peers: Mutex<HashMap<String, Channel>>,
     limiter: Option<Arc<RateLimiter>>,
     hub: Option<Arc<RefHub>>,
+    guard: Arc<Guard>,
 }
 
 impl LandSvc {
@@ -41,7 +44,13 @@ impl LandSvc {
             peers: Mutex::new(HashMap::new()),
             limiter: None,
             hub: None,
+            guard: Guard::disabled(),
         }
+    }
+
+    pub fn with_guard(mut self, guard: Arc<Guard>) -> Self {
+        self.guard = guard;
+        self
     }
 
     /// 合入成功后通知 WatchRefs 的订阅者。
@@ -164,7 +173,14 @@ impl LandService for LandSvc {
     async fn land(&self, request: Request<LandRequest>) -> Result<Response<LandResponse>, Status> {
         let forwarded = request.metadata().contains_key(FORWARDED_HEADER);
         let auth = request.metadata().get("authorization").cloned();
+        let p = principal(&request);
         let req = request.into_inner();
+        authorize(
+            &self.guard,
+            &p,
+            AuthRequest::repo(&req.repo, Action::Land).with_ref(&req.r#ref),
+        )
+        .await?;
         let cs_id = parse_id(&req.changeset_id)?;
         if !forwarded {
             RateLimiter::admit(self.limiter.as_deref(), &req.repo)?;
@@ -200,10 +216,12 @@ impl LandService for LandSvc {
         &self,
         request: Request<GetLandStatusRequest>,
     ) -> Result<Response<GetLandStatusResponse>, Status> {
+        let p = principal(&request);
         let req = request.into_inner();
         if req.request_id.is_empty() {
             return Err(Status::invalid_argument("request_id is required"));
         }
+        authorize_any(&self.guard, &p, &req.repo, Action::Read).await?;
         check_repo(self.coordinator.writer().meta().as_ref(), &req.repo).await?;
         let found = self
             .coordinator

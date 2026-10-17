@@ -11,16 +11,25 @@ use crate::config::ServerConfig;
 
 pub struct ServerInfoSvc {
     config: Arc<ServerConfig>,
+    guard: Arc<scion_auth::Guard>,
 }
 
 impl ServerInfoSvc {
     pub fn new(config: Arc<ServerConfig>) -> Self {
-        Self { config }
+        Self {
+            config,
+            guard: scion_auth::Guard::disabled(),
+        }
+    }
+
+    pub fn with_guard(mut self, guard: Arc<scion_auth::Guard>) -> Self {
+        self.guard = guard;
+        self
     }
 
     /// 当前实现的能力。只有真正实现了的能力才能出现在这里。
-    fn features() -> Vec<String> {
-        [
+    fn features(&self) -> Vec<String> {
+        let mut out: Vec<String> = [
             features::OBJECTS_GET,
             features::OBJECTS_HAS,
             features::WRITE_UPLOAD,
@@ -39,15 +48,24 @@ impl ServerInfoSvc {
             features::QUERY_RESOLVE,
             features::QUERY_STAT,
             features::QUERY_DERIVED,
+            features::AUTH,
+            features::ADMIN,
         ]
         .map(String::from)
-        .to_vec()
+        .to_vec();
+        if self.guard.required() {
+            out.push(features::AUTH_REQUIRED.into());
+        }
+        if self.guard.device_login() {
+            out.push(features::AUTH_DEVICE.into());
+        }
+        out
     }
 
     fn info(&self) -> v1::ServerInfo {
         v1::ServerInfo {
             protocol_version: PROTOCOL_VERSION.to_string(),
-            features: Self::features(),
+            features: self.features(),
             limits: Some((&self.config.limits).into()),
             read_endpoints: self
                 .config

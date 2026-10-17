@@ -25,6 +25,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 scion-api.workspace = true
 scion-store.workspace = true
 scion-cache.workspace = true
+scion-auth = { workspace = true, features = ["testing"] }
 tokio.workspace = true
 
 [lints]

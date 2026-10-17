@@ -185,6 +185,8 @@ async fn resolved_refs_are_prefetched_when_they_advance() {
     // 工作副本经 daemon 解析 main：登记预取
     let c = via(&socket, &server).await;
     c.resolve_ref("main").await.expect("resolve");
+    // 检出时经 daemon 读过对象：读权限已确认，之后服务端不可达也能离线读本地缓存
+    c.get_object(&a.root_tree).await.expect("checkout read");
     tokio::time::sleep(Duration::from_millis(200)).await;
     let before = cached_files(dir.path());
 
@@ -316,5 +318,68 @@ async fn cached_objects_are_not_visible_across_repositories() {
         other.get_object(&id).await.expect("now visible").as_ref(),
         b"only in mono"
     );
+    daemon.stop().await;
+}
+
+/// 服务端要求认证：本地缓存里有的对象，也只交给有读权限的调用者；无权限的拒绝不受离线宽限影响。
+#[tokio::test(flavor = "multi_thread")]
+async fn cached_objects_require_read_access() {
+    use scion_api::scion_auth::{Guard, GuardConfig};
+    let store = Arc::new(MemStore::new());
+    store.create_repo("mono").await.expect("repo");
+    let auth = GuardConfig {
+        required: true,
+        ..GuardConfig::default()
+    };
+    let guard = Guard::build(auth.clone(), store.clone(), Arc::new(|_: &str| None)).expect("guard");
+    guard
+        .set_policy("[[rule]]\nsubjects=[\"user:bob\"]\nrepos=[\"mono\"]\nactions=[\"land\"]\n")
+        .await
+        .expect("policy");
+    let (bob, _) = guard.create_token("pat", "bob", vec![], "", None).await.expect("bob");
+    let (eve, _) = guard.create_token("pat", "eve", vec![], "", None).await.expect("eve");
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let server = format!("http://{}", listener.local_addr().expect("addr"));
+    let app = App {
+        config: Arc::new(ServerConfig {
+            auth,
+            ..ServerConfig::default()
+        }),
+        meta: store.clone(),
+        blobs: store,
+    };
+    let (_stop, rx) = oneshot::channel::<()>();
+    tokio::spawn(scion_api::serve(listener, app, async {
+        let _ = rx.await;
+    }));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = config(dir.path());
+    let socket = cfg.socket.clone();
+    let daemon = start(cfg).await;
+    let as_user = |token: String| {
+        let (server, socket) = (server.clone(), socket.clone());
+        async move {
+            Client::builder()
+                .endpoint(server)
+                .repo("mono")
+                .auth(scion_client::Auth::Bearer(token))
+                .daemon_socket(socket)
+                .build()
+                .await
+                .expect("connect")
+        }
+    };
+    let b = as_user(bob).await;
+    let cs = b
+        .changeset(None)
+        .put("secret.txt", "s3cret")
+        .create()
+        .await
+        .expect("create");
+    let id = ObjectId::of_blob(b"s3cret");
+    b.get_object(&id).await.expect("bob reads");
+    let e = as_user(eve).await.get_object(&id).await.expect_err("eve has no access");
+    assert_eq!(e.reason(), Some(scion_proto::v1::ErrorReason::PermissionDenied));
+    assert!(b.get_object(&cs.root_tree).await.is_ok());
     daemon.stop().await;
 }

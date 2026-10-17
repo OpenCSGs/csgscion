@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::repo::validate_repo_name;
 use crate::{
     BlobStore, ChangesetRecord, IdempotencyRecord, IndexedObject, LandedChange, Lease, MetaStore, PathChange,
-    PathHistoryEntry, RefExpect, RefState, path_within,
+    PathHistoryEntry, RefExpect, RefState, TokenRecord, path_within,
 };
 
 #[derive(Default)]
@@ -33,6 +33,8 @@ struct Inner {
     repos: BTreeMap<String, RepoData>,
     blobs: HashMap<ObjectId, Bytes>,
     leases: HashMap<String, Lease>,
+    tokens: Vec<TokenRecord>,
+    settings: HashMap<String, Vec<u8>>,
 }
 
 /// 同时实现 [`MetaStore`] 与 [`BlobStore`] 的内存存储。
@@ -174,6 +176,47 @@ impl MetaStore for MemStore {
         };
         inner.leases.insert(scope.to_owned(), lease.clone());
         Ok(lease)
+    }
+
+    async fn put_token(&self, token: &TokenRecord) -> Result<()> {
+        let mut inner = self.write()?;
+        if inner.tokens.iter().any(|t| t.id == token.id || t.hash == token.hash) {
+            return Err(Error::Backend(format!("token {} already exists", token.id)));
+        }
+        inner.tokens.push(token.clone());
+        Ok(())
+    }
+
+    async fn get_token(&self, hash: &[u8; 32]) -> Result<Option<TokenRecord>> {
+        Ok(self.read()?.tokens.iter().find(|t| &t.hash == hash).cloned())
+    }
+
+    async fn list_tokens(&self, subject: Option<&str>) -> Result<Vec<TokenRecord>> {
+        let mut v: Vec<TokenRecord> = self
+            .read()?
+            .tokens
+            .iter()
+            .filter(|t| subject.is_none_or(|s| t.subject == s))
+            .cloned()
+            .collect();
+        v.sort_by(|a, b| (a.created_at_ms, &a.id).cmp(&(b.created_at_ms, &b.id)));
+        Ok(v)
+    }
+
+    async fn delete_token(&self, id: &str) -> Result<bool> {
+        let mut inner = self.write()?;
+        let before = inner.tokens.len();
+        inner.tokens.retain(|t| t.id != id);
+        Ok(inner.tokens.len() != before)
+    }
+
+    async fn get_setting(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.read()?.settings.get(key).cloned())
+    }
+
+    async fn put_setting(&self, key: &str, value: &[u8]) -> Result<()> {
+        self.write()?.settings.insert(key.to_owned(), value.to_vec());
+        Ok(())
     }
 
     async fn release_lease(&self, scope: &str, holder: &str) -> Result<()> {
@@ -399,6 +442,7 @@ mod tests {
     #[tokio::test]
     async fn conformance_leases() {
         testsuite::leases(&MemStore::new()).await;
+        testsuite::tokens_and_settings(&MemStore::new()).await;
     }
 
     #[tokio::test]
