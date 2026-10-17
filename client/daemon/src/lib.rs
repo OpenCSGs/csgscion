@@ -112,6 +112,8 @@ pub struct Daemon {
     pub(crate) upstreams: Upstreams,
     pub(crate) flight: objects::Flight,
     pub(crate) visible: objects::Visible,
+    pub(crate) access: objects::Access,
+    pub(crate) offline_access: objects::Access,
     pub(crate) prefetch: Prefetcher,
     pub(crate) stats: Stats,
     /// 最近一次请求的时间（Unix 秒）。
@@ -132,6 +134,8 @@ impl Daemon {
             upstreams: Upstreams::default(),
             flight: objects::Flight::new(),
             visible: objects::Visible::new(1_000_000),
+            access: objects::new_access_cache(),
+            offline_access: objects::new_offline_cache(),
             prefetch: Prefetcher::new(prefetch),
             stats: Stats::default(),
             last_activity: AtomicU64::new(now_secs()),

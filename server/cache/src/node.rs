@@ -40,6 +40,8 @@ pub struct Stats {
     pub upstream_requests: AtomicU64,
     /// 为确认可见性而向上游查询的对象数。
     pub visibility_checks: AtomicU64,
+    /// 向上游确认读权限的次数。
+    pub access_checks: AtomicU64,
 }
 
 /// [`Stats`] 的一个快照。
@@ -51,6 +53,7 @@ pub struct StatsSnapshot {
     pub upstream_objects: u64,
     pub upstream_requests: u64,
     pub visibility_checks: u64,
+    pub access_checks: u64,
 }
 
 impl StatsSnapshot {
@@ -74,6 +77,7 @@ impl Stats {
             upstream_objects: self.upstream_objects.load(Ordering::Relaxed),
             upstream_requests: self.upstream_requests.load(Ordering::Relaxed),
             visibility_checks: self.visibility_checks.load(Ordering::Relaxed),
+            access_checks: self.access_checks.load(Ordering::Relaxed),
         }
     }
 }
@@ -81,11 +85,31 @@ impl Stats {
 type Outcome = Result<Bytes, Status>;
 type FlightKey = (Arc<str>, ObjectId);
 
+/// 读权限确认结果的缓存时间。
+pub const ACCESS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// 可见集默认条目数上限（每条约百字节）。
 pub const DEFAULT_VISIBLE_ENTRIES: u64 = 10_000_000;
 
 /// 错误中最多列出的 id 个数（与 L3 相同）。
 const MAX_IDS_IN_ERROR: usize = 32;
+
+/// 与 L3 相同的「没有权限」错误。
+fn permission_denied(repo: &str) -> Status {
+    let details = tonic_types::ErrorDetails::with_error_info(
+        scion_proto::reason_name(scion_proto::v1::ErrorReason::PermissionDenied),
+        scion_proto::ERROR_DOMAIN,
+        HashMap::from([
+            ("repo".to_string(), repo.to_string()),
+            ("action".to_string(), "read".to_string()),
+        ]),
+    );
+    <Status as tonic_types::StatusExt>::with_error_details(
+        tonic::Code::PermissionDenied,
+        format!("permission denied: read on {repo}"),
+        details,
+    )
+}
 
 /// 与 L3 相同的「对象不存在」错误：NOT_FOUND / OBJECT_MISSING，metadata 带 `ids` 与 `count`。
 pub fn object_missing(ids: &[ObjectId]) -> Status {
@@ -110,6 +134,8 @@ pub struct CacheNode {
     flight: Group<FlightKey, Outcome>,
     /// 已确认可见的 (仓库, id)。对象一旦进入仓库索引就不会离开（redaction 在 M5 处理）。
     visible: moka::sync::Cache<FlightKey, ()>,
+    /// 已确认可以读取整个仓库的 (令牌哈希, 仓库)，[`ACCESS_TTL`] 后重新确认（吊销或改策略最多延迟这么久）。
+    access: moka::sync::Cache<([u8; 32], Arc<str>), ()>,
     ring: Ring,
     /// 本节点在 ring 中的地址；不在 ring 中（单节点）时为 `None`。
     me: Option<String>,
@@ -138,6 +164,10 @@ impl CacheNode {
             store,
             flight: Group::new(),
             visible: moka::sync::Cache::new(DEFAULT_VISIBLE_ENTRIES),
+            access: moka::sync::Cache::builder()
+                .max_capacity(1_000_000)
+                .time_to_live(ACCESS_TTL)
+                .build(),
             ring,
             me,
             peers,
@@ -178,6 +208,7 @@ impl CacheNode {
         unique.sort_unstable_by_key(|id| id.to_bytes());
         unique.dedup();
         let repo_key: Arc<str> = Arc::from(repo);
+        self.check_access(&repo_key, ctx).await?;
         let found = self.resolve(&repo_key, &unique, ctx, forwarded).await;
         let out: Vec<Bytes> = ids
             .iter()
@@ -189,6 +220,26 @@ impl CacheNode {
             .collect::<Result<_, _>>()?;
         self.check_visible(&repo_key, &unique, ctx).await?;
         Ok(out)
+    }
+
+    /// 确认调用者能读取整个仓库（按 id 读对象无法按路径限制，与 L3 的要求相同）。缓存不解析令牌，
+    /// 用调用者自己的令牌向上游确认，结果按 (令牌, 仓库) 缓存。
+    async fn check_access(&self, repo: &Arc<str>, ctx: &RequestCtx) -> Result<(), Status> {
+        let token = ctx.authorization.as_ref().map_or(&[][..], |a| a.as_bytes());
+        let key = (*blake3::hash(token).as_bytes(), repo.clone());
+        if self.access.contains_key(&key) {
+            return Ok(());
+        }
+        self.stats.access_checks.fetch_add(1, Ordering::Relaxed);
+        if !self.upstream.can_read(repo, ctx).await? {
+            return Err(if ctx.authorization.is_none() {
+                Status::unauthenticated("authentication required")
+            } else {
+                permission_denied(repo)
+            });
+        }
+        self.access.insert(key, ());
+        Ok(())
     }
 
     /// 确认 `ids` 都在 `repo` 中可见：可见集里没有的向上游批量查询。
@@ -502,12 +553,54 @@ mod tests {
         fresh.get_many("b", &[id(A), id(B)], &ctx, false).await.expect("ok");
         assert_eq!(fresh.stats().visibility_checks, 0);
         // 确认可见性时上游故障：错误原样返回
-        let down = Arc::new(Fake::new("down", &[A]).script(vec![Ok(()), Err(Status::unavailable("down"))]));
+        // 依次是：确认读权限、回源、确认可见性（失败）
+        let down = Arc::new(Fake::new("down", &[A]).script(vec![Ok(()), Ok(()), Err(Status::unavailable("down"))]));
         let n = single(&down).await;
         n.get_many("x", &[id(A)], &ctx, false).await.expect("fetched");
         n.visible.invalidate_all();
         let err = n.get_many("x", &[id(A)], &ctx, false).await.expect_err("check fails");
         assert_eq!(err.code(), Code::Unavailable);
+    }
+
+    /// 命中缓存前先确认调用者能读这个仓库（按令牌缓存）。
+    #[tokio::test]
+    async fn reads_require_repo_access() {
+        let mut f = Fake::new("l3", &[A]);
+        f.unreadable = vec!["secret".into()];
+        let up = Arc::new(f);
+        let n = single(&up).await;
+        let anon = RequestCtx::default();
+        n.get_many("open", &[id(A)], &anon, false).await.expect("readable");
+        n.get_many("open", &[id(A)], &anon, false).await.expect("again");
+        assert_eq!(n.stats().access_checks, 1, "cached per (token, repo)");
+        let err = n
+            .get_many("secret", &[id(A)], &anon, false)
+            .await
+            .expect_err("anonymous denied");
+        assert_eq!(err.code(), Code::Unauthenticated);
+        let alice = RequestCtx {
+            authorization: Some(tonic::metadata::MetadataValue::from_static("Bearer alice")),
+        };
+        let err = n.get_many("secret", &[id(A)], &alice, false).await.expect_err("denied");
+        assert_eq!(err.code(), Code::PermissionDenied);
+        let info = tonic_types::StatusExt::get_error_details(&err)
+            .error_info()
+            .cloned()
+            .expect("info");
+        assert_eq!(info.reason, "PERMISSION_DENIED");
+        // 不同令牌分别确认
+        n.get_many("open", &[id(A)], &alice, false).await.expect("ok");
+        assert_eq!(n.stats().access_checks, 4);
+        let invalid = RequestCtx {
+            authorization: Some(tonic::metadata::MetadataValue::from_static("Bearer invalid")),
+        };
+        assert_eq!(
+            n.get_many("open", &[id(A)], &invalid, false)
+                .await
+                .map_err(|e| e.code())
+                .expect_err("bad token"),
+            Code::Unauthenticated
+        );
     }
 
     /// 并发的不同仓库各自回源：a 的失败不会交给 b。

@@ -321,3 +321,98 @@ async fn cached_objects_are_not_visible_across_repositories() {
         .expect("connect");
     assert!(nowhere.get_object(&id).await.expect_err("no repo").is_not_found());
 }
+
+/// 服务端要求认证：缓存命中前也按调用者的令牌确认读权限；只能读部分路径的身份不能按 id 读对象；
+/// 预热用配置的令牌订阅和回源。
+#[tokio::test(flavor = "multi_thread")]
+async fn cache_enforces_upstream_access_control() {
+    use scion_api::scion_auth::{Guard, GuardConfig};
+    let s = store();
+    s.create_repo(REPO).await.expect("repo");
+    let auth = GuardConfig {
+        required: true,
+        ..GuardConfig::default()
+    };
+    let guard = Guard::build(auth.clone(), s.clone(), std::sync::Arc::new(|_: &str| None)).expect("guard");
+    guard
+        .set_policy(
+            "[[rule]]\nsubjects=[\"group:eng\"]\nrepos=[\"mono\"]\nactions=[\"land\"]\n\n\
+             [[rule]]\nsubjects=[\"user:contractor\"]\nrepos=[\"mono\"]\nactions=[\"read\"]\npaths=[\"src/ui\"]\n",
+        )
+        .await
+        .expect("policy");
+    let (eng, _) = guard
+        .create_token("pat", "bob", vec!["eng".into()], "", None)
+        .await
+        .expect("eng");
+    let (ct, _) = guard
+        .create_token("pat", "contractor", vec![], "", None)
+        .await
+        .expect("ct");
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let up_url = format!("http://{}", listener.local_addr().expect("addr"));
+    let app = App {
+        config: Arc::new(ServerConfig {
+            auth,
+            ref_poll_interval: Duration::from_millis(50),
+            ..ServerConfig::default()
+        }),
+        meta: s.clone(),
+        blobs: s.clone(),
+    };
+    let (_stop_l3, rx) = oneshot::channel::<()>();
+    tokio::spawn(scion_api::serve(listener, app, async {
+        let _ = rx.await;
+    }));
+
+    let as_user = |url: String, token: Option<String>| async move {
+        let mut b = Client::builder().endpoint(url).repo(REPO);
+        if let Some(t) = token {
+            b = b.auth(scion_client::Auth::Bearer(t));
+        }
+        b.build().await.expect("connect")
+    };
+    let writer = as_user(up_url.clone(), Some(eng.clone())).await;
+    let cs = writer
+        .changeset(None)
+        .put("src/ui/a.rs", "ui")
+        .create()
+        .await
+        .expect("create");
+    writer.land("main", &cs.id).await.expect("land");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let mut cfg = config(&up_url);
+    cfg.warm = vec![WarmTarget {
+        repo: REPO.into(),
+        refs: vec!["main".into()],
+    }];
+    cfg.warm_options.token = Some(format!("Bearer {eng}").parse().expect("header"));
+    let (url, node, _stop) = cache(cfg, listener).await;
+
+    let blob = ObjectId::of_blob(b"ui");
+    let via_eng = as_user(url.clone(), Some(eng.clone())).await;
+    assert_eq!(via_eng.get_object(&blob).await.expect("eng reads").as_ref(), b"ui");
+    // 已在缓存里，但 contractor 只能读部分路径，不能按 id 读对象；匿名需要认证
+    let via_ct = as_user(url.clone(), Some(ct)).await;
+    let e = via_ct.get_object(&blob).await.expect_err("path-scoped reader");
+    assert_eq!(e.reason(), Some(scion_proto::v1::ErrorReason::PermissionDenied));
+    let anon = as_user(url, None).await;
+    assert!(matches!(
+        anon.get_object(&blob).await.expect_err("anonymous"),
+        scion_client::Error::Rpc {
+            code: tonic::Code::Unauthenticated,
+            ..
+        }
+    ));
+    // 预热带令牌：订阅成功，根目录树进入缓存
+    let mut warmed = false;
+    for _ in 0..200 {
+        if node.store().in_memory(&cs.root_tree) {
+            warmed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(warmed, "warm-up authenticated with the configured token");
+}

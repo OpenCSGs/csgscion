@@ -190,6 +190,9 @@ struct CacheArgs {
     /// 关闭对冲（慢请求向另一个上游重发）。
     #[arg(long)]
     no_hedge: bool,
+    /// 预热时使用的令牌（服务端要求认证时需要），建议用环境变量传入。
+    #[arg(long, value_name = "TOKEN", env = "SCION_CACHE_WARM_TOKEN", hide_env_values = true)]
+    warm_token: Option<String>,
 }
 
 /// 字节数：纯数字，或带 K/M/G/T（KiB/MiB/…，均按 1024 进位）后缀。
@@ -265,6 +268,14 @@ fn cache_config(args: &CacheArgs) -> anyhow::Result<scion_cache::CacheConfig> {
         },
         warm: args.warm.clone(),
         warm_options: scion_cache::WarmOptions {
+            token: match &args.warm_token {
+                Some(t) => Some(
+                    format!("Bearer {}", t.trim())
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("--warm-token contains invalid characters"))?,
+                ),
+                None => None,
+            },
             max_blob_bytes: args.warm_blob_max,
             ..scion_cache::WarmOptions::default()
         },

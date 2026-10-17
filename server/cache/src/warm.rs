@@ -43,8 +43,10 @@ impl std::str::FromStr for WarmTarget {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WarmOptions {
+    /// 回源与订阅时使用的身份（服务端要求认证时需要）；`None` 为匿名。
+    pub token: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
     /// 一次 ref 变化最多预取的对象数。
     pub max_objects: usize,
     /// 同时预取不超过这个大小的文件；0 只预取目录树。
@@ -56,6 +58,7 @@ pub struct WarmOptions {
 impl Default for WarmOptions {
     fn default() -> Self {
         Self {
+            token: None,
             max_objects: 100_000,
             max_blob_bytes: 0,
             batch: 256,
@@ -71,7 +74,9 @@ pub async fn warm_tree(
     new: ObjectId,
     opts: WarmOptions,
 ) -> Result<usize, tonic::Status> {
-    let ctx = RequestCtx::default();
+    let ctx = RequestCtx {
+        authorization: opts.token.clone(),
+    };
     let batch = opts.batch.max(1);
     let mut fetched = 0;
     // 当前层要比较的 (旧子树, 新子树)
@@ -142,11 +147,14 @@ pub async fn follow(
         if *stop.borrow() {
             return;
         }
-        let req = WatchRefsRequest {
+        let mut req = tonic::Request::new(WatchRefsRequest {
             repo: target.repo.clone(),
             refs: target.refs.clone(),
             known_versions: known.clone(),
-        };
+        });
+        if let Some(t) = &opts.token {
+            req.metadata_mut().insert("authorization", t.clone());
+        }
         let mut stream = match RefServiceClient::new(upstream.clone()).watch_refs(req).await {
             Ok(s) => {
                 backoff = Duration::from_millis(200);
@@ -185,7 +193,7 @@ pub async fn follow(
                     continue;
                 }
                 let started = std::time::Instant::now();
-                match warm_tree(&node, &target.repo, old, root, opts).await {
+                match warm_tree(&node, &target.repo, old, root, opts.clone()).await {
                     Ok(n) => tracing::info!(repo = %target.repo, r#ref = %ev.name, version = ev.version,
                         objects = n, elapsed_ms = started.elapsed().as_millis() as u64, "warmed"),
                     Err(e) => tracing::warn!(repo = %target.repo, r#ref = %ev.name, error = %e, "warm-up failed"),
@@ -224,6 +232,9 @@ mod tests {
             ids.iter()
                 .map(|id| self.data.get(id).cloned().ok_or_else(|| tonic::Status::not_found("x")))
                 .collect()
+        }
+        async fn can_read(&self, _: &str, _: &RequestCtx) -> Result<bool, tonic::Status> {
+            Ok(true)
         }
         async fn missing(&self, _: &str, ids: &[ObjectId], _: &RequestCtx) -> Result<Vec<ObjectId>, tonic::Status> {
             Ok(ids.iter().filter(|id| !self.data.contains_key(id)).copied().collect())
@@ -328,12 +339,14 @@ mod tests {
         };
 
         // 第一次：整棵树（目录 + 小文件）
-        let got = warm_tree(&n, "r", None, root1.id, opts).await.expect("warm");
+        let got = warm_tree(&n, "r", None, root1.id, opts.clone()).await.expect("warm");
         assert_eq!(got, 5, "root, lib, src, b.rs, a.rs");
         up.asked.lock().expect("lock").clear();
 
         // 之后只取变化的路径：lib 没变，跳过
-        let got = warm_tree(&n, "r", Some(root1.id), root2.id, opts).await.expect("warm");
+        let got = warm_tree(&n, "r", Some(root1.id), root2.id, opts.clone())
+            .await
+            .expect("warm");
         let asked = up.asked.lock().expect("lock").clone();
         assert!(!asked.contains(&lib.id), "unchanged subtree skipped");
         assert!(!asked.contains(&big.id), "large blob skipped");
