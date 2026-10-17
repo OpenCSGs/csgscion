@@ -1,0 +1,522 @@
+//! 回源：从上游（L3 服务端，或负责某个 id 的另一个缓存节点）批量取对象。
+//!
+//! [`UpstreamPool`] 管理多个上游副本：
+//! - **熔断**：每个上游一个 [`Breaker`]，连续失败的上游在冷却期内被跳过；
+//! - **故障转移**：连接层面的失败（不可用、超时、数据损坏）换下一个上游重试；业务错误（对象不存在、
+//!   无权限等）直接返回，换上游也不会不同；
+//! - **对冲**：请求超过最近 p95 延迟仍未返回时，向另一个上游再发一份，取先成功的结果；
+//! - **并发上限**：同时在途的回源请求数有上限，保护上游。
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+use bytes::{Bytes, BytesMut};
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
+use scion_object::ObjectId;
+use scion_proto::v1::object_service_client::ObjectServiceClient;
+use scion_proto::v1::{Encoding, GetObjectsRequest, ObjectWant};
+use tokio::sync::Semaphore;
+use tonic::Code;
+use tonic::Status;
+use tonic::metadata::{Ascii, MetadataValue};
+use tonic::transport::Channel;
+
+use crate::breaker::Breaker;
+use crate::latency::Latency;
+
+/// 缓存节点之间转发的请求带上的元数据：收到的节点不再转发，直接回源。
+pub const CACHE_FORWARDED_HEADER: &str = "x-scion-cache-forwarded";
+
+/// 随请求透传给上游的信息。
+#[derive(Debug, Clone, Default)]
+pub struct RequestCtx {
+    /// 调用者的 `authorization`，原样转给上游（缓存不持有凭证）。
+    pub authorization: Option<MetadataValue<Ascii>>,
+}
+
+#[tonic::async_trait]
+pub trait Upstream: Send + Sync {
+    /// 取一批对象的完整内容，顺序与 `ids` 相同，并校验内容哈希。
+    async fn fetch(&self, repo: &str, ids: &[ObjectId], ctx: &RequestCtx) -> Result<Vec<Bytes>, Status>;
+
+    /// 日志中使用的名字（地址）。
+    fn name(&self) -> &str;
+}
+
+/// 通过 gRPC `GetObjects` 回源。
+pub struct GrpcUpstream {
+    name: String,
+    channel: Channel,
+    max_batch: usize,
+    /// 是否标记为缓存节点之间的转发。
+    forwarded: bool,
+}
+
+impl GrpcUpstream {
+    pub fn new(name: impl Into<String>, channel: Channel, max_batch: usize) -> Self {
+        Self {
+            name: name.into(),
+            channel,
+            max_batch: max_batch.max(1),
+            forwarded: false,
+        }
+    }
+
+    /// 发给另一个缓存节点：带上 [`CACHE_FORWARDED_HEADER`]。
+    pub fn forwarded(mut self) -> Self {
+        self.forwarded = true;
+        self
+    }
+
+    async fn fetch_batch(&self, repo: &str, ids: &[ObjectId], ctx: &RequestCtx) -> Result<Vec<Bytes>, Status> {
+        let mut req = tonic::Request::new(GetObjectsRequest {
+            repo: repo.to_owned(),
+            wants: ids
+                .iter()
+                .map(|id| ObjectWant {
+                    id: Bytes::copy_from_slice(&id.to_bytes()),
+                    offset: 0,
+                })
+                .collect(),
+            accept_encodings: vec![Encoding::Identity as i32],
+        });
+        if let Some(a) = &ctx.authorization {
+            req.metadata_mut().insert("authorization", a.clone());
+        }
+        if self.forwarded {
+            req.metadata_mut()
+                .insert(CACHE_FORWARDED_HEADER, MetadataValue::from_static("1"));
+        }
+        let mut stream = ObjectServiceClient::new(self.channel.clone())
+            .max_decoding_message_size(64 << 20)
+            .get_objects(req)
+            .await?
+            .into_inner();
+        let mut out = Vec::with_capacity(ids.len());
+        let mut buf = BytesMut::new();
+        while let Some(part) = stream.message().await? {
+            let Some(id) = ids.get(out.len()) else {
+                return Err(Status::internal(format!(
+                    "{} sent more objects than requested",
+                    self.name
+                )));
+            };
+            if part.id.as_ref() != id.to_bytes() || part.offset != buf.len() as u64 {
+                return Err(Status::internal(format!(
+                    "{} sent an unexpected chunk while reading {id}",
+                    self.name
+                )));
+            }
+            buf.extend_from_slice(&part.data);
+            if part.last {
+                let data = std::mem::take(&mut buf).freeze();
+                if data.len() as u64 != part.total_size || !id.verify(&data) {
+                    return Err(Status::data_loss(format!("{} returned corrupt object {id}", self.name)));
+                }
+                out.push(data);
+            }
+        }
+        if out.len() != ids.len() {
+            return Err(Status::unavailable(format!(
+                "{} ended the stream after {} of {} objects",
+                self.name,
+                out.len(),
+                ids.len()
+            )));
+        }
+        Ok(out)
+    }
+}
+
+#[tonic::async_trait]
+impl Upstream for GrpcUpstream {
+    async fn fetch(&self, repo: &str, ids: &[ObjectId], ctx: &RequestCtx) -> Result<Vec<Bytes>, Status> {
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(self.max_batch) {
+            out.extend(self.fetch_batch(repo, chunk, ctx).await?);
+        }
+        Ok(out)
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// 是否是上游本身的故障（值得换一个上游重试、计入熔断）。业务错误换上游也一样，直接返回。
+pub fn is_upstream_failure(s: &Status) -> bool {
+    matches!(
+        s.code(),
+        Code::Unavailable
+            | Code::DeadlineExceeded
+            | Code::Unknown
+            | Code::Internal
+            | Code::DataLoss
+            | Code::Cancelled
+            | Code::ResourceExhausted
+            | Code::Unimplemented
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolConfig {
+    /// 同时在途的回源请求上限。
+    pub max_in_flight: usize,
+    /// 是否对冲。
+    pub hedge: bool,
+    /// 对冲阈值的上下限（阈值本身取最近的 p95）。
+    pub hedge_min: Duration,
+    pub hedge_max: Duration,
+    /// 熔断：连续失败多少次打开、冷却多久。
+    pub breaker_threshold: u32,
+    pub breaker_cooldown: Duration,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            max_in_flight: 512,
+            hedge: true,
+            hedge_min: Duration::from_millis(5),
+            hedge_max: Duration::from_secs(2),
+            breaker_threshold: 5,
+            breaker_cooldown: Duration::from_secs(5),
+        }
+    }
+}
+
+struct Member {
+    up: Arc<dyn Upstream>,
+    breaker: Breaker,
+}
+
+/// 一组等价的上游副本。
+pub struct UpstreamPool {
+    members: Vec<Member>,
+    next: AtomicUsize,
+    permits: Semaphore,
+    latency: Latency,
+    config: PoolConfig,
+}
+
+type Attempt<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Bytes>, Status>> + Send + 'a>>;
+
+impl UpstreamPool {
+    pub fn new(upstreams: Vec<Arc<dyn Upstream>>, config: PoolConfig) -> Self {
+        Self {
+            members: upstreams
+                .into_iter()
+                .map(|up| Member {
+                    up,
+                    breaker: Breaker::new(config.breaker_threshold, config.breaker_cooldown),
+                })
+                .collect(),
+            next: AtomicUsize::new(0),
+            permits: Semaphore::new(config.max_in_flight.max(1)),
+            latency: Latency::default(),
+            config,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.members.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.members.is_empty()
+    }
+
+    /// 本次请求依次尝试的上游：从轮询位置开始，跳过熔断中的。
+    fn order(&self) -> Vec<usize> {
+        let n = self.members.len();
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
+        (0..n).map(|i| (start + i) % n).collect()
+    }
+
+    fn attempt<'a>(&'a self, i: usize, repo: &'a str, ids: &'a [ObjectId], ctx: &'a RequestCtx) -> Attempt<'a> {
+        Box::pin(async move {
+            let m = &self.members[i];
+            let started = Instant::now();
+            let r = m.up.fetch(repo, ids, ctx).await;
+            match &r {
+                Ok(_) => {
+                    self.latency.record(started.elapsed());
+                    m.breaker.success();
+                }
+                Err(s) if is_upstream_failure(s) => {
+                    tracing::warn!(upstream = m.up.name(), code = ?s.code(), error = %s.message(), "upstream fetch failed");
+                    m.breaker.failure();
+                }
+                // 业务错误说明上游是健康的
+                Err(_) => m.breaker.success(),
+            }
+            r
+        })
+    }
+
+    /// 取下一个可用的上游。
+    fn take_next(&self, order: &mut std::vec::IntoIter<usize>) -> Option<usize> {
+        order.find(|i| self.members[*i].breaker.allow())
+    }
+
+    /// 回源一批对象。
+    pub async fn fetch(&self, repo: &str, ids: &[ObjectId], ctx: &RequestCtx) -> Result<Vec<Bytes>, Status> {
+        let _permit = self
+            .permits
+            .acquire()
+            .await
+            .map_err(|_| Status::unavailable("upstream pool closed"))?;
+        let mut order = self.order().into_iter();
+        let Some(first) = self.take_next(&mut order) else {
+            return Err(Status::unavailable("all upstreams are unavailable"));
+        };
+        let mut running = FuturesUnordered::new();
+        running.push(self.attempt(first, repo, ids, ctx));
+        let mut hedged = !self.config.hedge;
+        let timer = tokio::time::sleep(self.latency.hedge_after(self.config.hedge_min, self.config.hedge_max));
+        tokio::pin!(timer);
+        let mut last_err = None;
+        loop {
+            tokio::select! {
+                Some(r) = running.next() => match r {
+                    Ok(v) => return Ok(v),
+                    Err(e) if !is_upstream_failure(&e) => return Err(e),
+                    Err(e) => {
+                        last_err = Some(e);
+                        // 没有其它在途的请求时，换下一个上游
+                        if running.is_empty() {
+                            match self.take_next(&mut order) {
+                                Some(i) => running.push(self.attempt(i, repo, ids, ctx)),
+                                None => break,
+                            }
+                        }
+                    }
+                },
+                // 超过 p95 仍未返回：对冲，再发一份给另一个上游
+                () = &mut timer, if !hedged => {
+                    hedged = true;
+                    if let Some(i) = self.take_next(&mut order) {
+                        tracing::debug!(upstream = self.members[i].up.name(), "hedging slow upstream fetch");
+                        running.push(self.attempt(i, repo, ids, ctx));
+                    }
+                }
+                else => break,
+            }
+        }
+        Err(last_err.unwrap_or_else(|| Status::unavailable("all upstreams are unavailable")))
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicU32;
+
+    /// 测试用上游：按脚本返回结果，可设置延迟。
+    pub(crate) struct Fake {
+        pub name: String,
+        pub delay: Duration,
+        /// 每次调用依次取一个结果；用完后重复最后一个。
+        pub script: Mutex<Vec<Result<(), Status>>>,
+        pub calls: AtomicU32,
+        pub data: std::collections::HashMap<ObjectId, Bytes>,
+    }
+
+    impl Fake {
+        pub(crate) fn new(name: &str, objects: &[&'static [u8]]) -> Self {
+            Self {
+                name: name.into(),
+                delay: Duration::ZERO,
+                script: Mutex::new(vec![Ok(())]),
+                calls: AtomicU32::new(0),
+                data: objects
+                    .iter()
+                    .map(|o| (ObjectId::of_blob(o), Bytes::from_static(o)))
+                    .collect(),
+            }
+        }
+
+        pub(crate) fn delay(mut self, d: Duration) -> Self {
+            self.delay = d;
+            self
+        }
+
+        pub(crate) fn script(self, s: Vec<Result<(), Status>>) -> Self {
+            *self.script.lock().expect("lock") = s;
+            self
+        }
+
+        pub(crate) fn calls(&self) -> u32 {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[tonic::async_trait]
+    impl Upstream for Fake {
+        async fn fetch(&self, _repo: &str, ids: &[ObjectId], _ctx: &RequestCtx) -> Result<Vec<Bytes>, Status> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let step = {
+                let mut s = self.script.lock().expect("lock");
+                if s.len() > 1 { s.remove(0) } else { s[0].clone() }
+            };
+            tokio::time::sleep(self.delay).await;
+            step?;
+            ids.iter()
+                .map(|id| {
+                    self.data
+                        .get(id)
+                        .cloned()
+                        .ok_or_else(|| Status::failed_precondition(format!("missing {id}")))
+                })
+                .collect()
+        }
+
+        fn name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    fn pool(members: Vec<Arc<Fake>>, config: PoolConfig) -> UpstreamPool {
+        UpstreamPool::new(members.into_iter().map(|m| m as Arc<dyn Upstream>).collect(), config)
+    }
+
+    fn no_hedge() -> PoolConfig {
+        PoolConfig {
+            hedge: false,
+            ..PoolConfig::default()
+        }
+    }
+
+    const OBJ: &[u8] = b"object";
+
+    fn id() -> ObjectId {
+        ObjectId::of_blob(OBJ)
+    }
+
+    #[tokio::test]
+    async fn fetches_and_round_robins() {
+        let (a, b) = (Arc::new(Fake::new("a", &[OBJ])), Arc::new(Fake::new("b", &[OBJ])));
+        let p = pool(vec![a.clone(), b.clone()], no_hedge());
+        assert_eq!((p.len(), p.is_empty()), (2, false));
+        for _ in 0..4 {
+            let got = p.fetch("r", &[id()], &RequestCtx::default()).await.expect("ok");
+            assert_eq!(got, vec![Bytes::from_static(OBJ)]);
+        }
+        assert_eq!((a.calls(), b.calls()), (2, 2));
+    }
+
+    #[tokio::test]
+    async fn business_errors_return_without_failover() {
+        let (a, b) = (Arc::new(Fake::new("a", &[])), Arc::new(Fake::new("b", &[OBJ])));
+        let p = pool(vec![a.clone(), b.clone()], no_hedge());
+        let err = p
+            .fetch("r", &[id()], &RequestCtx::default())
+            .await
+            .expect_err("missing");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert_eq!(a.calls() + b.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn failures_fail_over_and_trip_the_breaker() {
+        let down = Arc::new(Fake::new("down", &[OBJ]).script(vec![Err(Status::unavailable("down"))]));
+        let up = Arc::new(Fake::new("up", &[OBJ]));
+        let p = pool(
+            vec![down.clone(), up.clone()],
+            PoolConfig {
+                breaker_threshold: 2,
+                breaker_cooldown: Duration::from_secs(60),
+                ..no_hedge()
+            },
+        );
+        for _ in 0..6 {
+            p.fetch("r", &[id()], &RequestCtx::default())
+                .await
+                .expect("served by up");
+        }
+        assert_eq!(down.calls(), 2, "breaker opened after two failures");
+        assert_eq!(up.calls(), 6);
+        // 全部上游都坏了：返回最后的错误
+        let p = pool(vec![down.clone()], no_hedge());
+        assert_eq!(
+            p.fetch("r", &[id()], &RequestCtx::default())
+                .await
+                .map_err(|e| e.code()),
+            Err(Code::Unavailable)
+        );
+        let empty = pool(vec![], no_hedge());
+        assert!(empty.is_empty());
+        assert_eq!(
+            empty
+                .fetch("r", &[id()], &RequestCtx::default())
+                .await
+                .map_err(|e| e.code()),
+            Err(Code::Unavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_primary_is_hedged() {
+        let slow = Arc::new(Fake::new("slow", &[OBJ]).delay(Duration::from_secs(5)));
+        let fast = Arc::new(Fake::new("fast", &[OBJ]).delay(Duration::from_millis(1)));
+        let cfg = PoolConfig {
+            hedge_min: Duration::from_millis(10),
+            hedge_max: Duration::from_millis(20),
+            ..PoolConfig::default()
+        };
+        let p = pool(vec![slow.clone(), fast.clone()], cfg);
+        let started = Instant::now();
+        for _ in 0..2 {
+            p.fetch("r", &[id()], &RequestCtx::default()).await.expect("ok");
+        }
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert_eq!(slow.calls(), 1, "slow was primary once");
+        // 只有一个上游时对冲没有对象可发，等主请求完成
+        let only = pool(
+            vec![Arc::new(Fake::new("only", &[OBJ]).delay(Duration::from_millis(30)))],
+            cfg,
+        );
+        only.fetch("r", &[id()], &RequestCtx::default()).await.expect("ok");
+    }
+
+    #[tokio::test]
+    async fn hedge_failure_waits_for_primary() {
+        let slow = Arc::new(Fake::new("slow", &[OBJ]).delay(Duration::from_millis(60)));
+        let broken = Arc::new(Fake::new("broken", &[OBJ]).script(vec![Err(Status::internal("boom"))]));
+        let cfg = PoolConfig {
+            hedge_min: Duration::from_millis(5),
+            hedge_max: Duration::from_millis(5),
+            breaker_threshold: 100,
+            ..PoolConfig::default()
+        };
+        let p = pool(vec![slow.clone(), broken.clone()], cfg);
+        // 第一次 slow 是主请求，对冲给 broken 失败，最终等到 slow 的结果
+        p.fetch("r", &[id()], &RequestCtx::default())
+            .await
+            .expect("primary wins");
+        assert_eq!((slow.calls(), broken.calls()), (1, 1));
+    }
+
+    #[test]
+    fn upstream_failure_classification() {
+        for c in [
+            Code::Unavailable,
+            Code::DeadlineExceeded,
+            Code::DataLoss,
+            Code::Internal,
+        ] {
+            assert!(is_upstream_failure(&Status::new(c, "")), "{c:?}");
+        }
+        for c in [
+            Code::NotFound,
+            Code::FailedPrecondition,
+            Code::PermissionDenied,
+            Code::InvalidArgument,
+        ] {
+            assert!(!is_upstream_failure(&Status::new(c, "")), "{c:?}");
+        }
+    }
+}

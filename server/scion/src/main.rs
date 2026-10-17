@@ -1,6 +1,6 @@
 //! `scion`：服务端单二进制，按子命令区分角色。
 //!
-//! 目前有 `server` 和 `version`；`cache`、`deriver`、`janitor`、`import`、`admin` 按里程碑逐个加入。
+//! 目前有 `server`、`cache`、`admin` 和 `version`；`deriver`、`janitor` 按里程碑逐个加入。
 
 mod storage;
 
@@ -32,6 +32,8 @@ enum LogFormat {
 enum Command {
     /// 运行 L3 服务端。
     Server(ServerArgs),
+    /// 运行区域对象缓存（L2）。
+    Cache(CacheArgs),
     /// 打印版本与协议版本。
     Version,
     /// 运维命令。
@@ -104,8 +106,151 @@ struct ServerArgs {
     /// 按仓库的写入速率限制：每秒 RATE 次，可选突发 BURST（默认等于 2×RATE），如 200 或 200/1000。
     #[arg(long, value_name = "RATE[/BURST]", value_parser = parse_write_rate, env = "SCION_REPO_WRITE_RATE")]
     repo_write_rate: Option<scion_api::WriteRate>,
+    /// 推荐给客户端的只读端点（区域缓存 `scion cache` 的地址），可附带区域名：URL 或 URL@REGION。
+    /// 可重复指定，客户端从中选择读取对象的地址。
+    #[arg(long = "read-endpoint", value_name = "URL[@REGION]", value_parser = parse_read_endpoint,
+        env = "SCION_READ_ENDPOINTS", value_delimiter = ',')]
+    read_endpoints: Vec<scion_api::ReadEndpoint>,
+    /// WatchRefs 轮询元数据库的间隔（集群中其它节点的合入通知到订阅者的最大延迟），如 500ms、2s。
+    #[arg(long, value_name = "DURATION", default_value = "1s", value_parser = parse_duration,
+        env = "SCION_REF_POLL_INTERVAL")]
+    ref_poll_interval: std::time::Duration,
     #[command(flatten)]
     storage: StorageArgs,
+}
+
+#[derive(Debug, clap::Args)]
+struct CacheArgs {
+    /// gRPC 监听地址。
+    #[arg(long, default_value = "127.0.0.1:7090", env = "SCION_CACHE_LISTEN")]
+    listen: SocketAddr,
+    /// 上游 L3 服务端地址，可重复指定（同一集群的多个节点，互为副本）。
+    #[arg(
+        long = "upstream",
+        value_name = "URL",
+        required = true,
+        env = "SCION_CACHE_UPSTREAMS",
+        value_delimiter = ','
+    )]
+    upstreams: Vec<String>,
+    /// 本节点供其它缓存节点访问的地址；与 --peer 一起按 rendezvous 哈希分片。
+    #[arg(long, value_name = "URL", env = "SCION_CACHE_ADVERTISE_URL")]
+    advertise_url: Option<String>,
+    /// 区域内其它缓存节点的地址，可重复指定。
+    #[arg(
+        long = "peer",
+        value_name = "URL",
+        env = "SCION_CACHE_PEERS",
+        value_delimiter = ',',
+        requires = "advertise_url"
+    )]
+    peers: Vec<String>,
+    /// 内存层容量，如 512MiB、8GiB。
+    #[arg(long, value_name = "SIZE", default_value = "1GiB", value_parser = parse_size, env = "SCION_CACHE_MEMORY")]
+    memory: u64,
+    /// 磁盘层目录（建议放在 NVMe 上）；不指定时只用内存。
+    #[arg(long, value_name = "DIR", env = "SCION_CACHE_DISK_DIR")]
+    disk_dir: Option<PathBuf>,
+    /// 磁盘层容量。
+    #[arg(long, value_name = "SIZE", default_value = "64GiB", value_parser = parse_size, env = "SCION_CACHE_DISK_SIZE")]
+    disk_size: u64,
+    /// 超过这个大小的对象不缓存（最大 16MiB）。
+    #[arg(long, value_name = "SIZE", default_value = "8MiB", value_parser = parse_size)]
+    max_object: u64,
+    /// 预热：订阅上游的 ref 变化并预取变化的目录树。REPO 或 REPO:REF[,REF...]，可重复指定。
+    #[arg(
+        long = "warm",
+        value_name = "REPO[:REFS]",
+        env = "SCION_CACHE_WARM",
+        value_delimiter = ';'
+    )]
+    warm: Vec<scion_cache::WarmTarget>,
+    /// 预热时连同不超过这个大小的文件一起预取；0 只预取目录树。
+    #[arg(long, value_name = "SIZE", default_value = "0", value_parser = parse_size)]
+    warm_blob_max: u64,
+    /// 关闭对冲（慢请求向另一个上游重发）。
+    #[arg(long)]
+    no_hedge: bool,
+}
+
+/// 字节数：纯数字，或带 K/M/G/T（KiB/MiB/…，均按 1024 进位）后缀。
+fn parse_size(s: &str) -> Result<u64, String> {
+    let t = s.trim();
+    let split = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
+    let (num, unit) = t.split_at(split);
+    let n: u64 = num
+        .parse()
+        .map_err(|_| format!("invalid size {s:?}; expected e.g. 512MiB"))?;
+    let shift = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 0,
+        "k" | "kb" | "kib" => 10,
+        "m" | "mb" | "mib" => 20,
+        "g" | "gb" | "gib" => 30,
+        "t" | "tb" | "tib" => 40,
+        _ => return Err(format!("invalid size unit in {s:?}; use K, M, G or T")),
+    };
+    n.checked_mul(1u64 << shift)
+        .ok_or_else(|| format!("size {s:?} is too large"))
+}
+
+/// 时长：数字加 ms、s、m 后缀。
+fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
+    let t = s.trim();
+    let split = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
+    let (num, unit) = t.split_at(split);
+    let n: u64 = num
+        .parse()
+        .map_err(|_| format!("invalid duration {s:?}; expected e.g. 500ms or 2s"))?;
+    match unit {
+        "ms" => Ok(std::time::Duration::from_millis(n)),
+        "s" => Ok(std::time::Duration::from_secs(n)),
+        "m" => Ok(std::time::Duration::from_secs(n * 60)),
+        _ => Err(format!("invalid duration unit in {s:?}; use ms, s or m")),
+    }
+}
+
+fn parse_read_endpoint(s: &str) -> Result<scion_api::ReadEndpoint, String> {
+    let (url, region) = match s.rsplit_once('@') {
+        Some((u, r)) => (u.trim(), r.trim()),
+        None => (s.trim(), ""),
+    };
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(format!("read endpoint must be an http:// or https:// URL, got {url:?}"));
+    }
+    Ok(scion_api::ReadEndpoint {
+        url: url.trim_end_matches('/').to_owned(),
+        region: region.to_owned(),
+    })
+}
+
+fn cache_config(args: &CacheArgs) -> anyhow::Result<scion_cache::CacheConfig> {
+    let size = |v: u64, what: &str| usize::try_from(v).with_context(|| format!("{what} is too large"));
+    Ok(scion_cache::CacheConfig {
+        upstreams: args.upstreams.clone(),
+        advertise_url: args.advertise_url.clone(),
+        peers: args.peers.clone(),
+        storage: scion_cache::StorageConfig {
+            memory_bytes: size(args.memory, "--memory")?,
+            disk: match &args.disk_dir {
+                Some(dir) => Some(scion_cache::DiskConfig {
+                    dir: dir.clone(),
+                    capacity_bytes: size(args.disk_size, "--disk-size")?,
+                }),
+                None => None,
+            },
+            max_object_bytes: size(args.max_object, "--max-object")?,
+        },
+        pool: scion_cache::PoolConfig {
+            hedge: !args.no_hedge,
+            ..scion_cache::PoolConfig::default()
+        },
+        warm: args.warm.clone(),
+        warm_options: scion_cache::WarmOptions {
+            max_blob_bytes: args.warm_blob_max,
+            ..scion_cache::WarmOptions::default()
+        },
+        ..scion_cache::CacheConfig::default()
+    })
 }
 
 fn parse_write_rate(s: &str) -> Result<scion_api::WriteRate, String> {
@@ -184,6 +329,8 @@ async fn build_app(args: &ServerArgs, env: impl Fn(&str) -> Option<String>) -> a
             cluster,
             max_concurrent_requests: args.max_concurrent_requests,
             repo_write_rate: args.repo_write_rate,
+            read_endpoints: args.read_endpoints.clone(),
+            ref_poll_interval: args.ref_poll_interval,
             ..ServerConfig::default()
         }),
         meta,
@@ -248,6 +395,21 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn run_cache(args: CacheArgs) -> anyhow::Result<()> {
+    let config = cache_config(&args)?;
+    let listener = tokio::net::TcpListener::bind(args.listen)
+        .await
+        .with_context(|| format!("bind {}", args.listen))?;
+    let addr = listener.local_addr()?;
+    let (node, info, channels) = scion_cache::build(&config).await?;
+    // 集成测试按这一行解析实际监听地址
+    tracing::info!(%addr, upstreams = ?config.upstreams, peers = ?config.peers,
+        disk = ?config.storage.disk.as_ref().map(|d| d.dir.display().to_string()), "scion cache listening");
+    scion_cache::serve_node(listener, node, info, channels, &config, shutdown_signal()).await?;
+    tracing::info!("scion cache stopped");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -259,6 +421,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Server(args) => {
             init_tracing(cli.log_format);
             run_server(args).await
+        }
+        Command::Cache(args) => {
+            init_tracing(cli.log_format);
+            run_cache(args).await
         }
         Command::Admin(AdminCmd::Reindex(args)) => {
             for line in reindex(&args, |k| std::env::var(k).ok()).await? {
@@ -277,6 +443,107 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn parse_sizes_and_durations() {
+        assert_eq!(parse_size("1024"), Ok(1024));
+        assert_eq!(parse_size("512MiB"), Ok(512 << 20));
+        assert_eq!(parse_size("8gib"), Ok(8 << 30));
+        assert_eq!(parse_size("2T"), Ok(2 << 40));
+        assert_eq!(parse_size(" 4 k "), Ok(4096));
+        assert_eq!(parse_size("7b"), Ok(7));
+        assert!(parse_size("MiB").is_err());
+        assert!(parse_size("5 parsecs").is_err());
+        assert!(parse_size("99999999999T").is_err());
+        assert_eq!(parse_duration("500ms"), Ok(std::time::Duration::from_millis(500)));
+        assert_eq!(parse_duration("2s"), Ok(std::time::Duration::from_secs(2)));
+        assert_eq!(parse_duration("3m"), Ok(std::time::Duration::from_secs(180)));
+        assert!(parse_duration("2h").is_err());
+        assert!(parse_duration("s").is_err());
+    }
+
+    #[test]
+    fn parse_read_endpoints() {
+        assert_eq!(
+            parse_read_endpoint("http://cache:7090/@cn-beijing"),
+            Ok(scion_api::ReadEndpoint {
+                url: "http://cache:7090".into(),
+                region: "cn-beijing".into()
+            })
+        );
+        assert_eq!(parse_read_endpoint("https://c").map(|e| e.region), Ok(String::new()));
+        assert!(parse_read_endpoint("cache:7090").is_err());
+        let cli = Cli::try_parse_from([
+            "scion",
+            "server",
+            "--read-endpoint",
+            "http://a:7090@r1",
+            "--read-endpoint",
+            "http://b:7090",
+            "--ref-poll-interval",
+            "250ms",
+        ])
+        .expect("parse");
+        let Command::Server(a) = cli.command else {
+            panic!("server");
+        };
+        assert_eq!(a.read_endpoints.len(), 2);
+        assert_eq!(a.ref_poll_interval, std::time::Duration::from_millis(250));
+    }
+
+    #[test]
+    fn parse_cache_args() {
+        let cli = Cli::try_parse_from([
+            "scion",
+            "cache",
+            "--upstream",
+            "http://l3a:7080",
+            "--upstream",
+            "http://l3b:7080",
+            "--advertise-url",
+            "http://c1:7090",
+            "--peer",
+            "http://c2:7090",
+            "--memory",
+            "256MiB",
+            "--disk-dir",
+            "/var/cache/scion",
+            "--disk-size",
+            "10GiB",
+            "--warm",
+            "mono:main,release",
+            "--warm-blob-max",
+            "64KiB",
+            "--no-hedge",
+        ])
+        .expect("parse");
+        let Command::Cache(a) = cli.command else {
+            panic!("cache");
+        };
+        let c = cache_config(&a).expect("config");
+        assert_eq!(c.upstreams.len(), 2);
+        assert_eq!(c.peers, ["http://c2:7090"]);
+        assert_eq!(c.storage.memory_bytes, 256 << 20);
+        assert_eq!(c.storage.disk.as_ref().map(|d| d.capacity_bytes), Some(10 << 30));
+        assert_eq!(c.storage.max_object_bytes, 8 << 20);
+        assert_eq!(c.warm[0].refs, ["main", "release"]);
+        assert_eq!(c.warm_options.max_blob_bytes, 64 << 10);
+        assert!(!c.pool.hedge);
+        // 默认值
+        let cli = Cli::try_parse_from(["scion", "cache", "--upstream", "http://l3:7080"]).expect("parse");
+        let Command::Cache(a) = cli.command else {
+            panic!("cache");
+        };
+        let c = cache_config(&a).expect("config");
+        assert_eq!(
+            (c.storage.memory_bytes, c.storage.disk.is_none(), c.pool.hedge),
+            (1 << 30, true, true)
+        );
+        assert_eq!(a.listen, "127.0.0.1:7090".parse().expect("addr"));
+        // 必须有上游；--peer 需要 --advertise-url
+        assert!(Cli::try_parse_from(["scion", "cache"]).is_err());
+        assert!(Cli::try_parse_from(["scion", "cache", "--upstream", "http://l3", "--peer", "http://c2"]).is_err());
     }
 
     #[test]

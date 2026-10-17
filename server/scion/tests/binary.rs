@@ -42,8 +42,14 @@ fn spawn_server(extra: &[&str]) -> (ServerProcess, String) {
 
 /// `drain_logs = false` 时读到监听地址后立即关闭日志管道，模拟日志采集进程退出。
 fn spawn_server_with(extra: &[&str], drain_logs: bool) -> (ServerProcess, String) {
-    let mut argv = vec!["--log-format", "json", "server", "--listen", "127.0.0.1:0"];
+    spawn_role("server", extra, drain_logs)
+}
+
+/// 启动一个角色（server / cache），等它打印「scion <role> listening」。
+fn spawn_role(role: &str, extra: &[&str], drain_logs: bool) -> (ServerProcess, String) {
+    let mut argv = vec!["--log-format", "json", role, "--listen", "127.0.0.1:0"];
     argv.extend_from_slice(extra);
+    let marker = format!("scion {role} listening");
     let mut child = Command::new(env!("CARGO_BIN_EXE_scion"))
         .args(&argv)
         .env("SCION_LOG", "info")
@@ -53,9 +59,9 @@ fn spawn_server_with(extra: &[&str], drain_logs: bool) -> (ServerProcess, String
     let stderr = child.stderr.take().expect("stderr");
     let mut lines = BufReader::new(stderr).lines();
     let addr = loop {
-        let line = lines.next().expect("server exited before listening").expect("read");
+        let line = lines.next().expect("process exited before listening").expect("read");
         let v: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
-        if v["fields"]["message"] == "scion server listening" {
+        if v["fields"]["message"] == marker.as_str() {
             break v["fields"]["addr"].as_str().expect("addr").to_string();
         }
     };
@@ -196,4 +202,50 @@ async fn server_serves_and_stops_on_sigterm() {
     assert!(status.success());
     let exit = child.wait().expect("wait");
     assert!(exit.success(), "server should exit cleanly on SIGTERM: {exit:?}");
+}
+
+/// `scion cache` 进程：经缓存读对象、预热订阅，两个进程都能收到 SIGTERM 后干净退出。
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn cache_serves_objects_from_the_server() {
+    let (server, addr) = spawn_server(&["--repo", "mono"]);
+    let upstream = format!("http://{addr}");
+    let direct = scion_client::Client::builder()
+        .endpoint(&upstream)
+        .repo("mono")
+        .build()
+        .await
+        .expect("connect");
+    let cs = direct
+        .changeset(None)
+        .put("a.txt", "hello")
+        .create()
+        .await
+        .expect("create");
+    direct.land("main", &cs.id).await.expect("land");
+
+    let (cache, cache_addr) = spawn_role("cache", &["--upstream", &upstream, "--warm", "mono:main"], true);
+    let via = scion_client::Client::builder()
+        .endpoint(format!("http://{cache_addr}"))
+        .repo("mono")
+        .build()
+        .await
+        .expect("connect cache");
+    assert_eq!(via.server_info().role, scion_client::Role::Cache);
+    let blob = scion_client::ObjectId::of_blob(b"hello");
+    assert_eq!(via.get_object(&blob).await.expect("read").as_ref(), b"hello");
+    drop((via, direct));
+    stop(cache);
+    // 缓存的 WatchRefs 订阅不能挡住服务端的优雅退出
+    stop(server);
+}
+
+#[test]
+fn cache_requires_reachable_upstream() {
+    let out = Command::new(env!("CARGO_BIN_EXE_scion"))
+        .args(["cache", "--listen", "127.0.0.1:0", "--upstream", "http://127.0.0.1:1"])
+        .output()
+        .expect("run");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("upstream"));
 }
