@@ -315,6 +315,13 @@ impl BlobStore for ObjectBlobStore {
             Err(e) => Err(backend("head object", e)),
         }
     }
+
+    async fn delete(&self, id: &ObjectId) -> Result<()> {
+        match self.store.delete(&self.key(id)).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(backend("delete object", e)),
+        }
+    }
 }
 
 #[cfg(test)]

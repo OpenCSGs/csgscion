@@ -10,7 +10,7 @@ use scion_object::{ObjectId, ObjectKind};
 
 use crate::{
     BlobStore, ChangesetRecord, Error, IdempotencyRecord, IndexedObject, LandedChange, Lease, MetaStore, PathChange,
-    PathHistoryEntry, RefExpect, RefState,
+    PathHistoryEntry, Redaction, RedactionFilter, RefExpect, RefState,
 };
 
 fn cs(n: u8) -> ObjectId {
@@ -113,7 +113,7 @@ pub async fn blob_store<S: BlobStore + ?Sized>(s: &S) {
     s.put(idb, b.clone()).await.expect("put empty blob");
 
     assert_eq!(s.get(&ida).await, Ok(Some(a)));
-    assert_eq!(s.get(&idb).await, Ok(Some(b)));
+    assert_eq!(s.get(&idb).await, Ok(Some(b.clone())));
     assert_eq!(s.exists(&ida).await, Ok(true));
 
     // 字节与 id 不符：拒绝，且不留下任何对象
@@ -129,6 +129,14 @@ pub async fn blob_store<S: BlobStore + ?Sized>(s: &S) {
     let idbig = ObjectId::of_blob(&big);
     s.put(idbig, big.clone()).await.expect("put big");
     assert_eq!(s.get(&idbig).await, Ok(Some(big)));
+
+    // 物理删除（redaction 清除）：删除后读不到，重复删除和删除不存在的对象都不是错误
+    s.delete(&ida).await.expect("delete");
+    assert_eq!(s.get(&ida).await, Ok(None));
+    assert_eq!(s.exists(&ida).await, Ok(false));
+    s.delete(&ida).await.expect("delete again");
+    s.delete(&idc).await.expect("delete missing");
+    assert_eq!(s.get(&idb).await, Ok(Some(b)), "other objects untouched");
 }
 
 /// 对象索引的语义：按仓库隔离、幂等登记、FindMissing。
@@ -596,6 +604,126 @@ pub async fn leases<S: MetaStore + ?Sized>(s: &S) {
     s.release_lease("missing", "node-a")
         .await
         .expect("release missing scope");
+    let all = s.list_leases().await.expect("list");
+    assert_eq!(
+        all.iter()
+            .map(|(k, l)| (k.as_str(), l.holder.as_str()))
+            .collect::<Vec<_>>(),
+        [("land/r/dev", "node-b"), ("land/r/main", "node-a")]
+    );
+}
+
+/// redaction 记录：按 (仓库, 对象) 覆盖、全局递增的 seq、各种过滤条件；按 id 查找对象所在的仓库。
+pub async fn redactions<S: MetaStore + ?Sized>(s: &S) {
+    s.create_repo("red/a").await.expect("create");
+    s.create_repo("red/b").await.expect("create");
+    let x = ObjectId::of_blob(b"secret-x");
+    let y = ObjectId::of_blob(b"secret-y");
+    s.index_objects(
+        "red/a",
+        &[IndexedObject { id: x, size: 8 }, IndexedObject { id: y, size: 8 }],
+    )
+    .await
+    .expect("index");
+    s.index_objects("red/b", &[IndexedObject { id: x, size: 8 }])
+        .await
+        .expect("index");
+    assert_eq!(
+        s.object_repos(&x).await,
+        Ok(vec!["red/a".to_string(), "red/b".to_string()])
+    );
+    assert_eq!(s.object_repos(&y).await, Ok(vec!["red/a".to_string()]));
+    assert_eq!(s.object_repos(&ObjectId::of_blob(b"none")).await, Ok(vec![]));
+
+    let rec = |repo: &str, id: ObjectId, rid: &str| Redaction {
+        repo: repo.into(),
+        id,
+        redaction_id: rid.into(),
+        reason: "leaked key".into(),
+        created_by: "root".into(),
+        created_at_ms: 1_000,
+        active: true,
+        purge_after_ms: None,
+        purged_at_ms: None,
+        seq: 0,
+    };
+    assert_eq!(s.get_redactions("red/a", &[x, y]).await, Ok(vec![]));
+    assert_eq!(
+        s.put_redactions(&[rec("nope", x, "rd1")]).await,
+        Err(Error::RepoNotFound("nope".into()))
+    );
+    s.put_redactions(&[rec("red/a", x, "rd1"), rec("red/a", y, "rd1")])
+        .await
+        .expect("put");
+    s.put_redactions(&[rec("red/b", x, "rd2")]).await.expect("put");
+    let all = s.list_redactions(&RedactionFilter::default()).await.expect("list");
+    assert_eq!(all.len(), 3);
+    assert!(all.windows(2).all(|w| w[0].seq < w[1].seq), "ascending seq");
+    assert!(all[0].seq > 0);
+    assert_eq!(
+        (
+            all[2].repo.as_str(),
+            all[2].id,
+            all[2].reason.as_str(),
+            all[2].created_by.as_str()
+        ),
+        ("red/b", x, "leaked key", "root")
+    );
+    let mut got = s.get_redactions("red/a", &[x, y, x]).await.expect("get");
+    got.sort_by_key(|r| r.seq);
+    assert_eq!(got, all[..2]);
+    assert_eq!(s.get_redactions("red/b", &[y]).await, Ok(vec![]));
+
+    // 过滤
+    let f = |repo: Option<&str>, rid: Option<&str>, after: u64| RedactionFilter {
+        repo: repo.map(str::to_owned),
+        redaction_id: rid.map(str::to_owned),
+        after_seq: after,
+        ..RedactionFilter::default()
+    };
+    assert_eq!(
+        s.list_redactions(&f(Some("red/b"), None, 0)).await.expect("repo").len(),
+        1
+    );
+    assert_eq!(s.list_redactions(&f(None, Some("rd1"), 0)).await.expect("rid").len(), 2);
+    assert_eq!(
+        s.list_redactions(&f(None, None, all[0].seq)).await.expect("after"),
+        all[1..]
+    );
+    let limited = RedactionFilter {
+        limit: 1,
+        ..RedactionFilter::default()
+    };
+    assert_eq!(s.list_redactions(&limited).await.expect("limit"), all[..1]);
+
+    // 覆盖：撤销、安排清除、标记已清除，每次都分配新的 seq
+    let mut undo = all[1].clone();
+    undo.active = false;
+    let mut due = all[0].clone();
+    due.purge_after_ms = Some(5_000);
+    let mut purged = all[2].clone();
+    purged.purge_after_ms = Some(1_000);
+    purged.purged_at_ms = Some(2_000);
+    s.put_redactions(&[undo, due, purged]).await.expect("update");
+    let after = s.list_redactions(&f(None, None, all[2].seq)).await.expect("changed");
+    assert_eq!(after.len(), 3, "every update gets a new seq");
+    assert_eq!(
+        s.list_redactions(&RedactionFilter::default()).await.expect("all").len(),
+        3
+    );
+    let due_at = |t: i64| RedactionFilter {
+        purge_due_at: Some(t),
+        ..RedactionFilter::default()
+    };
+    assert_eq!(s.list_redactions(&due_at(4_999)).await, Ok(vec![]));
+    let due = s.list_redactions(&due_at(5_000)).await.expect("due");
+    assert_eq!(due.len(), 1, "inactive and purged records are not due");
+    assert_eq!(
+        (due[0].repo.as_str(), due[0].id, due[0].purge_after_ms),
+        ("red/a", x, Some(5_000))
+    );
+    let y_rec = s.get_redactions("red/a", &[y]).await.expect("get");
+    assert!(!y_rec[0].active);
 }
 
 /// 合入的原子提交：ref CAS、landed 行与幂等记录同成同败；已存在的记录保留第一次的值。

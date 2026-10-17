@@ -11,6 +11,12 @@ pub enum Error {
     /// ref CAS 条件不满足。`current` 为 `None` 表示 ref 不存在。
     #[error("ref {name:?} version mismatch (current: {current:?})")]
     RefVersionMismatch { name: String, current: Option<u64> },
+    /// 对象已被 redaction，不能读取。
+    #[error("object {id} is redacted ({redaction_id})")]
+    Redacted {
+        id: scion_object::ObjectId,
+        redaction_id: String,
+    },
     /// 后端故障（数据库、网络等），通常可重试。
     #[error("storage backend error: {0}")]
     Backend(String),
@@ -45,5 +51,14 @@ mod tests {
             "ref \"main\" version mismatch (current: Some(3))"
         );
         assert_eq!(Error::Backend("io".into()).to_string(), "storage backend error: io");
+        let id = scion_object::ObjectId::of_blob(b"x");
+        assert_eq!(
+            Error::Redacted {
+                id,
+                redaction_id: "rd1".into()
+            }
+            .to_string(),
+            format!("object {id} is redacted (rd1)")
+        );
     }
 }

@@ -91,7 +91,40 @@ pub(crate) fn record_from_row(row: ChangesetRow) -> Result<scion_store::Changese
     })
 }
 
-/// URL 中的密码替换为 `***`，用于错误信息和日志。
+/// redactions 表（连同仓库名）的一行，与 [`REDACTION_COLUMNS`] 顺序一致。
+pub(crate) type RedactionRow = (
+    String,
+    Vec<u8>,
+    String,
+    String,
+    String,
+    i64,
+    bool,
+    Option<i64>,
+    Option<i64>,
+    i64,
+);
+
+/// 查询 redaction 时的列（`r` 为 repos，`x` 为 redactions）。
+pub(crate) const REDACTION_COLUMNS: &str = "r.name, x.object_id, x.redaction_id, x.reason, x.created_by, \
+     x.created_at_ms, x.active, x.purge_after_ms, x.purged_at_ms, x.seq";
+
+pub(crate) fn redaction_from_row(row: RedactionRow) -> Result<scion_store::Redaction> {
+    let (repo, id, redaction_id, reason, created_by, created_at_ms, active, purge_after_ms, purged_at_ms, seq) = row;
+    Ok(scion_store::Redaction {
+        repo,
+        id: id_from_db(&id)?,
+        redaction_id,
+        reason,
+        created_by,
+        created_at_ms,
+        active,
+        purge_after_ms,
+        purged_at_ms,
+        seq: version_from_db(seq)?,
+    })
+}
+
 /// tokens 表的一行。
 pub(crate) type TokenRow = (String, Vec<u8>, String, String, String, String, i64, Option<i64>);
 

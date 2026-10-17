@@ -11,6 +11,7 @@ mod blobcache;
 mod cached;
 mod error;
 mod mem;
+mod redacted;
 mod repo;
 #[cfg(any(test, feature = "testsuite"))]
 pub mod testsuite;
@@ -25,6 +26,7 @@ pub use blobcache::{BlobCacheConfig, CachedBlobs};
 pub use cached::CachedMeta;
 pub use error::{Error, Result};
 pub use mem::MemStore;
+pub use redacted::{RedactedBlobs, redactable, redacted_error};
 
 pub use repo::{MAX_REPO_NAME_LEN, validate_repo_name};
 
@@ -251,6 +253,78 @@ pub trait MetaStore: Send + Sync + 'static {
     async fn put_setting(&self, _key: &str, _value: &[u8]) -> Result<()> {
         Err(unsupported("settings"))
     }
+
+    /// 写入 redaction 记录（`redactions` 表，按 (仓库, 对象) 覆盖）。每条记录由存储分配一个新的
+    /// `seq`（全局递增，忽略传入的值），缓存层按 `seq` 增量同步。仓库不存在时返回 [`Error::RepoNotFound`]。
+    async fn put_redactions(&self, _entries: &[Redaction]) -> Result<()> {
+        Err(unsupported("redactions"))
+    }
+
+    /// `ids` 中在该仓库有 redaction 记录的（包括已撤销的），顺序不定。
+    async fn get_redactions(&self, _repo: &str, _ids: &[ObjectId]) -> Result<Vec<Redaction>> {
+        Err(unsupported("redactions"))
+    }
+
+    /// 按条件列出 redaction 记录，按 `seq` 升序。
+    async fn list_redactions(&self, _filter: &RedactionFilter) -> Result<Vec<Redaction>> {
+        Err(unsupported("redactions"))
+    }
+
+    /// 对象索引中有 `id` 的仓库（按名字排序）。用于判断对象字节能否物理删除。
+    async fn object_repos(&self, _id: &ObjectId) -> Result<Vec<String>> {
+        Err(unsupported("object lookups"))
+    }
+
+    /// 列出全部租约（含已过期的），按 scope 排序。
+    async fn list_leases(&self) -> Result<Vec<(String, Lease)>> {
+        Err(unsupported("lease listings"))
+    }
+}
+
+/// 一个仓库中一个对象的 redaction（服务端设计文档 §9）。对象 id 与历史不变，读取返回 `REDACTED`；
+/// 安排清除（purge）后，`janitor` 在宽限期过后物理删除对象字节。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Redaction {
+    pub repo: String,
+    pub id: ObjectId,
+    /// 同一次操作的记录共用一个标识。
+    pub redaction_id: String,
+    pub reason: String,
+    pub created_by: String,
+    pub created_at_ms: i64,
+    /// false 表示已撤销（unredact）：记录保留，缓存层据此恢复读取。
+    pub active: bool,
+    /// 安排的物理删除时间。
+    pub purge_after_ms: Option<i64>,
+    /// 对象字节已删除的时间。
+    pub purged_at_ms: Option<i64>,
+    /// 最后一次修改的序号（全局递增），由存储分配。
+    pub seq: u64,
+}
+
+/// [`MetaStore::list_redactions`] 的条件；字段都为空时列出全部。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RedactionFilter {
+    pub repo: Option<String>,
+    pub redaction_id: Option<String>,
+    /// 只列出 `seq` 大于该值的记录。
+    pub after_seq: u64,
+    /// 只列出到期待清除的记录：有效、`purge_after_ms <= 该值`、尚未清除。
+    pub purge_due_at: Option<i64>,
+    /// 最多返回的条数；0 表示不限。
+    pub limit: usize,
+}
+
+impl RedactionFilter {
+    /// 记录是否满足条件（不考虑 `limit`），供内存实现与测试使用。
+    pub fn matches(&self, r: &Redaction) -> bool {
+        self.repo.as_ref().is_none_or(|x| *x == r.repo)
+            && self.redaction_id.as_ref().is_none_or(|x| *x == r.redaction_id)
+            && r.seq > self.after_seq
+            && self
+                .purge_due_at
+                .is_none_or(|t| r.active && r.purged_at_ms.is_none() && r.purge_after_ms.is_some_and(|p| p <= t))
+    }
 }
 
 fn unsupported(what: &str) -> Error {
@@ -378,6 +452,13 @@ pub trait BlobStore: Send + Sync + 'static {
     async fn get(&self, id: &ObjectId) -> Result<Option<Bytes>>;
 
     async fn exists(&self, id: &ObjectId) -> Result<bool>;
+
+    /// 物理删除对象（redaction 清除）。对象不存在时不是错误。
+    async fn delete(&self, _id: &ObjectId) -> Result<()> {
+        Err(Error::Backend(
+            "deleting objects is not supported by this blob store".into(),
+        ))
+    }
 }
 
 #[cfg(test)]

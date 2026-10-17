@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::repo::validate_repo_name;
 use crate::{
     BlobStore, ChangesetRecord, IdempotencyRecord, IndexedObject, LandedChange, Lease, MetaStore, PathChange,
-    PathHistoryEntry, RefExpect, RefState, TokenRecord, path_within,
+    PathHistoryEntry, Redaction, RedactionFilter, RefExpect, RefState, TokenRecord, path_within,
 };
 
 #[derive(Default)]
@@ -35,6 +35,8 @@ struct Inner {
     leases: HashMap<String, Lease>,
     tokens: Vec<TokenRecord>,
     settings: HashMap<String, Vec<u8>>,
+    redactions: BTreeMap<(String, ObjectId), Redaction>,
+    redaction_seq: u64,
 }
 
 /// 同时实现 [`MetaStore`] 与 [`BlobStore`] 的内存存储。
@@ -217,6 +219,68 @@ impl MetaStore for MemStore {
     async fn put_setting(&self, key: &str, value: &[u8]) -> Result<()> {
         self.write()?.settings.insert(key.to_owned(), value.to_vec());
         Ok(())
+    }
+
+    async fn put_redactions(&self, entries: &[Redaction]) -> Result<()> {
+        let mut inner = self.write()?;
+        for e in entries {
+            repo_ref(&inner, &e.repo)?;
+        }
+        for e in entries {
+            inner.redaction_seq += 1;
+            let rec = Redaction {
+                seq: inner.redaction_seq,
+                ..e.clone()
+            };
+            inner.redactions.insert((e.repo.clone(), e.id), rec);
+        }
+        Ok(())
+    }
+
+    async fn get_redactions(&self, repo: &str, ids: &[ObjectId]) -> Result<Vec<Redaction>> {
+        let inner = self.read()?;
+        let mut seen = HashSet::new();
+        Ok(ids
+            .iter()
+            .filter(|id| seen.insert(**id))
+            .filter_map(|id| inner.redactions.get(&(repo.to_owned(), *id)).cloned())
+            .collect())
+    }
+
+    async fn list_redactions(&self, filter: &RedactionFilter) -> Result<Vec<Redaction>> {
+        let inner = self.read()?;
+        let mut v: Vec<Redaction> = inner
+            .redactions
+            .values()
+            .filter(|r| filter.matches(r))
+            .cloned()
+            .collect();
+        v.sort_by_key(|r| r.seq);
+        if filter.limit > 0 {
+            v.truncate(filter.limit);
+        }
+        Ok(v)
+    }
+
+    async fn object_repos(&self, id: &ObjectId) -> Result<Vec<String>> {
+        Ok(self
+            .read()?
+            .repos
+            .iter()
+            .filter(|(_, d)| d.objects.contains_key(id))
+            .map(|(name, _)| name.clone())
+            .collect())
+    }
+
+    async fn list_leases(&self) -> Result<Vec<(String, Lease)>> {
+        let mut v: Vec<(String, Lease)> = self
+            .read()?
+            .leases
+            .iter()
+            .map(|(k, l)| (k.clone(), l.clone()))
+            .collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(v)
     }
 
     async fn release_lease(&self, scope: &str, holder: &str) -> Result<()> {
@@ -407,6 +471,11 @@ impl BlobStore for MemStore {
     async fn exists(&self, id: &ObjectId) -> Result<bool> {
         Ok(self.read()?.blobs.contains_key(id))
     }
+
+    async fn delete(&self, id: &ObjectId) -> Result<()> {
+        self.write()?.blobs.remove(id);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -443,6 +512,7 @@ mod tests {
     async fn conformance_leases() {
         testsuite::leases(&MemStore::new()).await;
         testsuite::tokens_and_settings(&MemStore::new()).await;
+        testsuite::redactions(&MemStore::new()).await;
     }
 
     #[tokio::test]
