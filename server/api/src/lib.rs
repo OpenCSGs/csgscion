@@ -1,6 +1,7 @@
 //! Scion 服务端的 gRPC 服务实现与启动入口。
 
 pub mod config;
+pub mod limit;
 mod service;
 pub mod status;
 
@@ -17,7 +18,7 @@ use scion_store::{BlobStore, MetaStore};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 
-pub use config::{Limits, ReadEndpoint, ServerConfig};
+pub use config::{Limits, ReadEndpoint, ServerConfig, WriteRate};
 pub use scion_proto::PROTOCOL_VERSION;
 pub use service::{FORWARDED_HEADER, LandSvc, ObjectSvc, QuerySvc, RefSvc, ServerInfoSvc, WriteSvc};
 
@@ -111,19 +112,31 @@ pub async fn serve(
     let objects = ObjectServiceServer::new(ObjectSvc::new(app.config.clone(), app.meta.clone(), app.blobs.clone()))
         .max_encoding_message_size(max_msg);
     // 上传的分块可能和读取分块一样大
-    let write_svc = WriteSvc::new(app.config.clone(), app.meta.clone(), app.blobs.clone());
+    let limiter = app
+        .config
+        .repo_write_rate
+        .map(|r| Arc::new(limit::RateLimiter::new(r.per_second, r.burst)));
+    let mut write_svc = WriteSvc::new(app.config.clone(), app.meta.clone(), app.blobs.clone());
+    if let Some(l) = &limiter {
+        write_svc = write_svc.with_rate_limit(l.clone());
+    }
     // 合入与创建提交共用同一个写入器
     let coordinator = match &app.config.cluster {
         Some(c) => scion_land::Coordinator::clustered(write_svc.writer().clone(), app.config.land, c.clone()),
         None => scion_land::Coordinator::new(write_svc.writer().clone(), app.config.land),
     };
-    let land = LandServiceServer::new(LandSvc::new(coordinator.clone()));
+    let mut land_svc = LandSvc::new(coordinator.clone());
+    if let Some(l) = limiter {
+        land_svc = land_svc.with_rate_limit(l);
+    }
+    let land = LandServiceServer::new(land_svc);
     let write = WriteServiceServer::new(write_svc).max_decoding_message_size(max_msg);
     let refs = RefServiceServer::new(RefSvc::new(app.meta.clone()));
     let query = QueryServiceServer::new(QuerySvc::new(app.config.clone(), app.meta, app.blobs))
         .max_encoding_message_size(max_msg);
 
     let result = tonic::transport::Server::builder()
+        .layer(limit::ConcurrencyLimitLayer::new(app.config.max_concurrent_requests))
         .add_service(health_svc)
         .add_service(info)
         .add_service(objects)

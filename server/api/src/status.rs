@@ -136,6 +136,16 @@ pub fn from_tree(err: scion_tree::TreeError) -> Status {
     }
 }
 
+/// 过载或超过速率限制：RESOURCE_EXHAUSTED + RATE_LIMITED（可重试），metadata `retry_after_ms` 为建议的等待时间。
+pub fn rate_limited(message: &str, retry_after: std::time::Duration) -> Status {
+    with_reason(
+        Code::ResourceExhausted,
+        ErrorReason::RateLimited,
+        message,
+        HashMap::from([("retry_after_ms".to_string(), retry_after.as_millis().max(1).to_string())]),
+    )
+}
+
 /// 冲突详情：`changeset`、`count`，以及每个冲突的 `path.N` / `kind.N` / `base.N` / `ours.N` / `theirs.N`。
 pub fn merge_conflict(changeset: &ObjectId, conflicts: &[scion_merge::Conflict]) -> Status {
     let id = |v: Option<ObjectId>| v.map(|i| i.to_string()).unwrap_or_default();

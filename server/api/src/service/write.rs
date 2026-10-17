@@ -15,6 +15,7 @@ use scion_store::{BlobStore, ChangesetRecord, MetaStore};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::config::ServerConfig;
+use crate::limit::RateLimiter;
 use crate::service::support::{check_repo, parse_id};
 use crate::status;
 
@@ -22,12 +23,24 @@ pub struct WriteSvc {
     config: Arc<ServerConfig>,
     meta: Arc<dyn MetaStore>,
     writer: Arc<ChangesetWriter>,
+    limiter: Option<Arc<RateLimiter>>,
 }
 
 impl WriteSvc {
     pub fn new(config: Arc<ServerConfig>, meta: Arc<dyn MetaStore>, blobs: Arc<dyn BlobStore>) -> Self {
         let writer = Arc::new(ChangesetWriter::new(meta.clone(), blobs.clone()));
-        Self { config, meta, writer }
+        Self {
+            config,
+            meta,
+            writer,
+            limiter: None,
+        }
+    }
+
+    /// 按仓库限制写入速率（上传与创建提交各算一次）。
+    pub fn with_rate_limit(mut self, limiter: Arc<RateLimiter>) -> Self {
+        self.limiter = Some(limiter);
+        self
     }
 
     pub(crate) fn writer(&self) -> &Arc<ChangesetWriter> {
@@ -211,6 +224,7 @@ impl WriteService for WriteSvc {
             let repo = asm.repo().unwrap_or_default().to_owned();
             if !checked {
                 check_repo(self.meta.as_ref(), &repo).await?;
+                RateLimiter::admit(self.limiter.as_deref(), &repo)?;
                 checked = true;
             }
             if let Some((id, bytes)) = done {
@@ -231,6 +245,7 @@ impl WriteService for WriteSvc {
             .changeset
             .ok_or_else(|| Status::invalid_argument("changeset is required"))?;
         let cs = spec_to_changeset(spec, self.config.limits.max_changes_per_changeset)?;
+        RateLimiter::admit(self.limiter.as_deref(), &req.repo)?;
         let rec = self.create(&req.repo, &cs).await?;
         tracing::info!(repo = %req.repo, changeset = %rec.id, request_id = %req.request_id, "changeset created");
         Ok(Response::new(CreateChangesetResponse {

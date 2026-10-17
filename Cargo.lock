@@ -2430,6 +2430,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "hex",
+ "http",
  "scion-land",
  "scion-merge",
  "scion-object",
@@ -2442,6 +2443,7 @@ dependencies = [
  "tonic",
  "tonic-health",
  "tonic-types",
+ "tower",
  "tracing",
 ]
 

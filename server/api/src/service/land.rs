@@ -4,7 +4,7 @@
 //! 转发的请求带上 [`FORWARDED_HEADER`]，收到的节点不会再转发（避免环路），而是返回可重试的错误。
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use scion_land::{Coordinator, LandError, LandOutcome, LandRequest as Request_, Landed};
@@ -17,6 +17,7 @@ use scion_proto::v1::{
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
 
+use crate::limit::RateLimiter;
 use crate::service::support::{check_repo, parse_id};
 use crate::status;
 
@@ -27,6 +28,7 @@ pub struct LandSvc {
     coordinator: Coordinator,
     /// 到其它节点的连接（按地址缓存）。
     peers: Mutex<HashMap<String, Channel>>,
+    limiter: Option<Arc<RateLimiter>>,
 }
 
 impl LandSvc {
@@ -34,7 +36,14 @@ impl LandSvc {
         Self {
             coordinator,
             peers: Mutex::new(HashMap::new()),
+            limiter: None,
         }
+    }
+
+    /// 按仓库限制合入速率。转发来的请求已在第一个节点计过数，不再检查。
+    pub fn with_rate_limit(mut self, limiter: Arc<RateLimiter>) -> Self {
+        self.limiter = Some(limiter);
+        self
     }
 
     fn peer(&self, addr: &str) -> Result<Channel, Status> {
@@ -138,6 +147,9 @@ impl LandService for LandSvc {
         let auth = request.metadata().get("authorization").cloned();
         let req = request.into_inner();
         let cs_id = parse_id(&req.changeset_id)?;
+        if !forwarded {
+            RateLimiter::admit(self.limiter.as_deref(), &req.repo)?;
+        }
         let request_id = Some(req.request_id.as_str()).filter(|id| !id.is_empty());
         let out = match self
             .land_with_id(&req.repo, &req.r#ref, cs_id, req.fast_forward_only, request_id)
@@ -353,6 +365,32 @@ mod tests {
         let (code, why, md) = reason(&land.land(REPO, "main", d, true).await.expect_err("ff only"));
         assert_eq!((code, why.as_str()), (Code::Aborted, "NOT_FAST_FORWARD"));
         assert_eq!((md["ref"].as_str(), md["tip"].clone()), ("main", b.to_string()));
+    }
+
+    #[tokio::test]
+    async fn lands_are_rate_limited_per_repo_except_forwarded() {
+        let (_store, w) = svc().await;
+        let land = land_svc(&w).with_rate_limit(Arc::new(RateLimiter::new(1, 1)));
+        let a = commit(&w, &[], &[], "a").await;
+        let b = commit(&w, &[a], &[("f", b"1")], "b").await;
+        let call = |id: ObjectId| LandRequest {
+            repo: REPO.into(),
+            request_id: String::new(),
+            r#ref: "main".into(),
+            changeset_id: id_bytes(&id),
+            fast_forward_only: false,
+        };
+        LandService::land(&land, Request::new(call(a))).await.expect("first");
+        let err = LandService::land(&land, Request::new(call(b)))
+            .await
+            .expect_err("limited");
+        assert_eq!(err.code(), Code::ResourceExhausted);
+        let mut fwd = Request::new(call(b));
+        fwd.metadata_mut()
+            .insert(FORWARDED_HEADER, tonic::metadata::MetadataValue::from_static("1"));
+        LandService::land(&land, fwd)
+            .await
+            .expect("forwarded requests were counted on the first node");
     }
 
     #[tokio::test]

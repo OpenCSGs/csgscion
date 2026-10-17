@@ -93,8 +93,45 @@ struct ServerArgs {
     /// 对象存储时，每个 ref 的合入由持有租约的节点处理，其它节点转发给它。
     #[arg(long, value_name = "URL", env = "SCION_ADVERTISE_URL", conflicts_with = "lite")]
     advertise_url: Option<String>,
+    /// 全局在途请求上限，超过时立即拒绝（客户端可重试）。
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 10_000,
+        env = "SCION_MAX_CONCURRENT_REQUESTS"
+    )]
+    max_concurrent_requests: usize,
+    /// 按仓库的写入速率限制：每秒 RATE 次，可选突发 BURST（默认等于 2×RATE），如 200 或 200/1000。
+    #[arg(long, value_name = "RATE[/BURST]", value_parser = parse_write_rate, env = "SCION_REPO_WRITE_RATE")]
+    repo_write_rate: Option<scion_api::WriteRate>,
     #[command(flatten)]
     storage: StorageArgs,
+}
+
+fn parse_write_rate(s: &str) -> Result<scion_api::WriteRate, String> {
+    let (rate, burst) = match s.split_once('/') {
+        Some((r, b)) => (r, Some(b)),
+        None => (s, None),
+    };
+    let rate: u32 = rate
+        .trim()
+        .parse()
+        .ok()
+        .filter(|r| *r > 0)
+        .ok_or_else(|| format!("invalid rate {rate:?}; expected a positive integer"))?;
+    let burst = match burst {
+        Some(b) => b
+            .trim()
+            .parse()
+            .ok()
+            .filter(|b| *b > 0)
+            .ok_or_else(|| format!("invalid burst {b:?}; expected a positive integer"))?,
+        None => rate.saturating_mul(2),
+    };
+    Ok(scion_api::WriteRate {
+        per_second: rate,
+        burst,
+    })
 }
 
 fn init_tracing(format: LogFormat) {
@@ -145,6 +182,8 @@ async fn build_app(args: &ServerArgs, env: impl Fn(&str) -> Option<String>) -> a
     let app = App {
         config: Arc::new(ServerConfig {
             cluster,
+            max_concurrent_requests: args.max_concurrent_requests,
+            repo_write_rate: args.repo_write_rate,
             ..ServerConfig::default()
         }),
         meta,
@@ -337,6 +376,40 @@ mod tests {
             "http://x",
         ]);
         assert!(lite.is_err(), "lite mode is single-node");
+    }
+
+    #[test]
+    fn write_rate_flag() {
+        let r = |v| parse_write_rate(v).map(|w| (w.per_second, w.burst));
+        assert_eq!(r("200"), Ok((200, 400)));
+        assert_eq!(r("200/1000"), Ok((200, 1000)));
+        assert_eq!(r(" 5 / 7 "), Ok((5, 7)));
+        for bad in ["", "0", "-1", "x", "5/0", "5/x"] {
+            assert!(r(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn build_app_applies_overload_settings() {
+        let (app, _) = build_app(
+            &args(&["--max-concurrent-requests", "64", "--repo-write-rate", "10/20"]),
+            no_env,
+        )
+        .await
+        .expect("app");
+        assert_eq!(app.config.max_concurrent_requests, 64);
+        assert_eq!(
+            app.config.repo_write_rate,
+            Some(scion_api::WriteRate {
+                per_second: 10,
+                burst: 20
+            })
+        );
+        let (app, _) = build_app(&args(&[]), no_env).await.expect("defaults");
+        assert_eq!(
+            (app.config.max_concurrent_requests, app.config.repo_write_rate),
+            (10_000, None)
+        );
     }
 
     #[tokio::test]
