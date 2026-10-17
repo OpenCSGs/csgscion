@@ -9,11 +9,12 @@
 mod coordinator;
 mod create;
 mod land;
+mod pending;
 mod record;
 mod stack;
 
 pub use coordinator::{Coordinator, CoordinatorConfig};
-pub use create::ChangesetWriter;
+pub use create::{Built, ChangesetWriter};
 pub use land::{LandOutcome, LandRequest, Lander};
 pub use stack::{Landed, Prepared, StackOptions, prepare};
 

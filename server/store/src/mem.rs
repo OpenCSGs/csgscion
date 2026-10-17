@@ -362,6 +362,11 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_batch_writes() {
+        testsuite::batch_writes(&MemStore::new()).await;
+    }
+
+    #[tokio::test]
     async fn conformance_history_index() {
         testsuite::history_index(&MemStore::new()).await;
     }

@@ -380,6 +380,49 @@ impl MetaStore for SqliteMetaStore {
         Ok(())
     }
 
+    async fn put_changesets(&self, repo: &str, recs: &[ChangesetRecord]) -> Result<()> {
+        let repo_id = self.repo_id(repo).await?;
+        if recs.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await.map_err(|e| backend("begin", e))?;
+        // 每行 8 个参数
+        for chunk in recs.chunks(MAX_IDS_PER_QUERY / 8) {
+            let mut rows = Vec::with_capacity(chunk.len());
+            for r in chunk {
+                rows.push((
+                    r.id.to_bytes().to_vec(),
+                    r.root_tree.to_bytes().to_vec(),
+                    r.first_parent().map(|p| p.to_bytes().to_vec()),
+                    version_to_db(r.generation)?,
+                    ids_to_db(&r.parents),
+                    version_to_db(r.fp_depth)?,
+                    r.fp_jump.map(|j| j.to_bytes().to_vec()),
+                ));
+            }
+            let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "INSERT INTO changesets (repo_id, cs_id, root_tree, first_parent, generation, parents, fp_depth, fp_jump) ",
+            );
+            qb.push_values(rows, |mut b, (id, root, first, generation, parents, depth, jump)| {
+                b.push_bind(repo_id)
+                    .push_bind(id)
+                    .push_bind(root)
+                    .push_bind(first)
+                    .push_bind(generation)
+                    .push_bind(parents)
+                    .push_bind(depth)
+                    .push_bind(jump);
+            });
+            qb.push(" ON CONFLICT (repo_id, cs_id) DO NOTHING");
+            qb.build()
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| backend("put changesets", e))?;
+        }
+        tx.commit().await.map_err(|e| backend("commit", e))?;
+        Ok(())
+    }
+
     async fn get_changeset(&self, repo: &str, id: &ObjectId) -> Result<Option<ChangesetRecord>> {
         let repo_id = self.repo_id(repo).await?;
         let sql = format!("SELECT {CHANGESET_COLUMNS} FROM changesets WHERE repo_id = ? AND cs_id = ?");
@@ -454,6 +497,44 @@ impl MetaStore for SqliteMetaStore {
                     .push_bind(cs_bytes.clone())
                     .push_bind(generation)
                     .push_bind(c.deleted);
+            });
+            qb.push(" ON CONFLICT (repo_id, path, cs_id) DO NOTHING");
+            qb.build()
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| backend("index paths", e))?;
+        }
+        tx.commit().await.map_err(|e| backend("commit", e))?;
+        Ok(())
+    }
+
+    async fn index_paths_many(&self, repo: &str, entries: &[(ObjectId, u64, Vec<PathChange>)]) -> Result<()> {
+        let repo_id = self.repo_id(repo).await?;
+        let mut rows = Vec::new();
+        for (cs, generation, changes) in entries {
+            let generation = version_to_db(*generation)?;
+            let cs = cs.to_bytes().to_vec();
+            rows.extend(
+                changes
+                    .iter()
+                    .map(|c| (c.path.clone(), cs.clone(), generation, c.deleted)),
+            );
+        }
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await.map_err(|e| backend("begin", e))?;
+        // 每行 5 个参数
+        for chunk in rows.chunks(MAX_IDS_PER_QUERY / 5) {
+            let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "INSERT INTO path_changes (repo_id, path, cs_id, generation, deleted) ",
+            );
+            qb.push_values(chunk, |mut b, (path, cs, generation, deleted)| {
+                b.push_bind(repo_id)
+                    .push_bind(path.clone())
+                    .push_bind(cs.clone())
+                    .push_bind(*generation)
+                    .push_bind(*deleted);
             });
             qb.push(" ON CONFLICT (repo_id, path, cs_id) DO NOTHING");
             qb.build()
@@ -658,6 +739,12 @@ mod tests {
     async fn conformance_landing() {
         let (_dir, s) = fresh().await;
         testsuite::landing(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_batch_writes() {
+        let (_dir, s) = fresh().await;
+        testsuite::batch_writes(&s).await;
     }
 
     #[tokio::test]

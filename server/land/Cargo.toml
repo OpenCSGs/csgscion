@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 bytes.workspace = true
 scion-merge.workspace = true
 scion-object.workspace = true
@@ -19,6 +20,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
+scion-store-sql.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

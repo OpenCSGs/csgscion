@@ -6,8 +6,8 @@ use std::time::Duration;
 use scion_object::ObjectId;
 use scion_store::{IdempotencyRecord, LandedChange, RefExpect, RefState};
 
-use crate::stack::StackOptions;
-use crate::{ChangesetWriter, LandError, Landed, Result, prepare, record, validate_ref_name};
+use crate::stack::{Batch, StackOptions};
+use crate::{ChangesetWriter, LandError, Landed, Result, record, validate_ref_name};
 
 /// 合入结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,7 +94,8 @@ impl Lander {
                 }
             }
             let head = meta.get_ref(repo, reference).await?;
-            let prepared = prepare(&self.writer, repo, reference, tip, head.map(|h| h.target), opts).await?;
+            let mut batch = Batch::new(&self.writer, repo, reference, head.map(|h| h.target)).await?;
+            let prepared = batch.add(tip, opts).await?;
             let (expect, version) = match head {
                 // 已经在历史中（或全部 change 早已合入）：直接返回当前状态
                 Some(h) if prepared.landed.is_empty() => {
@@ -134,6 +135,7 @@ impl Lander {
                 })
                 .into_iter()
                 .collect();
+            self.writer.persist(repo, batch.built()).await?;
             match meta
                 .land_commit(repo, reference, expect, prepared.tip, &changes, &requests)
                 .await

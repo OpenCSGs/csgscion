@@ -484,6 +484,64 @@ pub async fn fp_skip_chain<S: MetaStore>(s: &S) {
 }
 
 /// 并发 CAS：同一版本上的多个竞争者恰好只有一个成功，且版本严格连续。
+/// 批量写入记录与路径索引：结果与逐条写入相同，跨越 SQL 分块边界，已存在的记录保留第一次的值。
+pub async fn batch_writes<S: MetaStore + ?Sized>(s: &S) {
+    s.create_repo("batch").await.expect("create");
+    let tree = ObjectId::hash(ObjectKind::Tree, b"t");
+    let id = |n: u32| ObjectId::hash(ObjectKind::Changeset, &n.to_be_bytes());
+    let recs: Vec<ChangesetRecord> = (1..=200u32)
+        .map(|n| ChangesetRecord {
+            id: id(n),
+            root_tree: tree,
+            parents: if n == 1 { vec![] } else { vec![id(n - 1), id(1)] },
+            generation: u64::from(n),
+            fp_depth: u64::from(n),
+            fp_jump: (n > 1).then(|| id(1)),
+        })
+        .collect();
+    // 第一条先单独写入一个不同的值：批量写入不覆盖
+    let first = ChangesetRecord {
+        fp_depth: 0,
+        ..recs[0].clone()
+    };
+    s.put_changeset("batch", &first).await.expect("put");
+    s.put_changesets("batch", &recs).await.expect("batch put");
+    s.put_changesets("batch", &[]).await.expect("empty");
+    assert_eq!(s.get_changeset("batch", &id(1)).await, Ok(Some(first)));
+    for r in &recs[1..] {
+        assert_eq!(s.get_changeset("batch", &r.id).await.as_ref(), Ok(&Some(r.clone())));
+    }
+    // 路径索引：300 条，跨越多个提交
+    let entries: Vec<(ObjectId, u64, Vec<PathChange>)> = (1..=30u32)
+        .map(|n| {
+            let changes = (0..10)
+                .map(|k| PathChange {
+                    path: format!("d{k}/f"),
+                    deleted: n % 7 == 0,
+                })
+                .collect();
+            (id(n), u64::from(n), changes)
+        })
+        .collect();
+    s.index_paths_many("batch", &entries).await.expect("index");
+    s.index_paths_many("batch", &entries).await.expect("idempotent");
+    s.index_paths_many("batch", &[]).await.expect("empty");
+    s.index_paths_many("batch", &[(id(31), 31, vec![])])
+        .await
+        .expect("no changes");
+    let hist = s.path_history("batch", "d3", 100, 100).await.expect("history");
+    assert_eq!(hist.len(), 30);
+    assert_eq!((hist[0].cs, hist[0].generation), (id(30), 30));
+    assert!(hist.iter().find(|e| e.cs == id(7)).expect("7").deleted);
+    assert_eq!(s.path_history("batch", "d0/f", 100, 100).await.expect("file").len(), 30);
+    for r in [
+        s.put_changesets("nope", &recs[..1]).await.err(),
+        s.index_paths_many("nope", &entries[..1]).await.err(),
+    ] {
+        assert!(matches!(r, Some(Error::RepoNotFound(_))), "{r:?}");
+    }
+}
+
 /// 合入的原子提交：ref CAS、landed 行与幂等记录同成同败；已存在的记录保留第一次的值。
 pub async fn landing<S: MetaStore + ?Sized>(s: &S) {
     s.create_repo("land").await.expect("create");

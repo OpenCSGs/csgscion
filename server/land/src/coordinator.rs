@@ -18,7 +18,7 @@ use scion_store::{IdempotencyRecord, LandedChange, RefExpect, RefState};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::land::now_ms;
-use crate::stack::{StackOptions, prepare_in_batch};
+use crate::stack::{Batch, StackOptions};
 use crate::{
     ChangesetWriter, LandError, LandOutcome, LandRequest, Landed, Prepared, Result, record, validate_ref_name,
 };
@@ -226,8 +226,13 @@ async fn process(shared: &Shared, repo: &str, batch: Vec<Job>) {
             Ok(h) => h,
             Err(e) => return fail_all(pending, e.into()),
         };
-        let mut onto = head.map(|h| h.target);
-        let mut in_batch: HashMap<[u8; 16], ObjectId> = HashMap::new();
+        let mut batch = match Batch::new(writer, repo, &reference, head.map(|h| h.target)).await {
+            Ok(b) => b,
+            Err(e) => return fail_all(pending, e),
+        };
+        // 并发读取整批请求的提交对象，之后的 rebase 不再逐个等待对象存储
+        let tips: Vec<ObjectId> = pending.iter().map(|j| j.tip).collect();
+        batch.prefetch(&tips).await;
         let mut by_request: HashMap<String, usize> = HashMap::new();
         let mut planned: Vec<(Job, Planned)> = Vec::with_capacity(pending.len());
         for job in pending {
@@ -249,16 +254,12 @@ async fn process(shared: &Shared, repo: &str, batch: Vec<Job>) {
                 fast_forward_only: job.fast_forward_only,
                 ..cfg.stack
             };
-            match prepare_in_batch(writer, repo, &reference, job.tip, onto, opts, &in_batch).await {
-                Ok(p) if p.landed.is_empty() && onto.is_some() => {
+            match batch.add(job.tip, opts).await {
+                Ok(p) if p.landed.is_empty() => {
                     let previously_landed = p.previously_landed;
                     planned.push((job, Planned::Included { previously_landed }));
                 }
                 Ok(p) => {
-                    onto = Some(p.tip);
-                    for l in &p.landed {
-                        in_batch.insert(l.change_id, l.landed);
-                    }
                     if let Some(id) = &job.request_id {
                         by_request.insert(id.clone(), planned.len());
                     }
@@ -269,6 +270,7 @@ async fn process(shared: &Shared, repo: &str, batch: Vec<Job>) {
                 }
             }
         }
+        let onto = batch.tip();
 
         let accepted = planned.iter().any(|(_, p)| matches!(p, Planned::Accepted(_)));
         let (Some(target), true) = (onto, accepted) else {
@@ -301,6 +303,9 @@ async fn process(shared: &Shared, repo: &str, batch: Vec<Job>) {
                     created_at_ms: now_ms(),
                 });
             }
+        }
+        if let Err(e) = writer.persist(repo, batch.built()).await {
+            return fail_all(planned.into_iter().map(|(j, _)| j).collect(), e);
         }
         match meta
             .land_commit(repo, &reference, expect, target, &changes, &requests)

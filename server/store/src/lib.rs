@@ -120,6 +120,15 @@ pub trait MetaStore: Send + Sync + 'static {
     /// 幂等：同一 id 重复写入时保留第一次的记录（相同 changeset 建出的树必然相同）。
     async fn put_changeset(&self, repo: &str, rec: &ChangesetRecord) -> Result<()>;
 
+    /// 批量记录 changeset（合入批处理一次写入整批 rebase 结果）。语义与逐个 [`MetaStore::put_changeset`]
+    /// 相同；远端数据库应覆盖默认实现，用一个事务完成。
+    async fn put_changesets(&self, repo: &str, recs: &[ChangesetRecord]) -> Result<()> {
+        for r in recs {
+            self.put_changeset(repo, r).await?;
+        }
+        Ok(())
+    }
+
     async fn get_changeset(&self, repo: &str, id: &ObjectId) -> Result<Option<ChangesetRecord>>;
 
     /// 只查内存缓存、不访问存储的提交记录读取；没有缓存层的实现返回 None。
@@ -150,6 +159,14 @@ pub trait MetaStore: Send + Sync + 'static {
     /// 登记提交改动的路径（PathHistory 索引，相对第一个父提交）。幂等。
     /// 应在 [`MetaStore::put_changeset`] 之前写入：记录存在即表示索引完整。
     async fn index_paths(&self, repo: &str, cs: ObjectId, generation: u64, changes: &[PathChange]) -> Result<()>;
+
+    /// 批量登记多个提交的改动路径，每项为 (提交, 代数, 改动)。语义与逐个 [`MetaStore::index_paths`] 相同。
+    async fn index_paths_many(&self, repo: &str, entries: &[(ObjectId, u64, Vec<PathChange>)]) -> Result<()> {
+        for (cs, generation, changes) in entries {
+            self.index_paths(repo, *cs, *generation, changes).await?;
+        }
+        Ok(())
+    }
 
     /// 改动了 `path` 或其下任意路径、且代数不大于 `max_generation` 的提交，按代数从高到低，最多 `limit` 条。
     async fn path_history(
@@ -234,12 +251,18 @@ pub async fn fp_skip(
         .get_changeset(repo, &j.jump())
         .await?
         .ok_or_else(|| missing(j.jump()))?;
+    Ok(fp_skip_step(&p, &j, &jj))
+}
+
+/// 已知第一父提交 `p`、它的跳跃目标 `j`、`j` 的跳跃目标 `jj` 时，新提交的 (深度, 跳跃指针)。
+/// `p` 的深度必须已知（非 0）。供需要从其它来源（例如尚未写入的批处理结果）读记录的调用方使用。
+pub fn fp_skip_step(p: &ChangesetRecord, j: &ChangesetRecord, jj: &ChangesetRecord) -> (u64, Option<ObjectId>) {
     let jump = if p.fp_depth - j.fp_depth == j.fp_depth - jj.fp_depth {
         jj.id
     } else {
         p.id
     };
-    Ok((p.fp_depth + 1, Some(jump)))
+    (p.fp_depth + 1, Some(jump))
 }
 
 /// 提交对一个路径的改动。

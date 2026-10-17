@@ -123,6 +123,10 @@ impl MetaStore for CachedMeta {
         self.inner.put_changeset(repo, rec).await
     }
 
+    async fn put_changesets(&self, repo: &str, recs: &[ChangesetRecord]) -> Result<()> {
+        self.inner.put_changesets(repo, recs).await
+    }
+
     async fn get_changeset(&self, repo: &str, id: &ObjectId) -> Result<Option<ChangesetRecord>> {
         if let Some(rec) = self.cached_changeset(repo, id) {
             return Ok(Some(rec));
@@ -166,6 +170,10 @@ impl MetaStore for CachedMeta {
 
     async fn index_paths(&self, repo: &str, cs: ObjectId, generation: u64, changes: &[PathChange]) -> Result<()> {
         self.inner.index_paths(repo, cs, generation, changes).await
+    }
+
+    async fn index_paths_many(&self, repo: &str, entries: &[(ObjectId, u64, Vec<PathChange>)]) -> Result<()> {
+        self.inner.index_paths_many(repo, entries).await
     }
 
     async fn path_history(
@@ -232,6 +240,11 @@ mod tests {
     #[tokio::test]
     async fn conformance_landing() {
         testsuite::landing(&cached()).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_batch_writes() {
+        testsuite::batch_writes(&cached()).await;
     }
 
     #[tokio::test]
