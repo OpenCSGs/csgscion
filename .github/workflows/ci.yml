@@ -67,6 +67,16 @@ jobs:
         ports: ["5432:5432"]
         options: >-
           --health-cmd "pg_isready -U scion" --health-interval 5s --health-timeout 5s --health-retries 20
+      # MinIO：starhub / CSGHub 部署里使用的版本（bitnami 镜像，2023.12）
+      minio:
+        image: opencsg-registry.cn-beijing.cr.aliyuncs.com/opencsg_public/bitnami/minio:2023
+        env:
+          MINIO_ROOT_USER: scion
+          MINIO_ROOT_PASSWORD: scion-dev-secret
+          MINIO_DEFAULT_BUCKETS: scion-test
+        ports: ["9000:9000"]
+        options: >-
+          --health-cmd "curl -fs http://localhost:9000/minio/health/ready" --health-interval 5s --health-timeout 5s --health-retries 30
     env:
       SCION_TEST_PG_URL: postgres://scion:scion@localhost:5432/scion
       SCION_TEST_S3_ENDPOINT: http://localhost:8333
@@ -89,6 +99,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p scion-store-sql -p scion-store-blob
+      - name: Object store tests on MinIO
+        run: cargo test -p scion-store-blob
+        env:
+          SCION_TEST_S3_ENDPOINT: http://localhost:9000
 
   # 函数级测试要求（服务端设计文档 §12.1）
   coverage:

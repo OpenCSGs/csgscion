@@ -30,6 +30,7 @@ cargo run -p scion -- server --lite --data-dir ./.scion-data --repo mono
 
 # Other backends: --meta mem|sqlite://PATH|postgres://…  --blobs mem|DIR|s3://bucket/prefix
 # S3 settings: SCION_S3_ENDPOINT, SCION_S3_ACCESS_KEY_ID, SCION_S3_SECRET_ACCESS_KEY, SCION_S3_REGION
+# (tested in CI against SeaweedFS and MinIO)
 
 # In another terminal: install scn and check the connection
 cargo install --path client/cli

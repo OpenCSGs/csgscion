@@ -5,8 +5,10 @@
 # 拉不到 Docker Hub 时，可以把镜像名换成镜像站地址，例如
 #   docker.m.daocloud.io/chrislusf/seaweedfs:4.48、docker.m.daocloud.io/library/postgres:16
 #
-# 为什么不用 MinIO：MinIO 开源版已归档、停止维护，官方不再提供社区版下载。
-# Scion 只用 S3 核心子集，对 MinIO 的兼容性不受影响（接入 starhub 时可直接使用其现有 MinIO）。
+# 默认用 SeaweedFS：MinIO 开源版已归档、停止维护，官方不再提供社区版下载。
+# Scion 只用 S3 核心子集，MinIO 同样支持，CI 中两者都测试。需要 MinIO 时（例如对齐 starhub 部署）：
+#   docker compose -f deploy/dev/docker-compose.yml --profile minio up -d minio
+# endpoint http://localhost:9000，access key scion / scion-dev-secret，bucket scion-objects。
 name: scion-dev
 
 services:
@@ -30,6 +32,24 @@ services:
         condition: service_healthy
     entrypoint: ["/bin/sh", "-c", "echo 's3.bucket.create -name scion-objects' | weed shell -master=s3:9333"]
 
+  # starhub / CSGHub 部署使用的 MinIO 版本（bitnami 镜像，2023.12）
+  minio:
+    profiles: ["minio"]
+    image: opencsg-registry.cn-beijing.cr.aliyuncs.com/opencsg_public/bitnami/minio:2023
+    environment:
+      MINIO_ROOT_USER: scion
+      MINIO_ROOT_PASSWORD: scion-dev-secret
+      MINIO_DEFAULT_BUCKETS: scion-objects
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # 控制台
+    volumes:
+      - minio-data:/bitnami/minio/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:9000/minio/health/ready"]
+      interval: 5s
+      retries: 30
+
   postgres:
     image: postgres:16
     environment:
@@ -48,3 +68,4 @@ services:
 volumes:
   s3-data:
   pg-data:
+  minio-data:

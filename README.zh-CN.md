@@ -62,6 +62,7 @@ cargo run -p scion -- server --lite --data-dir ./.scion-data --repo mono
 
 # 其它后端：--meta mem|sqlite://PATH|postgres://…  --blobs mem|DIR|s3://bucket/prefix
 # S3 连接参数：SCION_S3_ENDPOINT、SCION_S3_ACCESS_KEY_ID、SCION_S3_SECRET_ACCESS_KEY、SCION_S3_REGION
+# （CI 中针对 SeaweedFS 与 MinIO 测试）
 
 # 另一个终端：安装 scn 并检查连接
 cargo install --path client/cli
