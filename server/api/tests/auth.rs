@@ -423,3 +423,64 @@ async fn auth_and_admin_services() {
         .await
         .expect("now admin");
 }
+
+/// 库里的策略加载失败：自签/外部 JWT 不查库也能验证，但服务端拒绝一切（Unavailable），
+/// 不退回到「没配策略」的默认放行；策略修好后自动恢复。
+#[tokio::test(flavor = "multi_thread")]
+async fn unloadable_policy_denies_until_fixed() {
+    let store = Arc::new(MemStore::new());
+    store.create_repo("mono").await.expect("repo");
+    store
+        .put_setting(scion_api::scion_auth::POLICY_KEY, b"broken [")
+        .await
+        .expect("policy");
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("addr"));
+    let app = App {
+        config: Arc::new(ServerConfig {
+            auth: GuardConfig {
+                required: true,
+                auth: AuthConfig::parse(AUTH).expect("auth config"),
+                signing_key_pem: None,
+            },
+            policy_poll_interval: std::time::Duration::from_secs(3600),
+            warm_record_cache: false,
+            ..ServerConfig::default()
+        }),
+        meta: store.clone(),
+        blobs: store.clone(),
+    };
+    let (_stop, rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(serve(listener, app, async {
+        let _ = rx.await;
+    }));
+    let c = Client::builder()
+        .endpoint(&url)
+        .repo("mono")
+        .auth(Auth::Bearer(starhub_jwt("alice")))
+        .build()
+        .await
+        .expect("connect");
+    let err = c.list_refs().await.expect_err("policy not loaded");
+    assert_eq!(code(&err), Some(Code::Unavailable), "{err:?}");
+
+    // 修好策略：不等轮询周期（1 小时），未加载状态下每秒重试
+    store
+        .put_setting(
+            scion_api::scion_auth::POLICY_KEY,
+            b"[[rule]]\nsubjects = [\"user:alice\"]\nrepos = [\"mono\"]\nactions = [\"read\"]\n",
+        )
+        .await
+        .expect("fix");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match c.list_refs().await {
+            Ok(_) => break,
+            Err(e) if tokio::time::Instant::now() < deadline => {
+                assert_eq!(code(&e), Some(Code::Unavailable), "{e:?}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("policy never loaded: {e:?}"),
+        }
+    }
+}

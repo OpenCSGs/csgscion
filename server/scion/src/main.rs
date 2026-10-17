@@ -349,9 +349,16 @@ async fn build_app(args: &ServerArgs, env: impl Fn(&str) -> Option<String>) -> a
     let auth = args.auth.guard_config()?;
     let (meta_spec, blob_spec) = args.storage.specs()?;
     let (meta, blobs) = storage::open(&meta_spec, &blob_spec, env).await?;
-    // 提前校验认证配置（密钥、外部签发方的密钥来源），配置有误时拒绝启动
-    scion_api::scion_auth::Guard::build(auth.clone(), meta.clone(), scion_api::scion_auth::remote::env_lookup())
-        .map_err(|e| anyhow::anyhow!("invalid auth configuration: {e}"))?;
+    // 提前校验认证配置（密钥、外部签发方的密钥来源）和库里的访问控制策略，有误时拒绝启动
+    let guard =
+        scion_api::scion_auth::Guard::build(auth.clone(), meta.clone(), scion_api::scion_auth::remote::env_lookup())
+            .map_err(|e| anyhow::anyhow!("invalid auth configuration: {e}"))?;
+    if auth.required {
+        guard
+            .reload_policy()
+            .await
+            .map_err(|e| anyhow::anyhow!("loading the access policy: {e}"))?;
+    }
     if auth.required && auth.signing_key_pem.is_none() {
         tracing::warn!(
             "authentication required but no --jwt-key: access tokens cannot be issued (PATs and external tokens still work)"
@@ -708,6 +715,29 @@ mod tests {
             "http://x",
         ]);
         assert!(lite.is_err(), "lite mode is single-node");
+    }
+
+    #[tokio::test]
+    async fn build_app_refuses_an_unloadable_policy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let d = dir.path().to_str().expect("utf8");
+        let (app, _) = build_app(&args(&["--lite", "--data-dir", d]), no_env)
+            .await
+            .expect("app");
+        app.meta
+            .put_setting(scion_api::scion_auth::POLICY_KEY, b"broken [")
+            .await
+            .expect("store");
+        drop(app);
+        let err = build_app(&args(&["--lite", "--data-dir", d, "--auth-required"]), no_env)
+            .await
+            .err()
+            .expect("refused");
+        assert!(err.to_string().contains("access policy"), "{err}");
+        // 不要求认证时不加载策略
+        build_app(&args(&["--lite", "--data-dir", d]), no_env)
+            .await
+            .expect("auth not required");
     }
 
     #[test]

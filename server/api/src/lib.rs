@@ -76,15 +76,25 @@ fn build_guard(config: &scion_auth::GuardConfig, meta: Arc<dyn MetaStore>) -> Ar
     }
 }
 
-/// 定期重新加载访问控制策略（其它节点的修改）。
+/// 策略还没加载成功时的重试间隔。
+const POLICY_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// 定期重新加载访问控制策略（其它节点的修改）。还没加载成功时（此期间拒绝一切请求）每秒重试。
 async fn reload_policy(guard: Arc<scion_auth::Guard>, every: std::time::Duration) {
-    let mut tick = tokio::time::interval(every.max(std::time::Duration::from_millis(10)));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    tick.tick().await;
+    let every = every.max(std::time::Duration::from_millis(10));
     loop {
-        tick.tick().await;
-        if let Err(e) = guard.reload_policy().await {
-            tracing::warn!(error = %e, "reloading the access policy failed; keeping the previous one");
+        let wait = if guard.policy_loaded() {
+            every
+        } else {
+            every.min(POLICY_RETRY)
+        };
+        tokio::time::sleep(wait).await;
+        match guard.reload_policy().await {
+            Ok(_) => {}
+            Err(e) if guard.policy_loaded() => {
+                tracing::warn!(error = %e, "reloading the access policy failed; keeping the previous one");
+            }
+            Err(e) => tracing::error!(error = %e, "loading the access policy failed; denying all requests"),
         }
     }
 }
@@ -155,7 +165,7 @@ pub async fn serve(
     let guard = build_guard(&app.config.auth, app.meta.clone());
     if guard.required() {
         if let Err(e) = guard.reload_policy().await {
-            tracing::error!(error = %e, "loading the access policy failed");
+            tracing::error!(error = %e, "loading the access policy failed; denying all requests until it loads");
         }
         tokio::spawn(reload_policy(guard.clone(), app.config.policy_poll_interval));
     }

@@ -82,7 +82,18 @@ pub struct Guard {
     introspection: Option<Introspection>,
     webhook: Option<AuthzWebhook>,
     oidc: Option<Oidc>,
-    policy: RwLock<Option<Arc<Policy>>>,
+    policy: RwLock<PolicyState>,
+}
+
+/// 内存中的访问控制策略。
+#[derive(Debug, Clone)]
+enum PolicyState {
+    /// 还没从元数据库加载成功：拒绝一切（返回 Unavailable），不能退回到默认放行。
+    Unloaded,
+    /// 元数据库里没有策略：已认证的身份可以读写和合入（见 [`Guard::check`]）。
+    Unset,
+    /// 显式保存的策略（包括空策略：没有规则命中即拒绝）。
+    Set(Arc<Policy>),
 }
 
 fn now_ms() -> i64 {
@@ -102,6 +113,7 @@ impl Guard {
     pub fn deny_all() -> Arc<Self> {
         Arc::new(Self {
             required: true,
+            policy: RwLock::new(PolicyState::Set(Arc::new(Policy::default()))),
             ..Self::unconfigured()
         })
     }
@@ -115,7 +127,7 @@ impl Guard {
             introspection: None,
             webhook: None,
             oidc: None,
-            policy: RwLock::new(None),
+            policy: RwLock::new(PolicyState::Unset),
         }
     }
 
@@ -151,7 +163,7 @@ impl Guard {
                 .authz_webhook
                 .map(|c| AuthzWebhook::new(c, http.clone(), lookup.clone())),
             oidc: config.auth.oidc.map(|c| Oidc::new(c, http, lookup)),
-            policy: RwLock::new(None),
+            policy: RwLock::new(PolicyState::Unloaded),
         }))
     }
 
@@ -343,12 +355,12 @@ impl Guard {
 
     // ---------- 策略 ----------
 
-    /// 校验并保存策略（本节点立即生效），返回规则数。
+    /// 校验并保存策略（本节点立即生效），返回规则数。空文本是一份没有规则的策略：拒绝一切。
     pub async fn set_policy(&self, text: &str) -> Result<usize, AuthError> {
         let p = Policy::parse(text).map_err(|e| AuthError::BadRequest(e.to_string()))?;
         self.meta()?.put_setting(POLICY_KEY, text.as_bytes()).await?;
         let n = p.len();
-        self.install(Some(p));
+        self.install(PolicyState::Set(Arc::new(p)));
         Ok(n)
     }
 
@@ -357,27 +369,44 @@ impl Guard {
         Ok(v.map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default())
     }
 
-    /// 从元数据库重新加载策略（定期调用，让其它节点的修改生效）。
+    /// 从元数据库重新加载策略（启动时和定期调用，让其它节点的修改生效）。失败时保留原来的策略；
+    /// 从未加载成功时保持拒绝一切。
     pub async fn reload_policy(&self) -> Result<usize, AuthError> {
-        let text = self.policy_text().await?;
-        if text.trim().is_empty() {
-            self.install(None);
+        let Some(raw) = self.meta()?.get_setting(POLICY_KEY).await? else {
+            self.install(PolicyState::Unset);
             return Ok(0);
-        }
+        };
+        let text = String::from_utf8(raw).map_err(|e| AuthError::Unavailable(format!("stored policy: {e}")))?;
         let p = Policy::parse(&text).map_err(|e| AuthError::Unavailable(format!("stored policy: {e}")))?;
         let n = p.len();
-        self.install(Some(p));
+        self.install(PolicyState::Set(Arc::new(p)));
         Ok(n)
     }
 
-    fn install(&self, p: Option<Policy>) {
+    /// 策略是否已加载（不要求认证时总是 true）。
+    pub fn policy_loaded(&self) -> bool {
+        !self.required || !matches!(self.state(), PolicyState::Unloaded)
+    }
+
+    fn install(&self, p: PolicyState) {
         if let Ok(mut cur) = self.policy.write() {
-            *cur = p.map(Arc::new);
+            *cur = p;
         }
     }
 
-    fn current_policy(&self) -> Option<Arc<Policy>> {
-        self.policy.read().ok().and_then(|p| p.clone())
+    fn state(&self) -> PolicyState {
+        self.policy.read().map_or(PolicyState::Unloaded, |p| p.clone())
+    }
+
+    /// 当前生效的策略；还没加载成功时返回 Unavailable。
+    fn current_policy(&self) -> Result<Option<Arc<Policy>>, AuthError> {
+        match self.state() {
+            PolicyState::Unloaded => Err(AuthError::Unavailable(
+                "the access policy has not been loaded yet".into(),
+            )),
+            PolicyState::Unset => Ok(None),
+            PolicyState::Set(p) => Ok(Some(p)),
+        }
     }
 
     // ---------- 鉴权 ----------
@@ -401,7 +430,7 @@ impl Guard {
         if !self.required {
             return Ok(true);
         }
-        let policy = self.current_policy();
+        let policy = self.current_policy()?;
         match &policy {
             Some(pol) if pol.allows(p, req) => return Ok(true),
             None if self.webhook.is_none() => return Ok(p.authenticated && req.action <= Action::Land),
@@ -415,7 +444,13 @@ impl Guard {
 
     /// 在仓库里是否有 `action`（不论 ref 和路径的限制），见 [`Policy::allows_any`]。
     pub async fn check_any(&self, p: &Principal, repo: &str, action: Action) -> Result<bool, AuthError> {
-        if self.current_policy().is_some_and(|pol| pol.allows_any(p, repo, action)) {
+        if !self.required {
+            return Ok(true);
+        }
+        if self
+            .current_policy()?
+            .is_some_and(|pol| pol.allows_any(p, repo, action))
+        {
             return Ok(true);
         }
         self.check(p, &Request::repo(repo, action)).await
@@ -453,7 +488,9 @@ impl Guard {
         {
             return Ok(true);
         }
-        Ok(self.current_policy().is_some_and(|pol| pol.path_visible(p, repo, path)))
+        Ok(self
+            .current_policy()?
+            .is_some_and(|pol| pol.path_visible(p, repo, path)))
     }
 
     /// 是否有系统管理权限（策略、令牌）。
@@ -461,7 +498,7 @@ impl Guard {
         if !self.required {
             return Ok(true);
         }
-        if self.current_policy().is_some_and(|pol| pol.is_system_admin(p)) {
+        if self.current_policy()?.is_some_and(|pol| pol.is_system_admin(p)) {
             return Ok(true);
         }
         self.webhook_allows(p, &Request::repo("*", Action::Admin)).await
@@ -480,7 +517,7 @@ mod tests {
         Arc::new(|k: &str| (k == "STARHUB_JWT_SIGNING_KEY").then(|| "signing-key".to_string()))
     }
 
-    fn guard(idp: &FakeIdp, webhook: bool) -> Arc<Guard> {
+    async fn guard(idp: &FakeIdp, webhook: bool) -> Arc<Guard> {
         let mut auth = AuthConfig::default();
         auth.token.issuer = "https://scion.test".into();
         auth.issuers = vec![
@@ -524,7 +561,7 @@ mod tests {
                 fail_open: false,
             });
         }
-        Guard::build(
+        let g = Guard::build(
             GuardConfig {
                 required: true,
                 auth,
@@ -533,7 +570,9 @@ mod tests {
             Arc::new(MemStore::new()),
             lookup(),
         )
-        .expect("guard")
+        .expect("guard");
+        g.reload_policy().await.expect("load policy");
+        g
     }
 
     fn now() -> i64 {
@@ -561,6 +600,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unloaded_policy_denies_everything() {
+        let meta: Arc<dyn MetaStore> = Arc::new(MemStore::new());
+        meta.put_setting(POLICY_KEY, b"broken [").await.expect("set");
+        let g = Guard::build(
+            GuardConfig {
+                required: true,
+                auth: AuthConfig::default(),
+                signing_key_pem: Some(crate::token::generate_signing_key()),
+            },
+            meta.clone(),
+            lookup(),
+        )
+        .expect("guard");
+        assert!(!g.policy_loaded());
+        // 自签令牌不查库也能验证，但策略没加载成功时不能退回默认放行
+        let (token, _) = g.issue(&Principal::user("alice", vec![])).expect("issue");
+        let alice = g.authenticate(Some(&token)).await.expect("jwt");
+        let unavailable = |r: Result<bool, AuthError>| matches!(r, Err(AuthError::Unavailable(_)));
+        assert!(unavailable(g.check(&alice, &Request::repo("x", Action::Read)).await));
+        assert!(unavailable(g.check_any(&alice, "x", Action::Read).await));
+        assert!(unavailable(g.path_visible(&alice, "x", "a").await));
+        assert!(unavailable(g.is_admin(&alice).await));
+        assert!(g.reload_policy().await.is_err(), "broken stored policy");
+        assert!(!g.policy_loaded(), "a failed reload keeps denying");
+        meta.put_setting(POLICY_KEY, &[0xff]).await.expect("set");
+        assert!(g.reload_policy().await.is_err(), "not UTF-8");
+        // 修好后加载成功
+        meta.put_setting(
+            POLICY_KEY,
+            b"[[rule]]\nsubjects=[\"*\"]\nrepos=[\"x\"]\nactions=[\"read\"]",
+        )
+        .await
+        .expect("fix");
+        assert_eq!(g.reload_policy().await.expect("reload"), 1);
+        assert!(g.policy_loaded());
+        assert!(g.check(&alice, &Request::repo("x", Action::Read)).await.expect("ok"));
+        assert!(!g.check(&alice, &Request::repo("y", Action::Read)).await.expect("ok"));
+        // 库里没有策略：默认放行
+        let fresh = Guard::build(
+            GuardConfig {
+                required: true,
+                ..GuardConfig::default()
+            },
+            Arc::new(MemStore::new()),
+            lookup(),
+        )
+        .expect("guard");
+        assert_eq!(fresh.reload_policy().await.expect("reload"), 0);
+        assert!(
+            fresh
+                .check(&alice, &Request::repo("y", Action::Land))
+                .await
+                .expect("ok")
+        );
+        assert!(Guard::disabled().policy_loaded());
+    }
+
+    #[tokio::test]
     async fn disabled_guard_allows_everything() {
         let g = Guard::disabled();
         assert!(!g.required() && !g.can_issue() && !g.device_login());
@@ -577,7 +674,7 @@ mod tests {
     #[tokio::test]
     async fn authenticates_every_token_kind() {
         let idp = FakeIdp::start().await;
-        let g = guard(&idp, false);
+        let g = guard(&idp, false).await;
         assert!(g.required() && g.can_issue() && g.device_login());
         assert!(!g.authenticate(None).await.expect("anon").authenticated);
         assert!(!g.authenticate(Some("  ")).await.expect("anon").authenticated);
@@ -655,7 +752,7 @@ mod tests {
     #[tokio::test]
     async fn device_login_creates_refresh_and_access_tokens() {
         let idp = FakeIdp::start().await;
-        let g = guard(&idp, false);
+        let g = guard(&idp, false).await;
         let s = g.start_device_login().await.expect("start");
         let (state, tokens) = g.poll_device_login(&s.device_code).await.expect("poll");
         assert_eq!((state, tokens), (DevicePoll::Pending, None));
@@ -672,7 +769,7 @@ mod tests {
     #[tokio::test]
     async fn authorization_combines_policy_grants_and_webhook() {
         let idp = FakeIdp::start().await;
-        let g = guard(&idp, false);
+        let g = guard(&idp, false).await;
         let alice = Principal::user("alice", vec!["eng".into()]);
         let anon = Principal::anonymous();
         // 没有策略和回调：已认证的身份可以读写合入，不能管理；匿名不行
@@ -725,18 +822,20 @@ mod tests {
                 .expect("ok")
         );
 
-        // 其它节点修改了策略：重新加载
-        g.meta()
-            .expect("meta")
-            .put_setting(POLICY_KEY, b"")
-            .await
-            .expect("clear");
+        // 显式保存的空策略拒绝一切，重新加载后（其它节点）仍然拒绝，不退回默认放行
+        assert_eq!(g.set_policy("  \n").await.expect("empty"), 0);
+        assert!(
+            !g.check(&alice, &Request::repo("other", Action::Read))
+                .await
+                .expect("ok")
+        );
         assert_eq!(g.reload_policy().await.expect("reload"), 0);
         assert!(
-            g.check(&alice, &Request::repo("other", Action::Read))
+            !g.check(&alice, &Request::repo("other", Action::Read))
                 .await
-                .expect("default again")
+                .expect("still denied")
         );
+        // 其它节点修改了策略：重新加载
         g.meta()
             .expect("meta")
             .put_setting(
@@ -765,7 +864,7 @@ mod tests {
     #[tokio::test]
     async fn webhook_decides_when_configured() {
         let idp = FakeIdp::start().await;
-        let g = guard(&idp, true);
+        let g = guard(&idp, true).await;
         let alice = Principal::user("alice", vec![]);
         // 有回调时没有「已认证即可」的默认
         assert!(
@@ -803,6 +902,7 @@ mod tests {
             lookup(),
         )
         .expect("guard");
+        closed.reload_policy().await.expect("load");
         assert!(matches!(
             closed.check(&alice, &Request::repo("x", Action::Read)).await,
             Err(AuthError::Unavailable(_))
@@ -821,6 +921,7 @@ mod tests {
             lookup(),
         )
         .expect("guard");
+        open.reload_policy().await.expect("load");
         assert!(
             !open
                 .check(&alice, &Request::repo("x", Action::Read))
