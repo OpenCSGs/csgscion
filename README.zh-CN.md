@@ -12,6 +12,7 @@
 
 **使用指南**
 - [从 git 导入](docs/guide/git-import.md)：把已有的 git 仓库连同全部历史导入 Scion
+- [对象存储](docs/guide/object-storage.md)：SeaweedFS、MinIO 与其他 S3 兼容服务；服务识别与启动检查
 
 **设计与规范**
 - 设计文档：[服务端](docs/design/rust-server-architecture.md) · [客户端](docs/design/rust-client-architecture.md) · [接入 starhub / CSGLite](docs/design/starhub-integration.md)
@@ -61,8 +62,8 @@ docs/design/         设计文档与架构图
 cargo run -p scion -- server --lite --data-dir ./.scion-data --repo mono
 
 # 其它后端：--meta mem|sqlite://PATH|postgres://…  --blobs mem|DIR|s3://bucket/prefix
-# S3 连接参数：SCION_S3_ENDPOINT、SCION_S3_ACCESS_KEY_ID、SCION_S3_SECRET_ACCESS_KEY、SCION_S3_REGION
-# （CI 中针对 SeaweedFS 与 MinIO 测试）
+# S3 连接参数：SCION_S3_ENDPOINT、SCION_S3_ACCESS_KEY_ID、SCION_S3_SECRET_ACCESS_KEY、SCION_S3_REGION、
+# SCION_S3_PROVIDER=auto|minio|seaweedfs|aws|generic（CI 中测试 SeaweedFS 与 MinIO，详见 docs/guide/object-storage.md）
 
 # 另一个终端：安装 scn 并检查连接
 cargo install --path client/cli

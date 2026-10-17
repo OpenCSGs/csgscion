@@ -2535,6 +2535,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "object_store",
+ "reqwest",
  "scion-object",
  "scion-store",
  "tempfile",

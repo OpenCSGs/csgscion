@@ -298,6 +298,8 @@ storage_class     = ""                      # 可选
 
 **启动自检**：执行 `scion admin blobstore-check`，server 启动时也会自动跑一遍。检查项：PUT 后立即 GET 和 HEAD、Range 读、超过 5 GiB 的分块上传与 UploadPartCopy（可选）、预签名 URL 访问、批量删除时的条数上限、ListObjectsV2 分页、时钟偏差（SigV4 对时间敏感）。检查结果写成 feature 标记，例如不支持 UploadPartCopy 时自动改走「读出再写入」的方式。
 
+> **实现说明**（2026-10-17）：服务适配层在 `server/store-blob/src/provider.rs`。`SCION_S3_PROVIDER` 可选 `auto`（默认）、`minio`、`seaweedfs`、`aws`、`generic`。启动检查依次执行：按 `Server` 响应头识别服务（显式配置与识别结果冲突时报错）、该服务的健康接口（MinIO `/minio/health/ready`、SeaweedFS `/healthz`）、bucket 是否存在（不存在时提示该服务的创建方法）、读写自检。请求风格按服务决定默认值，只有 AWS 默认 virtual-hosted。CI 在 SeaweedFS 4.48 与 MinIO 2023.12.23（bitnami 镜像，与 starhub 部署一致）上各跑一遍完整的存储一致性测试。使用说明见 [`docs/guide/object-storage.md`](../guide/object-storage.md)。
+
 **直连对象存储下载（减轻服务端带宽压力）**：
 - 超过阈值（默认 64 MiB）的 blob，`GetObjects` 可以不返回数据流，而是返回 `redirect{presigned_url, expires}`。前提是请求里声明了 `accept_redirect`，并且服务端开启了 `objects.presigned` 特性。
 - 客户端直接从 MinIO 或 S3 下载，**下载后仍然校验 BLAKE3**。

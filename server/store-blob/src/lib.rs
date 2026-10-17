@@ -6,6 +6,13 @@
 //! 对象按内容寻址、全局只存一份，key 为 `{prefix}objects/{kind}/{hh}/{hex}`。
 //! 只使用 S3 的核心子集（PUT / GET / HEAD），不依赖条件写：同一 key 的内容永远相同，重复写入天然幂等。
 //! 读取时校验 BLAKE3，磁盘或存储服务的静默损坏会以错误形式暴露，而不是把坏数据发给客户端。
+//!
+//! 不同 S3 兼容服务（MinIO、SeaweedFS 等）的差异由 [`provider`] 适配：启动检查
+//! [`ObjectBlobStore::check`] 识别服务、做对应的健康检查，并在 bucket 缺失时给出该服务的创建方法。
+
+mod provider;
+
+pub use provider::{Detected, S3Provider, detect};
 
 use std::sync::Arc;
 
@@ -27,8 +34,11 @@ pub struct S3Config {
     pub region: String,
     pub access_key_id: String,
     pub secret_access_key: String,
-    /// 是否使用 virtual-hosted 风格（`bucket.host`）。MinIO、SeaweedFS 等自建服务通常需要 path 风格（false）。
-    pub virtual_hosted_style: bool,
+    /// 服务种类；`Auto` 时在 [`ObjectBlobStore::check`] 中识别。
+    pub provider: S3Provider,
+    /// 是否使用 virtual-hosted 风格（`bucket.host`）。`None` 按服务决定：只有 AWS 默认使用，
+    /// MinIO、SeaweedFS 等自建服务使用 path 风格。
+    pub virtual_hosted_style: Option<bool>,
     /// key 前缀，多个部署共用一个 bucket 时用来隔离，如 `scion/`。
     pub prefix: String,
     /// 单个请求的最大重试次数；`None` 使用默认值（10 次，指数退避）。
@@ -41,6 +51,7 @@ impl std::fmt::Debug for S3Config {
             .field("endpoint", &self.endpoint)
             .field("bucket", &self.bucket)
             .field("region", &self.region)
+            .field("provider", &self.provider)
             .field("access_key_id", &self.access_key_id)
             .field("secret_access_key", &"<redacted>")
             .field("virtual_hosted_style", &self.virtual_hosted_style)
@@ -53,6 +64,34 @@ impl std::fmt::Debug for S3Config {
 pub struct ObjectBlobStore {
     store: Arc<dyn ObjectStore>,
     prefix: String,
+    /// S3 后端的服务信息；本地目录为 None。
+    s3: Option<S3Target>,
+}
+
+#[derive(Debug, Clone)]
+struct S3Target {
+    endpoint: Option<String>,
+    bucket: String,
+    provider: S3Provider,
+}
+
+/// 启动检查识别出的后端。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlobBackend {
+    Local,
+    S3(Detected),
+}
+
+impl std::fmt::Display for BlobBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Local => f.write_str("local"),
+            Self::S3(d) => match &d.server {
+                Some(s) => write!(f, "s3 ({}, Server: {s})", d.provider),
+                None => write!(f, "s3 ({})", d.provider),
+            },
+        }
+    }
 }
 
 impl ObjectBlobStore {
@@ -64,6 +103,7 @@ impl ObjectBlobStore {
         Ok(Self {
             store: Arc::new(fs),
             prefix: String::new(),
+            s3: None,
         })
     }
 
@@ -80,13 +120,27 @@ impl ObjectBlobStore {
         if cfg.bucket.trim().is_empty() {
             return Err(Error::Backend("s3 bucket must not be empty".into()));
         }
+        if cfg.endpoint.is_none() && cfg.provider.requires_endpoint() {
+            return Err(Error::Backend(format!(
+                "s3 provider {} needs an endpoint (SCION_S3_ENDPOINT)",
+                cfg.provider
+            )));
+        }
+        // 没有 endpoint 只能是 AWS
+        let provider = match (cfg.provider, &cfg.endpoint) {
+            (S3Provider::Auto, None) => S3Provider::Aws,
+            (p, _) => p,
+        };
+        let virtual_hosted = cfg
+            .virtual_hosted_style
+            .unwrap_or_else(|| provider.default_virtual_hosted());
         let mut b = AmazonS3Builder::new()
             .with_retry(retry)
             .with_bucket_name(&cfg.bucket)
             .with_region(&cfg.region)
             .with_access_key_id(&cfg.access_key_id)
             .with_secret_access_key(&cfg.secret_access_key)
-            .with_virtual_hosted_style_request(cfg.virtual_hosted_style);
+            .with_virtual_hosted_style_request(virtual_hosted);
         if let Some(endpoint) = &cfg.endpoint {
             b = b
                 .with_endpoint(endpoint)
@@ -96,7 +150,49 @@ impl ObjectBlobStore {
         Ok(Self {
             store: Arc::new(store),
             prefix: normalize_prefix(&cfg.prefix),
+            s3: Some(S3Target {
+                endpoint: cfg.endpoint.clone(),
+                bucket: cfg.bucket.clone(),
+                provider,
+            }),
         })
+    }
+
+    /// 启动检查：S3 后端先识别服务并做该服务的健康检查（见 [`provider`]），再做读写自检；
+    /// bucket 不存在时报错并给出该服务的创建方法。
+    pub async fn check(&self) -> Result<BlobBackend> {
+        let Some(t) = &self.s3 else {
+            self.self_test().await?;
+            return Ok(BlobBackend::Local);
+        };
+        let detected = match &t.endpoint {
+            Some(endpoint) => detect(endpoint, t.provider).await?,
+            None => Detected {
+                provider: t.provider,
+                server: None,
+            },
+        };
+        if !self.bucket_exists().await? {
+            return Err(Error::Backend(format!(
+                "s3 bucket {:?} does not exist; {}",
+                t.bucket,
+                detected.provider.create_bucket_hint(&t.bucket)
+            )));
+        }
+        self.self_test().await?;
+        Ok(BlobBackend::S3(detected))
+    }
+
+    /// 列一次前缀判断 bucket 是否存在。存在但为空时返回空列表；不存在时 MinIO 与 SeaweedFS 都返回
+    /// 404 `NoSuchBucket`，object_store 把它包成通用错误，只能从错误链里认出来。
+    async fn bucket_exists(&self) -> Result<bool> {
+        let prefix = Path::from(format!("{}objects", self.prefix));
+        match self.store.list_with_delimiter(Some(&prefix)).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e) if is_no_such_bucket(&e) => Ok(false),
+            Err(e) => Err(backend("list bucket", e)),
+        }
     }
 
     /// 启动自检：写入、读回、校验一个探测对象（服务端设计文档 §4.6 `blobstore-check`）。
@@ -136,6 +232,18 @@ fn object_key(id: &ObjectId) -> String {
     // 文本形式为 `<kind><algo><hex>`，如 b1af13…
     let (kind_algo, digest) = hex.split_at(2);
     format!("objects/{kind_algo}/{}/{digest}", &digest[..2])
+}
+
+/// 错误链中是否有 S3 错误码 `NoSuchBucket`。
+fn is_no_such_bucket(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur = Some(e);
+    while let Some(err) = cur {
+        if err.to_string().contains("NoSuchBucket") {
+            return true;
+        }
+        cur = err.source();
+    }
+    false
 }
 
 /// 规范化前缀：去掉首尾的 `/`，非空时补一个结尾的 `/`。
@@ -240,6 +348,28 @@ mod tests {
             ..Default::default()
         };
         assert!(!format!("{cfg:?}").contains("hunter2"));
+    }
+
+    #[test]
+    fn no_such_bucket_found_anywhere_in_chain() {
+        #[derive(Debug)]
+        struct Wrap(&'static str, Option<Box<Wrap>>);
+        impl std::fmt::Display for Wrap {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Wrap {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1.as_deref().map(|w| w as _)
+            }
+        }
+        let deep = Wrap("list failed", Some(Box::new(Wrap("<Code>NoSuchBucket</Code>", None))));
+        assert!(is_no_such_bucket(&deep));
+        assert!(!is_no_such_bucket(&Wrap(
+            "list failed",
+            Some(Box::new(Wrap("AccessDenied", None)))
+        )));
     }
 
     #[test]
@@ -403,7 +533,118 @@ mod tests {
         assert!(matches!(ObjectBlobStore::s3(&cfg), Err(Error::Backend(_))));
     }
 
-    /// 真实 S3 兼容服务：需要 `SCION_TEST_S3_ENDPOINT` 等环境变量（CI 中由 SeaweedFS 提供），未设置时跳过。
+    #[test]
+    fn provider_defaults_applied_at_build() {
+        // 自建服务必须有 endpoint
+        for provider in [S3Provider::Minio, S3Provider::SeaweedFs] {
+            let cfg = S3Config {
+                bucket: "b".into(),
+                provider,
+                ..Default::default()
+            };
+            assert!(matches!(ObjectBlobStore::s3(&cfg), Err(Error::Backend(m)) if m.contains("needs an endpoint")));
+        }
+        // 没有 endpoint 的 Auto 即 AWS
+        let aws = ObjectBlobStore::s3(&S3Config {
+            bucket: "b".into(),
+            ..Default::default()
+        })
+        .expect("aws");
+        assert_eq!(aws.s3.expect("s3").provider, S3Provider::Aws);
+        let minio = ObjectBlobStore::s3(&S3Config {
+            endpoint: Some("http://minio:9000".into()),
+            bucket: "b".into(),
+            provider: S3Provider::Minio,
+            ..Default::default()
+        })
+        .expect("minio");
+        assert_eq!(minio.s3.expect("s3").provider, S3Provider::Minio);
+    }
+
+    #[tokio::test]
+    async fn local_check_reports_local() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let s = ObjectBlobStore::local(dir.path()).expect("local");
+        assert_eq!(s.check().await, Ok(BlobBackend::Local));
+        assert_eq!(BlobBackend::Local.to_string(), "local");
+        let d = Detected {
+            provider: S3Provider::Minio,
+            server: Some("MinIO".into()),
+        };
+        assert_eq!(BlobBackend::S3(d.clone()).to_string(), "s3 (minio, Server: MinIO)");
+        let bare = Detected { server: None, ..d };
+        assert_eq!(BlobBackend::S3(bare).to_string(), "s3 (minio)");
+    }
+
+    #[tokio::test]
+    async fn s3_check_reports_unreachable_endpoint() {
+        let s = ObjectBlobStore::s3(&S3Config {
+            endpoint: Some("http://127.0.0.1:1".into()),
+            bucket: "b".into(),
+            ..Default::default()
+        })
+        .expect("build");
+        // 直连时在识别阶段报 unreachable；经过代理时代理返回 502，随后列 bucket 失败
+        assert!(matches!(s.check().await, Err(Error::Backend(_))));
+    }
+
+    #[tokio::test]
+    async fn s3_check_identifies_provider() {
+        let Some(cfg) = s3_from_env() else {
+            eprintln!("SCION_TEST_S3_ENDPOINT not set; skipping");
+            return;
+        };
+        let s = ObjectBlobStore::s3(&cfg).expect("build");
+        let BlobBackend::S3(d) = s.check().await.expect("check") else {
+            panic!("expected s3")
+        };
+        assert_ne!(d.provider, S3Provider::Auto);
+        if cfg.provider != S3Provider::Auto {
+            assert_eq!(d.provider, cfg.provider);
+        }
+        // 自动识别得到同样的结果
+        let auto = ObjectBlobStore::s3(&S3Config {
+            provider: S3Provider::Auto,
+            ..cfg.clone()
+        })
+        .expect("build");
+        assert_eq!(auto.check().await, Ok(BlobBackend::S3(d.clone())));
+        // 配置成另一种已知服务：报错
+        if matches!(d.provider, S3Provider::Minio | S3Provider::SeaweedFs) {
+            let other = if d.provider == S3Provider::Minio {
+                S3Provider::SeaweedFs
+            } else {
+                S3Provider::Minio
+            };
+            let wrong = ObjectBlobStore::s3(&S3Config {
+                provider: other,
+                ..cfg.clone()
+            })
+            .expect("build");
+            assert!(matches!(wrong.check().await, Err(Error::Backend(m)) if m.contains("configured as")));
+        }
+        // bucket 不存在：给出该服务的创建方法
+        let missing = ObjectBlobStore::s3(&S3Config {
+            bucket: format!("scion-missing-{}", std::process::id()),
+            ..cfg
+        })
+        .expect("build");
+        let err = missing.check().await.expect_err("missing bucket");
+        let hint = d.provider.create_bucket_hint("x");
+        let tool = hint
+            .split('`')
+            .nth(1)
+            .unwrap_or("")
+            .split_whitespace()
+            .next()
+            .unwrap_or("");
+        assert!(
+            matches!(&err, Error::Backend(m) if m.contains("does not exist") && m.contains(tool)),
+            "{err:?}"
+        );
+    }
+
+    /// 真实 S3 兼容服务：需要 `SCION_TEST_S3_ENDPOINT` 等环境变量（CI 中由 SeaweedFS 和 MinIO 提供），未设置时跳过。
     fn s3_from_env() -> Option<S3Config> {
         let endpoint = std::env::var("SCION_TEST_S3_ENDPOINT").ok()?;
         Some(S3Config {
@@ -412,7 +653,12 @@ mod tests {
             region: "us-east-1".into(),
             access_key_id: std::env::var("SCION_TEST_S3_ACCESS_KEY").unwrap_or_default(),
             secret_access_key: std::env::var("SCION_TEST_S3_SECRET_KEY").unwrap_or_default(),
-            virtual_hosted_style: false,
+            // 期望的服务种类（CI 中分别为 seaweedfs、minio）；未设置时自动识别
+            provider: std::env::var("SCION_TEST_S3_PROVIDER")
+                .ok()
+                .map(|p| p.parse().expect("SCION_TEST_S3_PROVIDER"))
+                .unwrap_or_default(),
+            virtual_hosted_style: None,
             max_retries: None,
             // 每次运行用独立前缀，互不干扰
             prefix: format!(
@@ -455,5 +701,6 @@ mod tests {
         };
         let s = ObjectBlobStore::s3_with_retry(&cfg, no_retry).expect("build");
         assert!(matches!(s.self_test().await, Err(Error::Backend(_))));
+        assert!(matches!(s.check().await, Err(Error::Backend(_))));
     }
 }

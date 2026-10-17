@@ -98,11 +98,16 @@ jobs:
           docker logs s3; exit 1
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p scion-store-sql -p scion-store-blob
+      # 同一套对象存储测试分别跑在 SeaweedFS 与 MinIO 上，并校验识别出的服务种类
+      - name: Store tests (PostgreSQL, SeaweedFS)
+        run: cargo test -p scion-store-sql -p scion-store-blob -p scion
+        env:
+          SCION_TEST_S3_PROVIDER: seaweedfs
       - name: Object store tests on MinIO
-        run: cargo test -p scion-store-blob
+        run: cargo test -p scion-store-blob -p scion
         env:
           SCION_TEST_S3_ENDPOINT: http://localhost:9000
+          SCION_TEST_S3_PROVIDER: minio
 
   # 函数级测试要求（服务端设计文档 §12.1）
   coverage:

@@ -12,6 +12,7 @@ A server-first source control system: history, merges and rebases are computed o
 
 **Guides**
 - [Importing from git](docs/guide/git-import.md) (Chinese): import an existing git repository with its full history
+- [Object storage](docs/guide/object-storage.md) (Chinese): SeaweedFS, MinIO and other S3-compatible services; provider detection and startup checks
 
 **Design and specifications** (Chinese)
 - Design docs: [server](docs/design/rust-server-architecture.md) · [client](docs/design/rust-client-architecture.md) · [starhub / CSGLite integration](docs/design/starhub-integration.md)
@@ -29,8 +30,8 @@ A server-first source control system: history, merges and rebases are computed o
 cargo run -p scion -- server --lite --data-dir ./.scion-data --repo mono
 
 # Other backends: --meta mem|sqlite://PATH|postgres://…  --blobs mem|DIR|s3://bucket/prefix
-# S3 settings: SCION_S3_ENDPOINT, SCION_S3_ACCESS_KEY_ID, SCION_S3_SECRET_ACCESS_KEY, SCION_S3_REGION
-# (tested in CI against SeaweedFS and MinIO)
+# S3 settings: SCION_S3_ENDPOINT, SCION_S3_ACCESS_KEY_ID, SCION_S3_SECRET_ACCESS_KEY, SCION_S3_REGION,
+# SCION_S3_PROVIDER=auto|minio|seaweedfs|aws|generic (SeaweedFS and MinIO are tested in CI; see docs/guide/object-storage.md)
 
 # In another terminal: install scn and check the connection
 cargo install --path client/cli
