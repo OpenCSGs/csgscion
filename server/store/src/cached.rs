@@ -12,7 +12,7 @@ use scion_object::ObjectId;
 
 use crate::{
     ChangesetRecord, IdempotencyRecord, IndexedObject, LandedChange, Lease, MetaStore, PathChange, PathHistoryEntry,
-    RefExpect, RefState, Result, TokenRecord,
+    Redaction, RedactionFilter, RefExpect, RefState, Result, TokenRecord,
 };
 
 /// 在任意 [`MetaStore`] 外加一层提交记录缓存。
@@ -235,6 +235,27 @@ impl MetaStore for CachedMeta {
     async fn put_setting(&self, key: &str, value: &[u8]) -> Result<()> {
         self.inner.put_setting(key, value).await
     }
+
+    // redaction 记录可变，不缓存
+    async fn put_redactions(&self, entries: &[Redaction]) -> Result<()> {
+        self.inner.put_redactions(entries).await
+    }
+
+    async fn get_redactions(&self, repo: &str, ids: &[ObjectId]) -> Result<Vec<Redaction>> {
+        self.inner.get_redactions(repo, ids).await
+    }
+
+    async fn list_redactions(&self, filter: &RedactionFilter) -> Result<Vec<Redaction>> {
+        self.inner.list_redactions(filter).await
+    }
+
+    async fn object_repos(&self, id: &ObjectId) -> Result<Vec<String>> {
+        self.inner.object_repos(id).await
+    }
+
+    async fn list_leases(&self) -> Result<Vec<(String, Lease)>> {
+        self.inner.list_leases().await
+    }
 }
 
 #[cfg(test)]
@@ -249,6 +270,25 @@ mod tests {
     }
 
     // 缓存层必须保持全部语义：完整跑一遍一致性测试
+    /// 没有实现的可选方法返回「不支持」（后端错误），而不是静默成功。
+    #[tokio::test]
+    async fn optional_methods_default_to_unsupported() {
+        let s = Counting {
+            inner: MemStore::new(),
+            reads: AtomicUsize::new(0),
+        };
+        let id = ObjectId::of_blob(b"x");
+        let unsupported = |e: crate::Error| matches!(e, crate::Error::Backend(m) if m.contains("not supported"));
+        assert!(unsupported(s.put_redactions(&[]).await.expect_err("put")));
+        assert!(unsupported(s.get_redactions("r", &[id]).await.expect_err("get")));
+        assert!(unsupported(
+            s.list_redactions(&RedactionFilter::default()).await.expect_err("list")
+        ));
+        assert!(unsupported(s.object_repos(&id).await.expect_err("repos")));
+        assert!(unsupported(s.list_leases().await.expect_err("leases")));
+        assert!(unsupported(s.get_setting("k").await.expect_err("setting")));
+    }
+
     #[tokio::test]
     async fn conformance_meta() {
         testsuite::meta_store(&cached()).await;
@@ -278,6 +318,7 @@ mod tests {
     async fn conformance_leases() {
         testsuite::leases(&cached()).await;
         testsuite::tokens_and_settings(&cached()).await;
+        testsuite::redactions(&cached()).await;
     }
 
     #[tokio::test]

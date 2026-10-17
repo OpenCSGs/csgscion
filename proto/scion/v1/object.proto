@@ -10,6 +10,8 @@ service ObjectService {
   rpc GetObjects(GetObjectsRequest) returns (stream GetObjectsResponse);
   // 返回请求中服务端不存在的对象（FindMissing）。
   rpc HasObjects(HasObjectsRequest) returns (HasObjectsResponse);
+  // 仓库中 redaction 的变化，按 seq 升序（缓存层与 daemon 增量同步，结果不缓存）。需要该仓库的读权限。
+  rpc ListRedactedObjects(ListRedactedObjectsRequest) returns (ListRedactedObjectsResponse);
 }
 
 message ObjectWant {
@@ -45,4 +47,28 @@ message HasObjectsRequest {
 message HasObjectsResponse {
   // 请求中不存在的 id，保持请求中的相对顺序。
   repeated bytes missing_ids = 1;
+}
+
+message ListRedactedObjectsRequest {
+  string repo = 1;
+  // 只返回 seq 大于该值的变化；0 表示从头开始。
+  uint64 after_seq = 2;
+  // 0 表示服务端默认值。
+  uint32 page_size = 3;
+}
+
+message RedactedObject {
+  bytes id = 1;
+  string redaction_id = 2;
+  // false 表示已撤销，可以重新读取。
+  bool active = 3;
+  uint64 seq = 4;
+}
+
+message ListRedactedObjectsResponse {
+  repeated RedactedObject objects = 1;
+  // 下一次请求的 after_seq。
+  uint64 next_seq = 2;
+  // 还有更多变化（达到 page_size）。
+  bool more = 3;
 }

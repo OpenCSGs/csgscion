@@ -90,6 +90,9 @@ pub enum MergeError {
     MissingBlob(ObjectId),
     #[error("storage error: {0}")]
     Storage(String),
+    /// 参与合并的 blob 已被 redact：不能读取，也不能把它的内容合并进新提交。
+    #[error("blob {id} is redacted ({redaction_id})")]
+    Redacted { id: ObjectId, redaction_id: String },
 }
 
 pub type Result<T> = std::result::Result<T, MergeError>;
@@ -278,7 +281,10 @@ async fn read(blobs: &dyn BlobStore, id: ObjectId) -> Result<Bytes> {
     blobs
         .get(&id)
         .await
-        .map_err(|e| MergeError::Storage(e.to_string()))?
+        .map_err(|e| match e {
+            scion_store::Error::Redacted { id, redaction_id } => MergeError::Redacted { id, redaction_id },
+            e => MergeError::Storage(e.to_string()),
+        })?
         .ok_or(MergeError::MissingBlob(id))
 }
 

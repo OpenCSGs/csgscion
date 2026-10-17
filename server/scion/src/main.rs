@@ -3,6 +3,8 @@
 //! 目前有 `server`、`cache`、`admin` 和 `version`；`deriver`、`janitor` 按里程碑逐个加入。
 
 mod authcmd;
+mod fsck;
+mod opscmd;
 mod storage;
 
 use std::net::SocketAddr;
@@ -60,6 +62,53 @@ enum AdminCmd {
     Policy {
         #[command(subcommand)]
         cmd: authcmd::PolicyCmd,
+        #[command(flatten)]
+        storage: StorageArgs,
+    },
+    /// redact 文件内容：对象 id 与历史不变，读取返回 REDACTED（docs/guide/redaction.md）。
+    Redact {
+        #[command(flatten)]
+        args: opscmd::RedactArgs,
+        #[command(flatten)]
+        storage: StorageArgs,
+    },
+    /// 撤销一次 redaction（物理删除之前）。
+    Unredact {
+        redaction_id: String,
+        #[command(flatten)]
+        storage: StorageArgs,
+    },
+    /// 安排物理删除 redact 过的对象（宽限期后由服务端执行，或 --now 立即执行）。
+    Purge {
+        #[command(flatten)]
+        args: opscmd::PurgeArgs,
+        #[command(flatten)]
+        storage: StorageArgs,
+    },
+    /// 列出 redaction 记录。
+    Redactions {
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long = "id", value_name = "REDACTION_ID")]
+        redaction_id: Option<String>,
+        #[command(flatten)]
+        storage: StorageArgs,
+    },
+    /// 查看租约（合入 leader 等）。
+    Lease {
+        #[command(subcommand)]
+        cmd: opscmd::LeaseCmd,
+        #[command(flatten)]
+        storage: StorageArgs,
+    },
+    /// 校验仓库数据：ref、提交、目录树与文件的引用闭包，对象索引与对象存储。只读。
+    Fsck {
+        /// 只检查这个仓库（可以重复）；不指定时检查全部。
+        #[arg(long = "repo", value_name = "NAME")]
+        repos: Vec<String>,
+        /// 读出每个文件并校验哈希（默认只确认存在）。
+        #[arg(long)]
+        verify: bool,
         #[command(flatten)]
         storage: StorageArgs,
     },
@@ -132,6 +181,10 @@ struct ServerArgs {
     #[arg(long, value_name = "DURATION", default_value = "1s", value_parser = parse_duration,
         env = "SCION_REF_POLL_INTERVAL")]
     ref_poll_interval: std::time::Duration,
+    /// redaction 清除的默认宽限期（AdminService.Purge 未指定时），期间可以撤销。
+    #[arg(long, value_name = "DURATION", default_value = "24h", value_parser = parse_duration,
+        env = "SCION_PURGE_GRACE")]
+    purge_grace: std::time::Duration,
     #[command(flatten)]
     auth: authcmd::AuthArgs,
     #[command(flatten)]
@@ -227,7 +280,9 @@ fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
         "ms" => Ok(std::time::Duration::from_millis(n)),
         "s" => Ok(std::time::Duration::from_secs(n)),
         "m" => Ok(std::time::Duration::from_secs(n * 60)),
-        _ => Err(format!("invalid duration unit in {s:?}; use ms, s or m")),
+        "h" => Ok(std::time::Duration::from_secs(n * 3600)),
+        "d" => Ok(std::time::Duration::from_secs(n * 86_400)),
+        _ => Err(format!("invalid duration unit in {s:?}; use ms, s, m, h or d")),
     }
 }
 
@@ -378,6 +433,7 @@ async fn build_app(args: &ServerArgs, env: impl Fn(&str) -> Option<String>) -> a
             read_endpoints: args.read_endpoints.clone(),
             auth,
             ref_poll_interval: args.ref_poll_interval,
+            purge_grace: args.purge_grace,
             ..ServerConfig::default()
         }),
         meta,
@@ -515,7 +571,64 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Command::Admin(cmd) => {
+            let (lines, ok) = admin_ops(cmd, |k| std::env::var(k).ok()).await?;
+            for line in lines {
+                println!("{line}");
+            }
+            if ok {
+                Ok(())
+            } else {
+                anyhow::bail!("fsck found problems")
+            }
+        }
     }
+}
+
+/// 运维类 admin 命令：返回输出与是否成功（fsck 发现问题时为 false）。
+async fn admin_ops(cmd: AdminCmd, env: impl Fn(&str) -> Option<String>) -> anyhow::Result<(Vec<String>, bool)> {
+    let open = |storage: &StorageArgs| {
+        let specs = storage.specs();
+        let env = &env;
+        async move {
+            let (meta_spec, blob_spec) = specs?;
+            storage::open(&meta_spec, &blob_spec, env).await
+        }
+    };
+    Ok(match cmd {
+        AdminCmd::Redact { args, storage } => {
+            let (meta, blobs) = open(&storage).await?;
+            (opscmd::redact(&args, meta, blobs, &env).await?, true)
+        }
+        AdminCmd::Unredact { redaction_id, storage } => {
+            let (meta, blobs) = open(&storage).await?;
+            (opscmd::unredact(&redaction_id, meta, blobs).await?, true)
+        }
+        AdminCmd::Purge { args, storage } => {
+            let (meta, blobs) = open(&storage).await?;
+            (opscmd::purge(&args, meta, blobs).await?, true)
+        }
+        AdminCmd::Redactions {
+            repo,
+            redaction_id,
+            storage,
+        } => {
+            let (meta, blobs) = open(&storage).await?;
+            (
+                opscmd::redactions(repo.as_deref(), redaction_id.as_deref(), meta, blobs).await?,
+                true,
+            )
+        }
+        AdminCmd::Lease { cmd, storage } => {
+            let (meta, _) = open(&storage).await?;
+            (opscmd::lease(&cmd, meta).await?, true)
+        }
+        AdminCmd::Fsck { repos, verify, storage } => {
+            let (meta, blobs) = open(&storage).await?;
+            opscmd::run_fsck(&fsck::FsckOptions { repos, verify }, meta, blobs).await?
+        }
+        other => anyhow::bail!("not an operations command: {other:?}"),
+    })
 }
 
 #[cfg(test)]
@@ -542,7 +655,9 @@ mod tests {
         assert_eq!(parse_duration("500ms"), Ok(std::time::Duration::from_millis(500)));
         assert_eq!(parse_duration("2s"), Ok(std::time::Duration::from_secs(2)));
         assert_eq!(parse_duration("3m"), Ok(std::time::Duration::from_secs(180)));
-        assert!(parse_duration("2h").is_err());
+        assert_eq!(parse_duration("2h"), Ok(std::time::Duration::from_secs(7200)));
+        assert_eq!(parse_duration("1d"), Ok(std::time::Duration::from_secs(86_400)));
+        assert!(parse_duration("2w").is_err());
         assert!(parse_duration("s").is_err());
     }
 
@@ -749,6 +864,42 @@ mod tests {
         build_app(&args(&["--lite", "--data-dir", d]), no_env)
             .await
             .expect("auth not required");
+    }
+
+    #[tokio::test]
+    async fn admin_operations_through_the_cli() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let d = dir.path().to_str().expect("utf8");
+        let (app, _) = build_app(&args(&["--lite", "--data-dir", d, "--repo", "r"]), no_env)
+            .await
+            .expect("app");
+        drop(app);
+        let run = |extra: &[&str]| {
+            let mut argv = vec!["scion", "admin"];
+            argv.extend_from_slice(extra);
+            argv.extend_from_slice(&["--lite", "--data-dir", d]);
+            let cli = Cli::try_parse_from(argv).expect("parse");
+            let Command::Admin(cmd) = cli.command else {
+                panic!("admin");
+            };
+            admin_ops(cmd, no_env)
+        };
+        let (lines, ok) = run(&["fsck", "--verify"]).await.expect("fsck");
+        assert!(ok, "{lines:?}");
+        let (lines, ok) = run(&["fsck", "--repo", "missing"]).await.expect("fsck");
+        assert!(!ok && lines.iter().any(|l| l.contains("does not exist")));
+        assert_eq!(run(&["lease", "ls"]).await.expect("lease"), (vec![], true));
+        assert_eq!(run(&["redactions"]).await.expect("ls"), (vec![], true));
+        assert!(run(&["unredact", "rd_nope"]).await.is_err());
+        assert!(run(&["purge", "rd_nope", "--now"]).await.is_err());
+        let id = scion_object::ObjectId::of_blob(b"never uploaded").to_string();
+        assert!(
+            run(&["redact", "--repo", "r", "--reason", "x", &id]).await.is_err(),
+            "not in the repository"
+        );
+        assert!(Cli::try_parse_from(["scion", "admin", "purge", "rd", "--now", "--grace", "1h"]).is_err());
+        // 不是运维命令
+        assert!(admin_ops(AdminCmd::JwtKeygen, no_env).await.is_err());
     }
 
     #[test]

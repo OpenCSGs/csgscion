@@ -65,6 +65,11 @@ impl Error {
         }
     }
 
+    /// 对象已被 redact（不可重试）。
+    pub fn is_redacted(&self) -> bool {
+        self.reason() == Some(ErrorReason::Redacted)
+    }
+
     /// 按协议约定是否可以原样重试。
     pub fn is_retryable(&self) -> bool {
         match self {
@@ -303,6 +308,8 @@ mod tests {
         assert!(!rpc(Code::Aborted, Some(ErrorReason::MergeConflict)).is_retryable());
         assert!(!rpc(Code::FailedPrecondition, Some(ErrorReason::ObjectMissing)).is_retryable());
         assert!(!rpc(Code::Unavailable, Some(ErrorReason::Redacted)).is_retryable());
+        assert!(rpc(Code::NotFound, Some(ErrorReason::Redacted)).is_redacted());
+        assert!(!rpc(Code::NotFound, Some(ErrorReason::ObjectMissing)).is_redacted());
         assert!(rpc(Code::DeadlineExceeded, None).is_retryable());
         assert!(!rpc(Code::InvalidArgument, None).is_retryable());
         assert!(

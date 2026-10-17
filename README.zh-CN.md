@@ -16,19 +16,27 @@
 - [多节点部署与合入](docs/guide/cluster.md)：合入语义（rebase、恰好一次）、`--advertise-url` 集群模式、故障切换与过载保护
 - [缓存](docs/guide/cache.md)：区域缓存 `scion cache`（分片、对冲、预热）与本机 daemon `scn daemon`
 - [认证与鉴权](docs/guide/auth.md)：令牌、访问控制策略、OIDC 登录、外部签发方、OPA 兼容的鉴权回调、接入 starhub-server
+- [Redaction 与数据校验](docs/guide/redaction.md)：清除泄露的内容（redact、purge）、`scion admin fsck`、`scion admin lease ls`
 
 **设计与规范**
 - 设计文档：[服务端](docs/design/rust-server-architecture.md) · [客户端](docs/design/rust-client-architecture.md) · [接入 starhub / CSGLite](docs/design/starhub-integration.md)
 - 对象格式规范：[`SPEC.md`](SPEC.md)，golden 测试向量在 [`testdata/vectors/`](testdata/vectors/)
 - 协议：[`proto/scion/v1/`](proto/scion/v1/)
 
-当前进度：**M5 生产化**进行中，认证与鉴权已完成：
-- **令牌**：自签 ES256 访问令牌、PAT、刷新令牌。
-- **外部身份（只用标准协议）**：JWKS 或 HS256 签发方、RFC 7662 内省、OPA 兼容的鉴权回调。接入 starhub-server 只需配置。
-- **ACL**：按主体、仓库、动作、ref、路径授予权限。
-- **`scn login`**：OIDC device flow，凭据存钥匙串。
+当前进度：**M5 生产化**进行中，已完成：
+- **认证与鉴权**：
+  - 令牌：自签 ES256 访问令牌、PAT、刷新令牌；
+  - 外部身份（只用标准协议）：JWKS 或 HS256 签发方、RFC 7662 内省、OPA 兼容的鉴权回调。接入 starhub-server 只需配置；
+  - ACL：按主体、仓库、动作、ref、路径授予权限；
+  - `scn login`：OIDC device flow，凭据存钥匙串。
+- **Redaction**：
+  - redact 泄露的文件内容：对象 id 与历史不变，读取返回 `REDACTED`；
+  - 区域缓存和本机 daemon 10 秒内停止返回；
+  - 合入时不会把 redact 过的内容合并进新提交；
+  - purge 在宽限期后物理删除字节，前提是所有含该对象的仓库都已 redact。
+- **运维**：`scion admin fsck` 对照对象索引与对象存储校验 ref、提交、目录树和文件；`scion admin lease ls` 列出租约。
 
-M5 后续还有 redaction、可观测性、YugabyteDB、Helm 与混沌测试。
+M5 后续还有可观测性、YugabyteDB、Helm 与混沌测试。
 
 **M4 缓存层**已完成：
 - **区域缓存 `scion cache`（L2）**：
@@ -54,7 +62,7 @@ M5 后续还有 redaction、可观测性、YugabyteDB、Helm 与混沌测试。
 - M2 实现了历史查询（10 万提交 p99 低于 20 ms）；
 - M1 实现了写入路径、Lite 模式、`scn` 工作副本与 git 导入。
 
-M5 剩余工作：redaction 与 fsck、OpenTelemetry 与指标、YugabyteDB 档、Helm 与发布构建。
+M5 剩余工作：OpenTelemetry 与指标、YugabyteDB 档、Helm 与发布构建。
 
 ## 性能
 

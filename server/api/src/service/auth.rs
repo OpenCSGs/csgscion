@@ -1,4 +1,4 @@
-//! AuthService（身份、换取令牌、device login、权限查询）与 AdminService（策略与令牌管理）。
+//! AuthService（身份、换取令牌、device login、权限查询）与 AdminService（策略、令牌与 redaction 管理）。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,15 +9,18 @@ use scion_proto::v1::admin_service_server::AdminService;
 use scion_proto::v1::auth_service_server::AuthService;
 use scion_proto::v1::{
     self, CheckAccessRequest, CheckAccessResponse, CreateTokenRequest, CreateTokenResponse, DeviceLoginState,
-    ExchangeTokenRequest, ExchangeTokenResponse, GetPolicyRequest, GetPolicyResponse, ListTokensRequest,
-    ListTokensResponse, PollDeviceLoginRequest, PollDeviceLoginResponse, RevokeTokenRequest, RevokeTokenResponse,
-    SetPolicyRequest, SetPolicyResponse, StartDeviceLoginRequest, StartDeviceLoginResponse, TokenInfo, WhoAmIRequest,
-    WhoAmIResponse,
+    ExchangeTokenRequest, ExchangeTokenResponse, GetPolicyRequest, GetPolicyResponse, ListRedactionsRequest,
+    ListRedactionsResponse, ListTokensRequest, ListTokensResponse, PollDeviceLoginRequest, PollDeviceLoginResponse,
+    PurgeRequest, PurgeResponse, RedactRequest, RedactResponse, RedactionInfo, RevokeTokenRequest, RevokeTokenResponse,
+    SetPolicyRequest, SetPolicyResponse, StartDeviceLoginRequest, StartDeviceLoginResponse, TokenInfo, UnredactRequest,
+    UnredactResponse, WhoAmIRequest, WhoAmIResponse,
 };
-use scion_store::TokenRecord;
+use scion_store::{Redaction, TokenRecord};
 use tonic::{Request, Response, Status};
 
-use crate::auth::{principal, to_status};
+use crate::auth::{authorize, principal, to_status};
+use crate::redaction::Redactor;
+use crate::service::support::parse_id;
 
 pub struct AuthSvc {
     guard: Arc<Guard>,
@@ -137,16 +140,77 @@ impl AuthService for AuthSvc {
 
 pub struct AdminSvc {
     guard: Arc<Guard>,
+    redactor: Option<Arc<Redactor>>,
+    purge_grace: Duration,
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+fn duration_ms(d: Duration) -> i64 {
+    i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
+}
+
+pub(crate) fn redaction_info(r: &Redaction) -> RedactionInfo {
+    RedactionInfo {
+        repo: r.repo.clone(),
+        id: bytes::Bytes::copy_from_slice(&r.id.to_bytes()),
+        redaction_id: r.redaction_id.clone(),
+        reason: r.reason.clone(),
+        created_by: r.created_by.clone(),
+        created_at_ms: r.created_at_ms,
+        active: r.active,
+        purge_after_ms: r.purge_after_ms.unwrap_or(0),
+        purged_at_ms: r.purged_at_ms.unwrap_or(0),
+    }
 }
 
 impl AdminSvc {
     pub fn new(guard: Arc<Guard>) -> Self {
-        Self { guard }
+        Self {
+            guard,
+            redactor: None,
+            purge_grace: Duration::from_secs(24 * 3600),
+        }
+    }
+
+    /// 开启 redaction 接口；`purge_grace` 为 Purge 未指定宽限期时的默认值。
+    pub fn with_redactor(mut self, redactor: Arc<Redactor>, purge_grace: Duration) -> Self {
+        self.redactor = Some(redactor);
+        self.purge_grace = purge_grace;
+        self
+    }
+
+    fn redactor(&self) -> Result<&Redactor, Status> {
+        self.redactor
+            .as_deref()
+            .ok_or_else(|| Status::unimplemented("redaction is not enabled on this server"))
+    }
+
+    /// 需要 `repo` 的 admin 权限。
+    async fn require_repo_admin(&self, p: &scion_auth::Principal, repo: &str) -> Result<(), Status> {
+        authorize(&self.guard, p, AuthRequest::repo(repo, Action::Admin)).await
+    }
+
+    /// 一次 redaction 涉及的每个仓库都需要 admin 权限。
+    async fn require_admin_of(&self, p: &scion_auth::Principal, recs: &[Redaction]) -> Result<(), Status> {
+        let repos: std::collections::BTreeSet<&str> = recs.iter().map(|r| r.repo.as_str()).collect();
+        for repo in repos {
+            self.require_repo_admin(p, repo).await?;
+        }
+        Ok(())
     }
 
     async fn require_admin<T>(&self, request: &Request<T>) -> Result<(), Status> {
-        let p = principal(request);
-        if self.guard.is_admin(&p).await.map_err(to_status)? {
+        self.require_system_admin(&principal(request)).await
+    }
+
+    async fn require_system_admin(&self, p: &scion_auth::Principal) -> Result<(), Status> {
+        if self.guard.is_admin(p).await.map_err(to_status)? {
             return Ok(());
         }
         if !p.authenticated {
@@ -238,5 +302,79 @@ impl AdminService for AdminSvc {
         let revoked = self.guard.revoke_token(&id).await.map_err(to_status)?;
         tracing::info!(by = %who, %id, revoked, "token revoked");
         Ok(Response::new(RevokeTokenResponse { revoked }))
+    }
+
+    async fn redact(&self, request: Request<RedactRequest>) -> Result<Response<RedactResponse>, Status> {
+        let red = self.redactor()?;
+        let p = principal(&request);
+        let req = request.into_inner();
+        if req.all_repos {
+            self.require_system_admin(&p).await?;
+        } else {
+            self.require_repo_admin(&p, &req.repo).await?;
+        }
+        let ids = req.ids.iter().map(|b| parse_id(b)).collect::<Result<Vec<_>, _>>()?;
+        let (redaction_id, recs) = red
+            .redact(
+                &req.repo,
+                &ids,
+                &req.paths,
+                &req.reason,
+                &p.subject,
+                req.all_repos,
+                now_ms(),
+            )
+            .await?;
+        Ok(Response::new(RedactResponse {
+            redaction_id,
+            redactions: recs.iter().map(redaction_info).collect(),
+        }))
+    }
+
+    async fn unredact(&self, request: Request<UnredactRequest>) -> Result<Response<UnredactResponse>, Status> {
+        let red = self.redactor()?;
+        let p = principal(&request);
+        let rid = request.into_inner().redaction_id;
+        self.require_admin_of(&p, &red.records(&rid).await?).await?;
+        let n = red.unredact(&rid).await?;
+        tracing::warn!(by = %p.subject, redaction_id = %rid, "redaction withdrawn via API");
+        Ok(Response::new(UnredactResponse {
+            count: u32::try_from(n).unwrap_or(u32::MAX),
+        }))
+    }
+
+    async fn purge(&self, request: Request<PurgeRequest>) -> Result<Response<PurgeResponse>, Status> {
+        let red = self.redactor()?;
+        let p = principal(&request);
+        let req = request.into_inner();
+        self.require_admin_of(&p, &red.records(&req.redaction_id).await?)
+            .await?;
+        let grace = req.grace_seconds.map_or(self.purge_grace, Duration::from_secs);
+        let (n, after) = red.purge(&req.redaction_id, duration_ms(grace), now_ms()).await?;
+        tracing::warn!(by = %p.subject, redaction_id = %req.redaction_id, purge_after_ms = after, "purge scheduled via API");
+        Ok(Response::new(PurgeResponse {
+            count: u32::try_from(n).unwrap_or(u32::MAX),
+            purge_after_ms: after,
+        }))
+    }
+
+    async fn list_redactions(
+        &self,
+        request: Request<ListRedactionsRequest>,
+    ) -> Result<Response<ListRedactionsResponse>, Status> {
+        let red = self.redactor()?;
+        let p = principal(&request);
+        let req = request.into_inner();
+        let repo = Some(req.repo.as_str()).filter(|r| !r.is_empty());
+        match repo {
+            Some(r) => self.require_repo_admin(&p, r).await?,
+            None => self.require_system_admin(&p).await?,
+        }
+        let recs = red
+            .list(repo, Some(req.redaction_id.as_str()).filter(|r| !r.is_empty()))
+            .await?;
+        Ok(Response::new(ListRedactionsResponse {
+            redactions: recs.iter().map(redaction_info).collect(),
+        }))
     }
 }

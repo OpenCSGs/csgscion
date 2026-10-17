@@ -33,7 +33,7 @@ use scion_proto::v1::{self, GetServerInfoRequest, GetServerInfoResponse};
 use tower::{Service, ServiceExt};
 
 pub use cas::Cas;
-pub use objects::DaemonObjectSvc;
+pub use objects::{DaemonObjectSvc, REDACTION_TTL};
 pub use prefetch::{PrefetchOptions, Prefetcher};
 pub use refs::DaemonRefSvc;
 pub use upstream::{Upstream, Upstreams};
@@ -71,6 +71,8 @@ pub struct DaemonConfig {
     /// 没有请求多久后退出；`None` 一直运行。
     pub idle_timeout: Option<Duration>,
     pub prefetch: PrefetchOptions,
+    /// 两次向服务端同步 redaction 的最长间隔（redact 之后 daemon 最多还返回该对象这么久）。
+    pub redaction_ttl: Duration,
 }
 
 impl DaemonConfig {
@@ -102,6 +104,7 @@ impl DaemonConfig {
             memory_bytes: 256 << 20,
             idle_timeout: Some(Duration::from_secs(30 * 60)),
             prefetch: PrefetchOptions::default(),
+            redaction_ttl: objects::REDACTION_TTL,
         }
     }
 }
@@ -114,6 +117,8 @@ pub struct Daemon {
     pub(crate) visible: objects::Visible,
     pub(crate) access: objects::Access,
     pub(crate) offline_access: objects::Access,
+    pub(crate) redactions: objects::Redactions,
+    pub(crate) redaction_ttl: Duration,
     pub(crate) prefetch: Prefetcher,
     pub(crate) stats: Stats,
     /// 最近一次请求的时间（Unix 秒）。
@@ -128,7 +133,7 @@ fn now_secs() -> u64 {
 }
 
 impl Daemon {
-    pub fn new(cas: Arc<Cas>, prefetch: PrefetchOptions) -> Arc<Self> {
+    pub fn new(cas: Arc<Cas>, prefetch: PrefetchOptions, redaction_ttl: Duration) -> Arc<Self> {
         Arc::new(Self {
             cas,
             upstreams: Upstreams::default(),
@@ -136,6 +141,8 @@ impl Daemon {
             visible: objects::Visible::new(1_000_000),
             access: objects::new_access_cache(),
             offline_access: objects::new_offline_cache(),
+            redactions: objects::Redactions::new(100_000),
+            redaction_ttl,
             prefetch: Prefetcher::new(prefetch),
             stats: Stats::default(),
             last_activity: AtomicU64::new(now_secs()),
@@ -318,7 +325,7 @@ pub async fn run(config: DaemonConfig, shutdown: impl Future<Output = ()> + Send
     let pid = pid_file(&config.socket);
     std::fs::write(&pid, std::process::id().to_string()).map_err(io("write", &pid))?;
 
-    let daemon = Daemon::new(cas, config.prefetch);
+    let daemon = Daemon::new(cas, config.prefetch, config.redaction_ttl);
     tracing::info!(socket = %config.socket.display(), cache = %config.cache_dir.display(), "scn daemon listening");
     let idle = idle_watch(daemon.clone(), config.idle_timeout);
     let result = tonic::transport::Server::builder()
@@ -386,6 +393,7 @@ mod tests {
         let d = Daemon::new(
             Cas::open(dir.path(), 1 << 20, 0).expect("cas"),
             PrefetchOptions::default(),
+            objects::REDACTION_TTL,
         );
         d.last_activity.store(0, Ordering::Relaxed);
         tokio::time::timeout(

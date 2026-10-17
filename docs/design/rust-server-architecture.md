@@ -638,6 +638,15 @@ SDK、工作副本、daemon 和 CLI 的完整设计见 [`rust-client-architectur
 > - **ACL**：TOML 规则按主体、仓库通配、动作（read < write < land < admin）、ref、路径前缀授予，存在元数据库中，各节点 30 秒内重新加载。按 id 读对象需要整个仓库的读权限（§9 中 GetTrees 过滤目录条目的做法推迟，`GetTrees` 尚未实现）；`ListDir` / `Diff` 为只限部分路径的读者过滤条目；创建提交逐个检查改动路径；合入检查目标 ref。
 > - **缓存层**：与 §9「L2 只验签」不同，L2 和 daemon 不解析令牌，用调用者的令牌向 L3 `CheckAccess(repo, read)`，结果按（令牌, 仓库）缓存 60 秒。这样对 PAT、外部令牌和鉴权回调都适用，吊销最多延迟 60 秒。daemon 在服务端不可达时，对 24 小时内确认过的身份放行本地读取。敏感前缀不缓存（§9）尚未实现。
 > - **客户端**：SDK `Auth::Exchange` 换取访问令牌并提前 2 分钟续期；`scn login`（device flow 或 `--token`）、`whoami`、`logout`，凭据存 macOS 钥匙串或 0600 文件。
+
+> **M5b redaction 与运维命令实现说明**（2026-10-18）：
+> - **数据模型**：没有在 `objects_index` 上加列，而是新表 `redactions`，按 (仓库, 对象) 一条记录（原因、操作人、时间、是否有效、安排的删除时间、删除时间）。撤销只把记录标为无效，不删除。每次修改分配一个全局递增的 `seq`，取自单行计数表 `redaction_seq`：写入事务先更新这一行，行锁让写入按 seq 顺序提交，按 seq 增量同步不会漏掉晚提交的小序号。不用 SEQUENCE，因为序列值的分配顺序与提交顺序无关。
+> - **只能 redact blob**：目录树和提交对象是历史结构，redact 它们会让检出和查询失效。
+> - **读路径**：`GetObjects` 在确认可见之后批量查一次 redaction，任何一个对象被 redact 就整个请求返回 `REDACTED`，与 OBJECT_MISSING 一样要么完整成功、要么一开始就报错。`ReadFile`、`Blame` 和合入时的三方合并经由 `RedactedBlobs` 读取，逐个检查 blob。rebase 需要合并 redact 过的版本时合入失败，内容不会进入新提交。
+> - **缓存层**：新 RPC `ObjectService.ListRedactedObjects(repo, after_seq)`，需要仓库中任意读权限。L2 和 daemon 按仓库保存 redact 过的对象，最多每 10 秒用调用者的令牌增量同步一次。命中 redaction 时返回与 L3 相同的 REDACTED，并删除本地字节（字节跨仓库共享，其它仓库的读取会重新回源）。同步失败时沿用已有状态，不阻塞读取。
+> - **purge**：`Purge` 安排在宽限期（`--purge-grace`，默认 24 小时）后删除，期间可以撤销。janitor 每轮执行到期的删除，只有对象索引中有该对象的每个仓库都已 redact 才删除字节，否则保持待删除并记录日志。判断“哪些仓库有这个对象”用 `object_repos`：按仓库逐个用主键探测，不为 `objects_index` 增加按 id 的二级索引（写入热路径上不值得多维护一个）。`BlobStore` 新增 `delete`。
+> - **运维命令**：`scion admin redact / unredact / purge / redactions`，直接读写存储；`AdminService` 提供同名的远程接口，权限为所涉及仓库的 admin，`all_repos` 和不限仓库的列表需要系统管理。`scion admin fsck` 校验 ref → 提交 → 目录树 → 文件的引用闭包、对象索引（含大小）与对象存储，`--verify` 读出并校验哈希。`scion admin lease ls` 列出租约。
+> - **限制**：检出包含被 redact 文件的版本会失败（没有占位文件）；blame 追溯到被 redact 的版本时返回 REDACTED；purge 之后重新上传的相同内容不会自动删除。`rederive` 和 `drain` 推迟。
 | **M5 生产化** | 4 周 | YugabyteDB 档与 `migrate-meta` 工具、ACL/OIDC/JWT、redaction、OTel、Helm、混沌测试、多区域 follower read、`conformance` 发布 | 全部 SLO 达标；单 AZ 故障演练通过 |
 
 ---

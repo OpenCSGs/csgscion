@@ -73,6 +73,9 @@ pub enum LandError {
     /// 存储暂时不可用（可重试）。
     #[error("storage unavailable: {0}")]
     Unavailable(String),
+    /// 需要读取的 blob（例如 rebase 时三方合并的文件）已被 redact。
+    #[error("blob {id} is redacted ({redaction_id})")]
+    Redacted { id: ObjectId, redaction_id: String },
 }
 
 pub type Result<T> = std::result::Result<T, LandError>;
@@ -84,6 +87,7 @@ impl From<scion_store::Error> for LandError {
             E::RepoNotFound(r) => Self::RepoNotFound(r),
             E::RefVersionMismatch { .. } => Self::Contention,
             E::Backend(m) => Self::Unavailable(m),
+            E::Redacted { id, redaction_id } => Self::Redacted { id, redaction_id },
             other => Self::Corrupt(other.to_string()),
         }
     }
@@ -110,6 +114,7 @@ impl From<MergeError> for LandError {
             MergeError::Tree(t) => t.into(),
             MergeError::MissingBlob(_) => Self::Corrupt(e.to_string()),
             MergeError::Storage(m) => Self::Unavailable(m),
+            MergeError::Redacted { id, redaction_id } => Self::Redacted { id, redaction_id },
         }
     }
 }

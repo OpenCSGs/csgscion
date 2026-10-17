@@ -8,13 +8,14 @@ use async_trait::async_trait;
 use scion_object::ObjectId;
 use scion_store::{
     ChangesetRecord, Error, IdempotencyRecord, IndexedObject, LandedChange, Lease, MetaStore, PathChange,
-    PathHistoryEntry, RefExpect, RefState, Result, TokenRecord, validate_repo_name,
+    PathHistoryEntry, Redaction, RedactionFilter, RefExpect, RefState, Result, TokenRecord, validate_repo_name,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous};
 
 use crate::common::{
-    CHANGESET_COLUMNS, ChangesetRow, MAX_IDS_PER_QUERY, backend, id_from_db, ids_to_db, is_unique_violation, now_ms,
-    record_from_row, size_to_db, subtract_present, version_from_db, version_to_db,
+    CHANGESET_COLUMNS, ChangesetRow, MAX_IDS_PER_QUERY, REDACTION_COLUMNS, RedactionRow, backend, id_from_db,
+    ids_to_db, is_unique_violation, now_ms, record_from_row, redaction_from_row, size_to_db, subtract_present,
+    version_from_db, version_to_db,
 };
 
 /// 写锁等待上限；SQLite 同一时刻只有一个写者，其余写者在此期间排队。
@@ -383,6 +384,143 @@ impl MetaStore for SqliteMetaStore {
         .await
         .map_err(|e| backend("put setting", e))?;
         Ok(())
+    }
+
+    async fn put_redactions(&self, entries: &[Redaction]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut repo_ids = std::collections::HashMap::new();
+        for e in entries {
+            if !repo_ids.contains_key(&e.repo) {
+                repo_ids.insert(e.repo.clone(), self.repo_id(&e.repo).await?);
+            }
+        }
+        let n = i64::try_from(entries.len()).map_err(|_| Error::Backend("too many redactions".into()))?;
+        let mut tx = self.pool.begin().await.map_err(|e| backend("begin", e))?;
+        // 计数器的行锁让写入按 seq 顺序提交
+        let last: i64 = sqlx::query_scalar("UPDATE redaction_seq SET seq = seq + ? WHERE id = 1 RETURNING seq")
+            .bind(n)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| backend("allocate redaction seq", e))?;
+        for (i, e) in entries.iter().enumerate() {
+            let seq = last - n + 1 + i as i64;
+            sqlx::query(
+                "INSERT INTO redactions (repo_id, object_id, redaction_id, reason, created_by, created_at_ms, \
+                 active, purge_after_ms, purged_at_ms, seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                 ON CONFLICT (repo_id, object_id) DO UPDATE SET redaction_id = excluded.redaction_id, \
+                 reason = excluded.reason, created_by = excluded.created_by, created_at_ms = excluded.created_at_ms, \
+                 active = excluded.active, purge_after_ms = excluded.purge_after_ms, \
+                 purged_at_ms = excluded.purged_at_ms, seq = excluded.seq",
+            )
+            .bind(repo_ids[&e.repo])
+            .bind(e.id.to_bytes().to_vec())
+            .bind(&e.redaction_id)
+            .bind(&e.reason)
+            .bind(&e.created_by)
+            .bind(e.created_at_ms)
+            .bind(e.active)
+            .bind(e.purge_after_ms)
+            .bind(e.purged_at_ms)
+            .bind(seq)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| backend("put redaction", e))?;
+        }
+        tx.commit().await.map_err(|e| backend("commit", e))
+    }
+
+    async fn get_redactions(&self, repo: &str, ids: &[ObjectId]) -> Result<Vec<Redaction>> {
+        let repo_id = self.repo_id(repo).await?;
+        let mut out = Vec::new();
+        let mut unique = ids.to_vec();
+        unique.sort_unstable_by_key(|id| id.to_bytes());
+        unique.dedup();
+        for chunk in unique.chunks(MAX_IDS_PER_QUERY) {
+            let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(format!(
+                "SELECT {} FROM redactions x JOIN repos r ON r.repo_id = x.repo_id WHERE x.repo_id = ",
+                REDACTION_COLUMNS
+            ));
+            qb.push_bind(repo_id).push(" AND x.object_id IN (");
+            let mut sep = qb.separated(", ");
+            for id in chunk {
+                sep.push_bind(id.to_bytes().to_vec());
+            }
+            qb.push(")");
+            let rows: Vec<RedactionRow> = qb
+                .build_query_as()
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| backend("get redactions", e))?;
+            for row in rows {
+                out.push(redaction_from_row(row)?);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn list_redactions(&self, filter: &RedactionFilter) -> Result<Vec<Redaction>> {
+        let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(format!(
+            "SELECT {} FROM redactions x JOIN repos r ON r.repo_id = x.repo_id WHERE x.seq > ",
+            REDACTION_COLUMNS
+        ));
+        qb.push_bind(version_to_db(filter.after_seq)?);
+        if let Some(repo) = &filter.repo {
+            qb.push(" AND r.name = ").push_bind(repo.clone());
+        }
+        if let Some(rid) = &filter.redaction_id {
+            qb.push(" AND x.redaction_id = ").push_bind(rid.clone());
+        }
+        if let Some(t) = filter.purge_due_at {
+            qb.push(" AND x.active = ")
+                .push_bind(true)
+                .push(" AND x.purged_at_ms IS NULL AND x.purge_after_ms <= ")
+                .push_bind(t);
+        }
+        qb.push(" ORDER BY x.seq");
+        if filter.limit > 0 {
+            qb.push(" LIMIT ")
+                .push_bind(i64::try_from(filter.limit).unwrap_or(i64::MAX));
+        }
+        let rows: Vec<RedactionRow> = qb
+            .build_query_as()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| backend("list redactions", e))?;
+        rows.into_iter().map(redaction_from_row).collect()
+    }
+
+    async fn object_repos(&self, id: &ObjectId) -> Result<Vec<String>> {
+        // 逐个仓库按主键探测：objects_index 没有按 id 的索引（写入热路径上不值得多维护一个）
+        sqlx::query_scalar(
+            "SELECT r.name FROM repos r WHERE EXISTS \
+             (SELECT 1 FROM objects_index o WHERE o.repo_id = r.repo_id AND o.id = ?) ORDER BY r.name",
+        )
+        .bind(id.to_bytes().to_vec())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| backend("object repos", e))
+    }
+
+    async fn list_leases(&self) -> Result<Vec<(String, Lease)>> {
+        let rows: Vec<(String, String, i64, i64)> =
+            sqlx::query_as("SELECT scope, holder, token, expires_at_ms FROM leases ORDER BY scope")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| backend("list leases", e))?;
+        rows.into_iter()
+            .map(|(scope, holder, token, expires_at_ms)| {
+                Ok((
+                    scope,
+                    Lease {
+                        holder,
+                        token: version_from_db(token)?,
+                        expires_at_ms,
+                    },
+                ))
+            })
+            .collect()
     }
 
     async fn release_lease(&self, scope: &str, holder: &str) -> Result<()> {
@@ -859,6 +997,7 @@ mod tests {
         let (_dir, s) = fresh().await;
         testsuite::leases(&s).await;
         testsuite::tokens_and_settings(&s).await;
+        testsuite::redactions(&s).await;
     }
 
     #[tokio::test]

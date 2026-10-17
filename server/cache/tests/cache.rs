@@ -416,3 +416,51 @@ async fn cache_enforces_upstream_access_control() {
     }
     assert!(warmed, "warm-up authenticated with the configured token");
 }
+
+/// redaction：缓存层用调用者的身份同步，redact 过的对象返回 REDACTED 并从本地删除；撤销后恢复。
+#[tokio::test(flavor = "multi_thread")]
+async fn redacted_objects_are_refused_by_the_cache() {
+    let s = store();
+    s.create_repo(REPO).await.expect("repo");
+    let up = l3(s.clone()).await;
+    let secret = b"password=hunter2".to_vec();
+    seed(&up, &[("secret.txt", secret.clone()), ("a.txt", b"a".to_vec())]).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let (url, node, _stop) = cache(
+        CacheConfig {
+            redaction_ttl: Duration::ZERO,
+            ..config(&up.url)
+        },
+        listener,
+    )
+    .await;
+    let via_cache = client(&url).await;
+    assert!(via_cache.has_feature(scion_proto::features::REDACTION));
+    let id = ObjectId::of_blob(&secret);
+    assert_eq!(via_cache.get_object(&id).await.expect("cached").to_vec(), secret);
+    assert!(node.store().get(&id).await.is_some());
+
+    let red = scion_api::redaction::Redactor::new(s.clone(), s.clone());
+    let (rid, _) = red
+        .redact(REPO, &[id], &[], "leak", "root", false, 1)
+        .await
+        .expect("redact");
+    let err = via_cache.get_object(&id).await.expect_err("redacted");
+    assert!(err.is_redacted(), "{err:?}");
+    assert!(node.store().get(&id).await.is_none(), "evicted from the cache");
+    assert_eq!(
+        via_cache
+            .get_object(&ObjectId::of_blob(b"a"))
+            .await
+            .expect("other")
+            .as_ref(),
+        b"a"
+    );
+    // 经由缓存转给 L3
+    let page = via_cache.list_redacted_objects(0).await.expect("feed");
+    assert_eq!(page.objects.len(), 1);
+
+    red.unredact(&rid).await.expect("unredact");
+    assert_eq!(via_cache.get_object(&id).await.expect("restored").to_vec(), secret);
+    assert_eq!(scion_cache::REDACTION_TTL, Duration::from_secs(10));
+}

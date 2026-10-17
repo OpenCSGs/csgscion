@@ -11,7 +11,7 @@ pub use blame::{BLAME_KIND, BLAME_VERSION, BlameResult, blame};
 pub use gitsha::{
     GIT_SHA1_EXTENSION, GITSHA_KIND, GITSHA_VERSION, git_sha_of, index_git_sha, lookup_git_sha, parse_git_sha,
 };
-pub use reindex::{ReindexStats, describe, reindex};
+pub use reindex::{ReindexStats, all_records, describe, reindex};
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};

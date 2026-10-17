@@ -111,6 +111,18 @@ impl BlobStore for CachedBlobs {
         }
         self.inner.exists(id).await
     }
+
+    async fn delete(&self, id: &ObjectId) -> Result<()> {
+        if let Some(c) = &self.cache {
+            c.invalidate(id);
+        }
+        self.inner.delete(id).await?;
+        // 删除期间进行中的读可能又把旧字节放回缓存
+        if let Some(c) = &self.cache {
+            c.invalidate(id);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -159,6 +171,30 @@ mod tests {
             delay,
             fail,
         })
+    }
+
+    #[tokio::test]
+    async fn delete_defaults_to_unsupported() {
+        let back = counting(Duration::ZERO, false);
+        assert!(matches!(
+            back.delete(&ObjectId::of_blob(b"x")).await,
+            Err(Error::Backend(m)) if m.contains("not supported")
+        ));
+        let cached = CachedBlobs::new(back, BlobCacheConfig::default());
+        assert!(
+            cached.delete(&ObjectId::of_blob(b"x")).await.is_err(),
+            "errors pass through"
+        );
+    }
+
+    #[tokio::test]
+    async fn conformance_with_and_without_cache() {
+        crate::testsuite::blob_store(&CachedBlobs::new(Arc::new(MemStore::new()), BlobCacheConfig::default())).await;
+        let off = BlobCacheConfig {
+            capacity_bytes: 0,
+            ..BlobCacheConfig::default()
+        };
+        crate::testsuite::blob_store(&CachedBlobs::new(Arc::new(MemStore::new()), off)).await;
     }
 
     #[tokio::test]

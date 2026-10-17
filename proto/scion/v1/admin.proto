@@ -2,7 +2,8 @@ syntax = "proto3";
 
 package scion.v1;
 
-// 管理接口。需要系统管理员权限（ACL 中 repos 含 "*" 且 actions 含 "admin" 的规则）。
+// 管理接口。策略与令牌需要系统管理员权限（ACL 中 repos 含 "*" 且 actions 含 "admin" 的规则）；
+// redaction 需要所涉及仓库的 admin 权限。
 service AdminService {
   // 当前的访问控制策略（TOML，格式见 docs/guide/auth.md）。
   rpc GetPolicy(GetPolicyRequest) returns (GetPolicyResponse);
@@ -12,6 +13,13 @@ service AdminService {
   rpc CreateToken(CreateTokenRequest) returns (CreateTokenResponse);
   rpc ListTokens(ListTokensRequest) returns (ListTokensResponse);
   rpc RevokeToken(RevokeTokenRequest) returns (RevokeTokenResponse);
+  // redaction（docs/guide/redaction.md）：对象 id 与历史不变，读取返回 REDACTED。
+  rpc Redact(RedactRequest) returns (RedactResponse);
+  // 撤销一次 redaction（已物理删除的对象不能撤销）。
+  rpc Unredact(UnredactRequest) returns (UnredactResponse);
+  // 安排在宽限期后物理删除对象字节；只有所有引用该对象的仓库都已 redact 时才会删除。
+  rpc Purge(PurgeRequest) returns (PurgeResponse);
+  rpc ListRedactions(ListRedactionsRequest) returns (ListRedactionsResponse);
 }
 
 message GetPolicyRequest {}
@@ -71,4 +79,63 @@ message RevokeTokenRequest {
 
 message RevokeTokenResponse {
   bool revoked = 1;
+}
+
+message RedactRequest {
+  string repo = 1;
+  // 要 redact 的 blob（34 字节 id）。
+  repeated bytes ids = 2;
+  // 或用 "REV:PATH" 指定文件，在服务端解析为 blob id。
+  repeated string paths = 3;
+  string reason = 4;
+  // 同时 redact 对象索引中有这些对象的所有仓库（需要系统管理员）。
+  bool all_repos = 5;
+}
+
+message RedactionInfo {
+  string repo = 1;
+  bytes id = 2;
+  string redaction_id = 3;
+  string reason = 4;
+  string created_by = 5;
+  int64 created_at_ms = 6;
+  bool active = 7;
+  // 0 表示没有安排物理删除。
+  int64 purge_after_ms = 8;
+  // 0 表示对象字节还在。
+  int64 purged_at_ms = 9;
+}
+
+message RedactResponse {
+  string redaction_id = 1;
+  repeated RedactionInfo redactions = 2;
+}
+
+message UnredactRequest {
+  string redaction_id = 1;
+}
+
+message UnredactResponse {
+  uint32 count = 1;
+}
+
+message PurgeRequest {
+  string redaction_id = 1;
+  // 宽限期（秒）；不设置时使用服务端配置（--purge-grace）。
+  optional uint64 grace_seconds = 2;
+}
+
+message PurgeResponse {
+  uint32 count = 1;
+  int64 purge_after_ms = 2;
+}
+
+message ListRedactionsRequest {
+  // 为空时不限仓库（需要系统管理员）。
+  string repo = 1;
+  string redaction_id = 2;
+}
+
+message ListRedactionsResponse {
+  repeated RedactionInfo redactions = 1;
 }

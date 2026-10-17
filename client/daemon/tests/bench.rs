@@ -97,6 +97,7 @@ async fn clone_through_daemon() {
         memory_bytes: 512 << 20,
         idle_timeout: None,
         prefetch: PrefetchOptions::default(),
+        redaction_ttl: scion_daemon::REDACTION_TTL,
     };
     let socket = cfg.socket.clone();
     tokio::spawn(scion_daemon::run(cfg, std::future::pending()));

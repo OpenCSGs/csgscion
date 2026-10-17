@@ -6,16 +6,23 @@ use std::sync::Arc;
 use bytes::Bytes;
 use scion_object::ObjectId;
 use scion_proto::v1::object_service_server::ObjectService;
-use scion_proto::v1::{Encoding, GetObjectsRequest, GetObjectsResponse, HasObjectsRequest, HasObjectsResponse};
-use scion_store::{BlobStore, MetaStore};
+use scion_proto::v1::{
+    Encoding, GetObjectsRequest, GetObjectsResponse, HasObjectsRequest, HasObjectsResponse, ListRedactedObjectsRequest,
+    ListRedactedObjectsResponse, RedactedObject,
+};
+use scion_store::{BlobStore, MetaStore, RedactionFilter, redactable};
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
-use crate::auth::{authorize, principal};
+use crate::auth::{authorize, authorize_any, principal};
 use crate::config::ServerConfig;
 use crate::service::support::{check_repo, parse_id};
 use crate::status;
 use scion_auth::{Action, Guard, Request as AuthRequest};
+
+/// `ListRedactedObjects` 默认与最大的每页条数。
+const REDACTIONS_PAGE: u32 = 1_000;
+const MAX_REDACTIONS_PAGE: u32 = 10_000;
 
 pub type GetObjectsStream = Pin<Box<dyn Stream<Item = Result<GetObjectsResponse, Status>> + Send>>;
 
@@ -114,6 +121,22 @@ impl ObjectService for ObjectSvc {
         if !missing.is_empty() {
             return Err(status::object_missing(&missing));
         }
+        // redact 过的 blob：整个请求失败（与缺失对象相同，要么完整成功，要么一开始就报错）
+        let blobs: Vec<ObjectId> = ids.iter().filter(|id| redactable(id)).copied().collect();
+        if !blobs.is_empty() {
+            let redacted: Vec<(ObjectId, String)> = self
+                .meta
+                .get_redactions(&req.repo, &blobs)
+                .await
+                .map_err(status::from_store)?
+                .into_iter()
+                .filter(|r| r.active)
+                .map(|r| (r.id, r.redaction_id))
+                .collect();
+            if !redacted.is_empty() {
+                return Err(status::redacted(&redacted));
+            }
+        }
         let mut found = Vec::with_capacity(ids.len());
         for (id, want) in ids.into_iter().zip(&req.wants) {
             match self.blobs.get(&id).await.map_err(status::from_store)? {
@@ -175,6 +198,46 @@ impl ObjectService for ObjectSvc {
                 .collect(),
         }))
     }
+
+    async fn list_redacted_objects(
+        &self,
+        request: Request<ListRedactedObjectsRequest>,
+    ) -> Result<Response<ListRedactedObjectsResponse>, Status> {
+        let p = principal(&request);
+        let req = request.into_inner();
+        // 只列出对象 id：仓库中任意读权限即可（缓存层用调用者的令牌同步）
+        authorize_any(&self.guard, &p, &req.repo, Action::Read).await?;
+        check_repo(self.meta.as_ref(), &req.repo).await?;
+        let page = match req.page_size {
+            0 => REDACTIONS_PAGE,
+            n => n.min(MAX_REDACTIONS_PAGE),
+        } as usize;
+        let mut rows = self
+            .meta
+            .list_redactions(&RedactionFilter {
+                repo: Some(req.repo.clone()),
+                after_seq: req.after_seq,
+                limit: page + 1,
+                ..RedactionFilter::default()
+            })
+            .await
+            .map_err(status::from_store)?;
+        let more = rows.len() > page;
+        rows.truncate(page);
+        Ok(Response::new(ListRedactedObjectsResponse {
+            next_seq: rows.last().map_or(req.after_seq, |r| r.seq),
+            more,
+            objects: rows
+                .into_iter()
+                .map(|r| RedactedObject {
+                    id: Bytes::copy_from_slice(&r.id.to_bytes()),
+                    redaction_id: r.redaction_id,
+                    active: r.active,
+                    seq: r.seq,
+                })
+                .collect(),
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -184,6 +247,7 @@ mod tests {
     use scion_store::{IndexedObject, MemStore};
     use tokio_stream::StreamExt;
     use tonic::Code;
+    use tonic_types::StatusExt;
 
     const REPO: &str = "r";
 
@@ -451,6 +515,98 @@ mod tests {
             collect(&svc, req).await.map_err(|s| s.code()).err(),
             Some(Code::Internal)
         );
+    }
+
+    fn redaction(id: ObjectId, rid: &str, active: bool) -> scion_store::Redaction {
+        scion_store::Redaction {
+            repo: REPO.into(),
+            id,
+            redaction_id: rid.into(),
+            reason: "leak".into(),
+            created_by: "root".into(),
+            created_at_ms: 1,
+            active,
+            purge_after_ms: None,
+            purged_at_ms: None,
+            seq: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn get_objects_refuses_redacted_blobs() {
+        let svc = svc_with(Default::default(), &[b"public", b"secret"]).await;
+        let secret = ObjectId::of_blob(b"secret");
+        svc.meta
+            .put_redactions(&[redaction(secret, "rd1", true)])
+            .await
+            .expect("redact");
+        let req = |wants| GetObjectsRequest {
+            repo: REPO.into(),
+            wants,
+            accept_encodings: vec![],
+        };
+        let err = collect(&svc, req(vec![want(b"public", 0), want(b"secret", 0)]))
+            .await
+            .expect_err("redacted");
+        assert_eq!(err.code(), Code::NotFound);
+        let info = err.get_error_details().error_info().cloned().expect("info");
+        assert_eq!(info.reason, "REDACTED");
+        assert_eq!(info.metadata["ids"], secret.to_string());
+        assert_eq!(info.metadata["redaction_ids"], "rd1");
+        assert_eq!(collect(&svc, req(vec![want(b"public", 0)])).await.expect("ok").len(), 1);
+        // 撤销后恢复读取
+        svc.meta
+            .put_redactions(&[redaction(secret, "rd1", false)])
+            .await
+            .expect("unredact");
+        assert_eq!(collect(&svc, req(vec![want(b"secret", 0)])).await.expect("ok").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_redacted_objects_pages_by_seq() {
+        let svc = svc_with(Default::default(), &[b"a", b"b", b"c"]).await;
+        let ids: Vec<ObjectId> = [b"a", b"b", b"c"].iter().map(|d| ObjectId::of_blob(*d)).collect();
+        svc.meta
+            .put_redactions(&ids.iter().map(|id| redaction(*id, "rd1", true)).collect::<Vec<_>>())
+            .await
+            .expect("redact");
+        let list = |after_seq, page_size| {
+            svc.list_redacted_objects(Request::new(ListRedactedObjectsRequest {
+                repo: REPO.into(),
+                after_seq,
+                page_size,
+            }))
+        };
+        let first = list(0, 2).await.expect("page").into_inner();
+        assert_eq!(first.objects.len(), 2);
+        assert!(first.more);
+        assert_eq!(first.next_seq, first.objects[1].seq);
+        assert!(first.objects.iter().all(|o| o.active && o.redaction_id == "rd1"));
+        let rest = list(first.next_seq, 0).await.expect("rest").into_inner();
+        assert_eq!(rest.objects.len(), 1);
+        assert!(!rest.more);
+        assert_eq!(rest.objects[0].id.as_ref(), ids[2].to_bytes().as_slice());
+        // 没有新变化：next_seq 保持不变
+        let none = list(rest.next_seq, 0).await.expect("none").into_inner();
+        assert!(none.objects.is_empty() && !none.more);
+        assert_eq!(none.next_seq, rest.next_seq);
+        // 撤销也是一次变化
+        svc.meta
+            .put_redactions(&[redaction(ids[0], "rd1", false)])
+            .await
+            .expect("unredact");
+        let undo = list(rest.next_seq, 0).await.expect("undo").into_inner();
+        assert_eq!(undo.objects.len(), 1);
+        assert!(!undo.objects[0].active);
+        let err = svc
+            .list_redacted_objects(Request::new(ListRedactedObjectsRequest {
+                repo: "nope".into(),
+                after_seq: 0,
+                page_size: 0,
+            }))
+            .await
+            .expect_err("no repo");
+        assert_eq!(err.code(), Code::NotFound);
     }
 
     #[tokio::test]

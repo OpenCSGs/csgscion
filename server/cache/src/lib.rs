@@ -34,7 +34,7 @@ use tonic::transport::{Channel, Endpoint};
 
 pub use breaker::Breaker;
 pub use latency::Latency;
-pub use node::{CacheNode, DEFAULT_VISIBLE_ENTRIES, Stats, StatsSnapshot, object_missing};
+pub use node::{CacheNode, DEFAULT_VISIBLE_ENTRIES, REDACTION_TTL, Stats, StatsSnapshot, object_missing};
 pub use ring::Ring;
 pub use service::{CacheInfoSvc, CacheObjectSvc};
 pub use store::{CacheKey, DiskConfig, ObjectCache, StorageConfig};
@@ -58,6 +58,8 @@ pub struct CacheConfig {
     pub warm_options: WarmOptions,
     /// 统计日志的间隔；`None` 不输出。
     pub stats_interval: Option<Duration>,
+    /// 两次向上游同步 redaction 的最长间隔（redact 之后缓存最多还返回该对象这么久）。
+    pub redaction_ttl: Duration,
 }
 
 impl Default for CacheConfig {
@@ -71,6 +73,7 @@ impl Default for CacheConfig {
             warm: Vec::new(),
             warm_options: WarmOptions::default(),
             stats_interval: Some(Duration::from_secs(60)),
+            redaction_ttl: node::REDACTION_TTL,
         }
     }
 }
@@ -161,13 +164,10 @@ pub async fn build(config: &CacheConfig) -> Result<(Arc<CacheNode>, v1::ServerIn
         }
     }
     let store = ObjectCache::open(&config.storage).await.map_err(CacheError::Storage)?;
-    let node = Arc::new(CacheNode::new(
-        store,
-        ring,
-        me,
-        peers,
-        UpstreamPool::new(upstreams, config.pool),
-    ));
+    let node = Arc::new(
+        CacheNode::new(store, ring, me, peers, UpstreamPool::new(upstreams, config.pool))
+            .with_redaction_ttl(config.redaction_ttl),
+    );
     Ok((node, info, channels.into_iter().map(|(_, c)| c).collect()))
 }
 

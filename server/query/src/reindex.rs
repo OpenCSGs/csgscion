@@ -24,7 +24,7 @@ pub struct ReindexStats {
 }
 
 /// 读出仓库的全部提交记录，按代数从低到高。同一代数的记录超过一个窗口时自动扩大窗口。
-async fn all_records(meta: &dyn MetaStore, repo: &str, window: usize) -> Result<Vec<ChangesetRecord>> {
+pub async fn all_records(meta: &dyn MetaStore, repo: &str, window: usize) -> Result<Vec<ChangesetRecord>> {
     let mut window = window.max(1);
     let mut max_generation = u64::MAX >> 1;
     let mut out: Vec<ChangesetRecord> = Vec::new();

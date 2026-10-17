@@ -6,6 +6,9 @@
 //! 本地命中而可见性未知的，先向上游批量 `HasObjects` 确认，不可见时返回与 L3 相同的 OBJECT_MISSING。
 //! single-flight 按 (仓库, id) 合并，一个仓库的回源结果不会交给另一个仓库的请求。
 //!
+//! **redaction**：按仓库保存 redact 过的对象，最多每 [`REDACTION_TTL`] 用调用者的令牌向上游增量同步一次
+//! （`ListRedactedObjects`）。redact 过的对象返回与 L3 相同的 REDACTED，字节从本地缓存删除。
+//!
 //! 一个 id 只由负责它的节点回源，整个区域对同一个对象只回源一次。负责的节点不可达时自己回源
 //! （区域内绕路，但绝不让客户端绕过 L2 直连源站）。转发来的请求（[`CACHE_FORWARDED_HEADER`]）不再
 //! 转发，避免环路。
@@ -22,7 +25,7 @@ use tonic::Status;
 
 use crate::ring::Ring;
 use crate::store::ObjectCache;
-use crate::upstream::{RequestCtx, Upstream, UpstreamPool, is_upstream_failure};
+use crate::upstream::{RedactionPage, RequestCtx, Upstream, UpstreamPool, is_upstream_failure};
 
 #[cfg(doc)]
 use crate::upstream::CACHE_FORWARDED_HEADER;
@@ -88,6 +91,21 @@ type FlightKey = (Arc<str>, ObjectId);
 /// 读权限确认结果的缓存时间。
 pub const ACCESS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// 两次向上游同步 redaction 的最长间隔，即 redact 之后缓存层最多还返回该对象这么久。
+pub const REDACTION_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 一次同步最多读取的页数（每页最多 1000 条）；剩下的下次请求继续。
+const MAX_REDACTION_PAGES: usize = 100;
+
+/// 一个仓库的 redaction 状态。
+#[derive(Default)]
+struct RepoRedactions {
+    after_seq: u64,
+    synced_at: Option<std::time::Instant>,
+    /// 对象 → redaction 标识。
+    redacted: HashMap<ObjectId, String>,
+}
+
 /// 可见集默认条目数上限（每条约百字节）。
 pub const DEFAULT_VISIBLE_ENTRIES: u64 = 10_000_000;
 
@@ -107,6 +125,27 @@ fn permission_denied(repo: &str) -> Status {
     <Status as tonic_types::StatusExt>::with_error_details(
         tonic::Code::PermissionDenied,
         format!("permission denied: read on {repo}"),
+        details,
+    )
+}
+
+/// 与 L3 相同的「对象已被 redact」错误：NOT_FOUND / REDACTED，metadata 带 `ids`、`redaction_ids` 与 `count`。
+pub fn redacted(objects: &[(ObjectId, String)]) -> Status {
+    let shown = &objects[..objects.len().min(MAX_IDS_IN_ERROR)];
+    let ids: Vec<String> = shown.iter().map(|(id, _)| id.to_string()).collect();
+    let rids: Vec<&str> = shown.iter().map(|(_, r)| r.as_str()).collect();
+    let details = tonic_types::ErrorDetails::with_error_info(
+        scion_proto::reason_name(scion_proto::v1::ErrorReason::Redacted),
+        scion_proto::ERROR_DOMAIN,
+        HashMap::from([
+            ("ids".to_string(), ids.join(",")),
+            ("redaction_ids".to_string(), rids.join(",")),
+            ("count".to_string(), objects.len().to_string()),
+        ]),
+    );
+    <Status as tonic_types::StatusExt>::with_error_details(
+        tonic::Code::NotFound,
+        format!("{} object(s) are redacted", objects.len()),
         details,
     )
 }
@@ -132,8 +171,11 @@ pub fn object_missing(ids: &[ObjectId]) -> Status {
 pub struct CacheNode {
     store: ObjectCache,
     flight: Group<FlightKey, Outcome>,
-    /// 已确认可见的 (仓库, id)。对象一旦进入仓库索引就不会离开（redaction 在 M5 处理）。
+    /// 已确认可见的 (仓库, id)。对象一旦进入仓库索引就不会离开；redaction 单独处理（见 `redactions`）。
     visible: moka::sync::Cache<FlightKey, ()>,
+    /// 各仓库的 redaction 状态；锁同时让同一仓库的并发同步只做一次。
+    redactions: moka::sync::Cache<Arc<str>, Arc<tokio::sync::Mutex<RepoRedactions>>>,
+    redaction_ttl: std::time::Duration,
     /// 已确认可以读取整个仓库的 (令牌哈希, 仓库)，[`ACCESS_TTL`] 后重新确认（吊销或改策略最多延迟这么久）。
     access: moka::sync::Cache<([u8; 32], Arc<str>), ()>,
     ring: Ring,
@@ -164,6 +206,8 @@ impl CacheNode {
             store,
             flight: Group::new(),
             visible: moka::sync::Cache::new(DEFAULT_VISIBLE_ENTRIES),
+            redactions: moka::sync::Cache::new(1_000_000),
+            redaction_ttl: REDACTION_TTL,
             access: moka::sync::Cache::builder()
                 .max_capacity(1_000_000)
                 .time_to_live(ACCESS_TTL)
@@ -174,6 +218,12 @@ impl CacheNode {
             upstream,
             stats: Stats::default(),
         }
+    }
+
+    /// 修改 redaction 同步间隔（测试用）。
+    pub fn with_redaction_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.redaction_ttl = ttl;
+        self
     }
 
     pub fn stats(&self) -> StatsSnapshot {
@@ -209,6 +259,7 @@ impl CacheNode {
         unique.dedup();
         let repo_key: Arc<str> = Arc::from(repo);
         self.check_access(&repo_key, ctx).await?;
+        self.check_redactions(&repo_key, &unique, ctx).await?;
         let found = self.resolve(&repo_key, &unique, ctx, forwarded).await;
         let out: Vec<Bytes> = ids
             .iter()
@@ -240,6 +291,48 @@ impl CacheNode {
         }
         self.access.insert(key, ());
         Ok(())
+    }
+
+    /// `ids` 中有 redact 过的对象时返回 REDACTED。状态过期时先向上游同步。
+    async fn check_redactions(&self, repo: &Arc<str>, ids: &[ObjectId], ctx: &RequestCtx) -> Result<(), Status> {
+        let state = self.redactions.get_with(repo.clone(), Default::default);
+        let mut st = state.lock().await;
+        if st.synced_at.is_none_or(|t| t.elapsed() >= self.redaction_ttl) {
+            self.sync_redactions(repo, &mut st, ctx).await;
+        }
+        let hits: Vec<(ObjectId, String)> = ids
+            .iter()
+            .filter_map(|id| st.redacted.get(id).map(|r| (*id, r.clone())))
+            .collect();
+        if hits.is_empty() { Ok(()) } else { Err(redacted(&hits)) }
+    }
+
+    /// 向上游增量同步一个仓库的 redaction。失败时保留已有状态（下一个请求再试），不阻塞读取。
+    async fn sync_redactions(&self, repo: &Arc<str>, st: &mut RepoRedactions, ctx: &RequestCtx) {
+        for _ in 0..MAX_REDACTION_PAGES {
+            let page: RedactionPage = match self.upstream.redactions(repo, st.after_seq, ctx).await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(%repo, error = %e, "syncing redactions failed; serving with the previous state");
+                    return;
+                }
+            };
+            for c in page.changes {
+                if c.active {
+                    // 字节跨仓库共享：从本地删除，其它仓库的读取会重新回源（对象被清除后回源也读不到）
+                    self.store.remove(&c.id);
+                    self.visible.invalidate(&(repo.clone(), c.id));
+                    st.redacted.insert(c.id, c.redaction_id);
+                } else {
+                    st.redacted.remove(&c.id);
+                }
+            }
+            st.after_seq = page.next_seq;
+            if !page.more {
+                st.synced_at = Some(std::time::Instant::now());
+                return;
+            }
+        }
     }
 
     /// 确认 `ids` 都在 `repo` 中可见：可见集里没有的向上游批量查询。
@@ -435,6 +528,69 @@ mod tests {
 
     async fn single(f: &Arc<Fake>) -> CacheNode {
         CacheNode::new(store().await, Ring::new(Vec::new()), None, HashMap::new(), pool(f))
+    }
+
+    #[tokio::test]
+    async fn redacted_objects_are_refused_and_evicted() {
+        use std::sync::atomic::Ordering;
+        let up = Arc::new(Fake::new("l3", &[A, B, C]));
+        let n = single(&up).await.with_redaction_ttl(Duration::ZERO);
+        let ctx = RequestCtx::default();
+        n.get_many("r", &[id(A), id(B)], &ctx, false).await.expect("ok");
+        assert!(n.store().get(&id(A)).await.is_some());
+
+        // 三条变化分两页同步
+        up.redact(A, true);
+        up.redact(C, true);
+        up.redact(B, true);
+        let err = n
+            .get_many("r", &[id(A), id(B)], &ctx, false)
+            .await
+            .expect_err("redacted");
+        assert_eq!(err.code(), Code::NotFound);
+        let info = tonic_types::StatusExt::get_error_details(&err)
+            .error_info()
+            .cloned()
+            .expect("info");
+        assert_eq!(info.reason, "REDACTED");
+        assert_eq!(info.metadata["count"], "2");
+        assert_eq!(info.metadata["redaction_ids"], "rd1,rd1");
+        assert!(n.store().get(&id(A)).await.is_none(), "evicted");
+        assert_eq!(
+            up.redaction_calls.load(Ordering::SeqCst),
+            3,
+            "initial sync, then two pages"
+        );
+
+        // 撤销：恢复读取（重新回源）
+        up.redact(A, false);
+        up.redact(B, false);
+        let got = n.get_many("r", &[id(A), id(B)], &ctx, false).await.expect("restored");
+        assert_eq!(got, [Bytes::from_static(A), Bytes::from_static(B)]);
+
+        // 同步失败：保留已有状态，不阻塞读取
+        *up.redaction_error.lock().expect("lock") = Some(Status::unavailable("down"));
+        n.get_many("r", &[id(A)], &ctx, false).await.expect("still served");
+        assert_eq!(
+            n.get_many("r", &[id(C)], &ctx, false).await.map_err(|e| e.code()),
+            Err(Code::NotFound),
+            "known redaction kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn redactions_sync_at_most_once_per_ttl() {
+        use std::sync::atomic::Ordering;
+        let up = Arc::new(Fake::new("l3", &[A]));
+        let n = single(&up).await;
+        let ctx = RequestCtx::default();
+        for _ in 0..3 {
+            n.get_many("r", &[id(A)], &ctx, false).await.expect("ok");
+        }
+        assert_eq!(up.redaction_calls.load(Ordering::SeqCst), 1);
+        n.get_many("other", &[id(A)], &ctx, false).await.expect("ok");
+        assert_eq!(up.redaction_calls.load(Ordering::SeqCst), 2, "per repository");
+        assert_eq!(redacted(&[]).code(), Code::NotFound);
     }
 
     #[tokio::test]

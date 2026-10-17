@@ -4,6 +4,7 @@
 //! 留在内存（[`Pending`]）里，后面的请求直接在上面继续；整批确定后由调用方一次写入并更新 ref。
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use scion_merge::{Limits, Outcome, rebase_delta};
 use scion_object::{Changeset, ObjectId};
@@ -97,7 +98,12 @@ impl<'a> Batch<'a> {
         reference: &'a str,
         head: Option<ObjectId>,
     ) -> Result<Self> {
-        let pending = Pending::new(writer.blobs().clone());
+        // 三方合并读取的 blob 按仓库检查 redaction：redact 过的内容不能被合并进新提交
+        let pending = Pending::new(Arc::new(scion_store::RedactedBlobs::new(
+            writer.blobs().clone(),
+            writer.meta().clone(),
+            repo,
+        )));
         let onto = match head {
             Some(h) => Some(pending.record(writer.meta().as_ref(), repo, h).await?),
             None => None,
