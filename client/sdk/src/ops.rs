@@ -80,7 +80,7 @@ fn bytes_of(id: &ObjectId) -> Bytes {
     Bytes::copy_from_slice(&id.to_bytes())
 }
 
-fn id_from(raw: &[u8], what: &str) -> Result<ObjectId> {
+pub(crate) fn id_from(raw: &[u8], what: &str) -> Result<ObjectId> {
     ObjectId::from_bytes(raw).map_err(|e| Error::Protocol(format!("bad {what} in response: {e}")))
 }
 
@@ -93,7 +93,7 @@ fn proto_mode(m: EntryMode) -> v1::EntryMode {
     }
 }
 
-fn mode_from(m: i32) -> Result<EntryMode> {
+pub(crate) fn mode_from(m: i32) -> Result<EntryMode> {
     match v1::EntryMode::try_from(m) {
         Ok(v1::EntryMode::File) => Ok(EntryMode::File),
         Ok(v1::EntryMode::Executable) => Ok(EntryMode::Executable),

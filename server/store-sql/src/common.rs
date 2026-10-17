@@ -61,6 +61,36 @@ pub(crate) fn size_to_db(size: u64) -> Result<i64> {
     i64::try_from(size).map_err(|_| Error::Backend(format!("object size {size} exceeds i64")))
 }
 
+/// 把多个 ObjectId 依次拼接存入一列。
+pub(crate) fn ids_to_db(ids: &[ObjectId]) -> Vec<u8> {
+    ids.iter().flat_map(|id| id.to_bytes()).collect()
+}
+
+pub(crate) fn ids_from_db(b: &[u8]) -> Result<Vec<ObjectId>> {
+    if b.len() % scion_object::ID_LEN != 0 {
+        return Err(Error::Backend(format!("corrupt id list of {} bytes", b.len())));
+    }
+    b.chunks(scion_object::ID_LEN).map(id_from_db).collect()
+}
+
+/// changesets 表的一行：cs_id, root_tree, parents, generation, fp_depth, fp_jump。
+pub(crate) type ChangesetRow = (Vec<u8>, Vec<u8>, Vec<u8>, i64, i64, Option<Vec<u8>>);
+
+/// 两个后端共用的列清单，与 [`ChangesetRow`] 顺序一致。
+pub(crate) const CHANGESET_COLUMNS: &str = "cs_id, root_tree, parents, generation, fp_depth, fp_jump";
+
+pub(crate) fn record_from_row(row: ChangesetRow) -> Result<scion_store::ChangesetRecord> {
+    let (id, root, parents, generation, fp_depth, fp_jump) = row;
+    Ok(scion_store::ChangesetRecord {
+        id: id_from_db(&id)?,
+        root_tree: id_from_db(&root)?,
+        parents: ids_from_db(&parents)?,
+        generation: version_from_db(generation)?,
+        fp_depth: version_from_db(fp_depth)?,
+        fp_jump: fp_jump.as_deref().map(id_from_db).transpose()?,
+    })
+}
+
 /// URL 中的密码替换为 `***`，用于错误信息和日志。
 pub(crate) fn redact_url(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
@@ -109,6 +139,34 @@ mod tests {
         let present = std::collections::HashSet::from([b.to_bytes().to_vec()]);
         assert_eq!(subtract_present(&[c, b, a, c], &present), vec![c, a]);
         assert_eq!(subtract_present(&[], &present), vec![]);
+    }
+
+    #[test]
+    fn record_from_row_cases() {
+        let id = ObjectId::hash(scion_object::ObjectKind::Changeset, b"c");
+        let row = |jump: Option<Vec<u8>>, depth: i64| -> ChangesetRow {
+            (
+                id.to_bytes().to_vec(),
+                id.to_bytes().to_vec(),
+                ids_to_db(&[id]),
+                3,
+                depth,
+                jump,
+            )
+        };
+        let rec = record_from_row(row(Some(id.to_bytes().to_vec()), 2)).expect("ok");
+        assert_eq!((rec.fp_depth, rec.fp_jump, rec.parents.len()), (2, Some(id), 1));
+        assert_eq!(record_from_row(row(None, 0)).expect("ok").fp_jump, None);
+        assert!(matches!(record_from_row(row(Some(vec![1]), 1)), Err(Error::Backend(_))));
+        assert!(matches!(record_from_row(row(None, -1)), Err(Error::Backend(_))));
+    }
+
+    #[test]
+    fn id_lists_roundtrip() {
+        let ids = vec![ObjectId::of_blob(b"a"), ObjectId::of_blob(b"b")];
+        assert_eq!(ids_from_db(&ids_to_db(&ids)), Ok(ids));
+        assert_eq!(ids_from_db(&[]), Ok(vec![]));
+        assert!(matches!(ids_from_db(&[1, 2, 3]), Err(Error::Backend(_))));
     }
 
     #[test]

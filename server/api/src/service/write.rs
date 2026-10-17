@@ -10,7 +10,7 @@ use scion_proto::v1::{
     self, ChangesetSpec, CreateChangesetRequest, CreateChangesetResponse, UploadBlobsRequest, UploadBlobsResponse,
     file_change,
 };
-use scion_store::{BlobStore, ChangesetRecord, IndexedObject, MetaStore};
+use scion_store::{BlobStore, ChangesetRecord, IndexedObject, MetaStore, PathChange};
 use scion_tree::{BlobTreeSource, apply_delta};
 use tonic::{Request, Response, Status, Streaming};
 
@@ -101,12 +101,33 @@ impl WriteSvc {
         objects.push((cs_id, cs_bytes));
         self.store(repo, &objects).await?;
 
+        let (fp_depth, fp_jump) = scion_store::fp_skip(self.meta.as_ref(), repo, cs.first_parent().copied())
+            .await
+            .map_err(status::from_store)?;
         let rec = ChangesetRecord {
             id: cs_id,
             root_tree: built.root,
-            first_parent: cs.first_parent().copied(),
+            parents: cs.parents.clone(),
             generation: generation.saturating_add(1),
+            fp_depth,
+            fp_jump,
         };
+        // 先写路径索引，再写记录：记录存在即表示索引完整
+        let changes: Vec<PathChange> = cs
+            .delta
+            .iter()
+            .map(|c| PathChange {
+                path: c.path.clone(),
+                deleted: matches!(c.op, scion_object::FileOp::Delete),
+            })
+            .collect();
+        self.meta
+            .index_paths(repo, cs_id, rec.generation, &changes)
+            .await
+            .map_err(status::from_store)?;
+        scion_query::index_git_sha(self.meta.as_ref(), repo, cs_id, cs)
+            .await
+            .map_err(crate::service::history::from_query)?;
         self.meta.put_changeset(repo, &rec).await.map_err(status::from_store)?;
         Ok(rec)
     }
@@ -532,7 +553,7 @@ pub(crate) mod tests {
             .await
             .expect("root");
         assert_eq!(root.generation, 1);
-        assert_eq!(root.first_parent, None);
+        assert_eq!(root.first_parent(), None);
         // 提交对象和新目录树都已登记，可被 GetObjects 读到
         assert_eq!(
             store.missing_objects(REPO, &[root.id, root.root_tree]).await,
@@ -546,9 +567,17 @@ pub(crate) mod tests {
             .await
             .expect("child");
         assert_eq!(child.generation, 2);
-        assert_eq!(child.first_parent, Some(root.id));
+        assert_eq!(child.first_parent(), Some(root.id));
+        assert_eq!((root.fp_depth, child.fp_depth), (1, 2));
+        assert_eq!(child.fp_jump, Some(root.id));
         assert_eq!(child.root_tree, scion_object::Tree::default().id());
-        assert_eq!(store.get_changeset(REPO, &child.id).await, Ok(Some(child)));
+        assert_eq!(store.get_changeset(REPO, &child.id).await, Ok(Some(child.clone())));
+        // 路径索引已写入
+        let hist = store.path_history(REPO, "a", 10, 10).await.expect("history");
+        assert_eq!(
+            hist.iter().map(|e| (e.cs, e.deleted)).collect::<Vec<_>>(),
+            vec![(child.id, true), (root.id, false)]
+        );
         // 幂等：同样的内容再次创建得到同样的结果
         let again = w
             .create(
@@ -612,6 +641,7 @@ pub(crate) mod tests {
             .expect("c");
         let m = w.create(REPO, &cs(&[c.id, b.id], vec![])).await.expect("merge");
         assert_eq!(m.generation, 3);
-        assert_eq!(m.first_parent, Some(c.id));
+        assert_eq!(m.first_parent(), Some(c.id));
+        assert_eq!(m.parents, vec![c.id, b.id]);
     }
 }

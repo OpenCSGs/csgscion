@@ -288,6 +288,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bstr"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6bb31b46c14244e20ee9984b11bf5c992b91fb6939fea616e3512c8baecdbe5f"
+dependencies = [
+ "memchr",
+ "serde_core",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -526,6 +536,24 @@ dependencies = [
  "digest 0.10.7",
  "rustversion",
  "spin 0.10.1",
+]
+
+[[package]]
+name = "crossbeam-channel"
+version = "0.5.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98b0cc327b5bc766e7fda9c9260cc0fa81b43a8e240440422dff70788e3f9ef1"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-epoch"
+version = "0.9.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc74980687109a3b14c72fd458107bf0baa1da1a1a805e178d15501ba9b86d9d"
+dependencies = [
+ "crossbeam-utils",
 ]
 
 [[package]]
@@ -1490,6 +1518,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "moka"
+version = "0.12.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4293f18e7567a1caf3c584855554377025c65e0aa445344d04171f5ad63d19b9"
+dependencies = [
+ "crossbeam-channel",
+ "crossbeam-epoch",
+ "crossbeam-utils",
+ "equivalent",
+ "parking_lot",
+ "portable-atomic",
+ "smallvec",
+ "tagptr",
+ "uuid",
+]
+
+[[package]]
 name = "multimap"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1734,6 +1779,12 @@ name = "plain"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
+
+[[package]]
+name = "portable-atomic"
+version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
 
 [[package]]
 name = "potential_utf"
@@ -2343,6 +2394,7 @@ dependencies = [
  "scion-api",
  "scion-client",
  "scion-object",
+ "scion-query",
  "scion-store",
  "scion-store-blob",
  "scion-store-sql",
@@ -2358,8 +2410,10 @@ name = "scion-api"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "hex",
  "scion-object",
  "scion-proto",
+ "scion-query",
  "scion-store",
  "scion-tree",
  "tokio",
@@ -2384,6 +2438,7 @@ dependencies = [
  "scion-wc",
  "serde",
  "serde_json",
+ "similar",
  "tempfile",
  "tokio",
 ]
@@ -2393,6 +2448,7 @@ name = "scion-client"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "hex",
  "scion-api",
  "scion-object",
  "scion-proto",
@@ -2444,11 +2500,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "scion-query"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "hex",
+ "scion-object",
+ "scion-store",
+ "scion-store-sql",
+ "scion-tree",
+ "similar",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "scion-store"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "moka",
  "scion-object",
  "thiserror",
  "tokio",
@@ -2461,6 +2535,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "object_store",
+ "reqwest",
  "scion-object",
  "scion-store",
  "tempfile",
@@ -2677,6 +2752,15 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
+
+[[package]]
+name = "similar"
+version = "3.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f66ca1f7aca2474dc10c942eb22feffc897735f54cd1db90138c2fddb490987"
+dependencies = [
+ "bstr",
+]
 
 [[package]]
 name = "slab"
@@ -2984,6 +3068,12 @@ dependencies = [
  "quote",
  "syn 3.0.9",
 ]
+
+[[package]]
+name = "tagptr"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
 
 [[package]]
 name = "tempfile"

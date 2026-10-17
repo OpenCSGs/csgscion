@@ -4,6 +4,7 @@
 //! 4 可重试错误（已用尽重试）、5 认证失败。
 
 mod commands;
+mod history;
 mod output;
 
 use std::io::Write;
@@ -62,6 +63,28 @@ enum Command {
     Cat { spec: String },
     /// 列出目录：[REV:][DIR]。
     Ls { spec: Option<String> },
+    /// 历史：从 REV（默认当前 ref）开始，按时间从新到旧。
+    Log {
+        revision: Option<String>,
+        /// 只显示改动了该路径的提交。
+        #[arg(long)]
+        path: Option<String>,
+        /// 最多显示的条数。
+        #[arg(short = 'n', long = "max-count", default_value_t = 20)]
+        max_count: usize,
+    },
+    /// 逐行显示最后改动的提交：[REV:]PATH。
+    Blame { spec: String },
+    /// 差异：不带参数为本地未提交的改动；一个 REV 为该提交引入的改动；两个 REV 为两者之间的差异。
+    Diff {
+        revisions: Vec<String>,
+        /// 只比较该路径。
+        #[arg(long)]
+        path: Option<String>,
+        /// 只列出文件名与状态（A / M / D）。
+        #[arg(long)]
+        name_only: bool,
+    },
     /// 导入外部历史。
     #[command(subcommand)]
     Import(ImportCmd),
@@ -132,6 +155,20 @@ async fn run(cli: Cli) -> ExitCode {
         Command::Land => emit(commands::land(&ctx).await, json),
         Command::Sync => emit(commands::sync(&ctx).await, json),
         Command::Ls { spec } => emit(commands::ls(&ctx, spec.as_deref()).await, json),
+        Command::Log {
+            revision,
+            path,
+            max_count,
+        } => emit(
+            history::log(&ctx, revision.as_deref(), path.as_deref(), max_count).await,
+            json,
+        ),
+        Command::Blame { spec } => emit(history::blame(&ctx, &spec).await, json),
+        Command::Diff {
+            revisions,
+            path,
+            name_only,
+        } => emit(history::diff(&ctx, &revisions, path.as_deref(), name_only).await, json),
         Command::Import(ImportCmd::Git {
             path,
             git_ref,
@@ -186,6 +223,10 @@ mod tests {
         let cli =
             Cli::try_parse_from(["scn", "import", "git", "../repo", "--repo", "r", "--git-ref", "dev"]).expect("parse");
         assert!(matches!(cli.command, Command::Import(ImportCmd::Git { ref git_ref, .. }) if git_ref == "dev"));
+        let cli = Cli::try_parse_from(["scn", "log", "main", "--path", "src", "-n", "5"]).expect("parse");
+        assert!(matches!(cli.command, Command::Log { max_count: 5, .. }));
+        let cli = Cli::try_parse_from(["scn", "diff", "a", "b", "--name-only"]).expect("parse");
+        assert!(matches!(cli.command, Command::Diff { ref revisions, name_only: true, .. } if revisions.len() == 2));
         let cli = Cli::try_parse_from(["scn", "ls"]).expect("parse");
         assert!(matches!(cli.command, Command::Ls { spec: None }));
     }

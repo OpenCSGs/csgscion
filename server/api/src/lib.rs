@@ -29,6 +29,30 @@ pub struct App {
     pub blobs: Arc<dyn BlobStore>,
 }
 
+/// 预热全部仓库的提交记录缓存。失败只记录日志：缓存未命中时照常按需读取。
+async fn warm(cache: Arc<scion_store::CachedMeta>) {
+    let repos = match scion_store::MetaStore::list_repos(cache.as_ref()).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "record cache warm-up skipped");
+            return;
+        }
+    };
+    let started = std::time::Instant::now();
+    let mut total = 0;
+    for repo in repos {
+        match cache.warm(&repo, 4096).await {
+            Ok(n) => total += n,
+            Err(e) => tracing::warn!(%repo, error = %e, "record cache warm-up failed"),
+        }
+    }
+    tracing::info!(
+        records = total,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "record cache warmed"
+    );
+}
+
 /// 在给定监听器上提供全部 gRPC 服务（含标准健康检查），直到 `shutdown` 完成。
 pub async fn serve(
     listener: TcpListener,
@@ -43,6 +67,12 @@ pub async fn serve(
     health.set_serving::<RefServiceServer<RefSvc>>().await;
     health.set_serving::<QueryServiceServer<QuerySvc>>().await;
 
+    // 所有服务共享一份提交记录缓存；启动后在后台预热，不阻塞监听
+    let cached = Arc::new(scion_store::CachedMeta::new(app.meta, app.config.record_cache_capacity));
+    if app.config.warm_record_cache {
+        tokio::spawn(warm(cached.clone()));
+    }
+    let app = App { meta: cached, ..app };
     let max_msg = usize::try_from(app.config.limits.max_chunk_bytes)
         .unwrap_or(usize::MAX)
         .saturating_add(64 * 1024);

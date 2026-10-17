@@ -9,13 +9,19 @@ use scion_object::ObjectId;
 
 use crate::error::{Error, Result};
 use crate::repo::validate_repo_name;
-use crate::{BlobStore, ChangesetRecord, IndexedObject, MetaStore, RefExpect, RefState};
+use crate::{
+    BlobStore, ChangesetRecord, IndexedObject, MetaStore, PathChange, PathHistoryEntry, RefExpect, RefState,
+    path_within,
+};
 
 #[derive(Default)]
 struct RepoData {
     refs: HashMap<String, RefState>,
     objects: HashMap<ObjectId, u64>,
     changesets: HashMap<ObjectId, ChangesetRecord>,
+    derived: HashMap<(String, u32, Vec<u8>), Vec<u8>>,
+    /// PathHistory：(路径, 提交) → (代数, 是否删除)。
+    paths: BTreeMap<(String, ObjectId), (u64, bool)>,
 }
 
 #[derive(Default)]
@@ -142,13 +148,109 @@ impl MetaStore for MemStore {
 
     async fn put_changeset(&self, repo: &str, rec: &ChangesetRecord) -> Result<()> {
         let mut inner = self.write()?;
-        repo_mut(&mut inner, repo)?.changesets.entry(rec.id).or_insert(*rec);
+        repo_mut(&mut inner, repo)?
+            .changesets
+            .entry(rec.id)
+            .or_insert_with(|| rec.clone());
         Ok(())
     }
 
     async fn get_changeset(&self, repo: &str, id: &ObjectId) -> Result<Option<ChangesetRecord>> {
         let inner = self.read()?;
-        Ok(repo_ref(&inner, repo)?.changesets.get(id).copied())
+        Ok(repo_ref(&inner, repo)?.changesets.get(id).cloned())
+    }
+
+    async fn changesets_below(&self, repo: &str, max_generation: u64, limit: usize) -> Result<Vec<ChangesetRecord>> {
+        let inner = self.read()?;
+        let mut recs: Vec<_> = repo_ref(&inner, repo)?
+            .changesets
+            .values()
+            .filter(|r| r.generation <= max_generation)
+            .cloned()
+            .collect();
+        recs.sort_unstable_by_key(|r| std::cmp::Reverse(r.generation));
+        recs.truncate(limit);
+        Ok(recs)
+    }
+
+    async fn repair_lineage(
+        &self,
+        repo: &str,
+        id: &ObjectId,
+        parents: &[ObjectId],
+        fp_depth: u64,
+        fp_jump: Option<ObjectId>,
+    ) -> Result<()> {
+        let mut inner = self.write()?;
+        if let Some(rec) = repo_mut(&mut inner, repo)?.changesets.get_mut(id) {
+            rec.parents = parents.to_vec();
+            rec.fp_depth = fp_depth;
+            rec.fp_jump = fp_jump;
+        }
+        Ok(())
+    }
+
+    async fn index_paths(&self, repo: &str, cs: ObjectId, generation: u64, changes: &[PathChange]) -> Result<()> {
+        let mut inner = self.write()?;
+        let data = repo_mut(&mut inner, repo)?;
+        for c in changes {
+            data.paths
+                .entry((c.path.clone(), cs))
+                .or_insert((generation, c.deleted));
+        }
+        Ok(())
+    }
+
+    async fn path_history(
+        &self,
+        repo: &str,
+        path: &str,
+        max_generation: u64,
+        limit: usize,
+    ) -> Result<Vec<PathHistoryEntry>> {
+        let inner = self.read()?;
+        let data = repo_ref(&inner, repo)?;
+        let mut out: Vec<_> = data
+            .paths
+            .range(
+                (
+                    path.to_owned(),
+                    ObjectId::new(
+                        scion_object::HashAlgo::Blake3_256,
+                        scion_object::ObjectKind::Blob,
+                        [0; 32],
+                    ),
+                )..,
+            )
+            .take_while(|((p, _), _)| p.as_str() == path || p.starts_with(path))
+            .filter(|((p, _), (g, _))| path_within(p, path) && *g <= max_generation)
+            .map(|((p, cs), (g, d))| PathHistoryEntry {
+                cs: *cs,
+                generation: *g,
+                path: p.clone(),
+                deleted: *d,
+            })
+            .collect();
+        out.sort_unstable_by(|a, b| b.generation.cmp(&a.generation).then_with(|| a.path.cmp(&b.path)));
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    async fn get_derived(&self, repo: &str, kind: &str, version: u32, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let inner = self.read()?;
+        Ok(repo_ref(&inner, repo)?
+            .derived
+            .get(&(kind.to_owned(), version, key.to_vec()))
+            .cloned())
+    }
+
+    async fn put_derived(&self, repo: &str, kind: &str, version: u32, key: &[u8], value: &[u8]) -> Result<()> {
+        let mut inner = self.write()?;
+        repo_mut(&mut inner, repo)?
+            .derived
+            .entry((kind.to_owned(), version, key.to_vec()))
+            .or_insert_with(|| value.to_vec());
+        Ok(())
     }
 
     async fn list_refs(&self, repo: &str) -> Result<Vec<(String, RefState)>> {
@@ -202,6 +304,21 @@ mod tests {
     #[tokio::test]
     async fn conformance_changesets_and_refs() {
         testsuite::changesets_and_refs(&MemStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_derived() {
+        testsuite::derived(&MemStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_history_index() {
+        testsuite::history_index(&MemStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_fp_skip_chain() {
+        testsuite::fp_skip_chain(&MemStore::new()).await;
     }
 
     #[tokio::test]

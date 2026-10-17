@@ -328,3 +328,127 @@ async fn upload_above_server_limit_rejected_client_side() {
     let ids = c.upload_blobs(&[Bytes::from_static(b"ok")]).await.expect("small");
     assert_eq!(c.upload_blobs(&[Bytes::from_static(b"ok")]).await.expect("again"), ids);
 }
+
+#[tokio::test]
+async fn history_queries_end_to_end() {
+    let srv = start(Limits::default(), &[]).await;
+    let c = Client::builder()
+        .endpoint(&srv.url)
+        .repo("mono")
+        .build()
+        .await
+        .expect("connect");
+    assert!(c.has_feature(scion_proto::features::QUERY_LOG));
+    let a = c
+        .changeset(None)
+        .put("README", "1")
+        .message("a")
+        .create()
+        .await
+        .expect("a");
+    let b = c
+        .changeset(Some(a.id))
+        .put("src/x.rs", "2")
+        .message("b")
+        .create()
+        .await
+        .expect("b");
+    let d = c
+        .changeset(Some(a.id))
+        .put("other", "3")
+        .message("d")
+        .create()
+        .await
+        .expect("d");
+    // 合并提交的 delta 相对第一个父提交：从 d 合入的 other 也要写进 delta
+    let m = c
+        .changeset(Some(b.id))
+        .parent(d.id)
+        .put("README", "4")
+        .put("other", "3")
+        .message("merge")
+        .create()
+        .await
+        .expect("m");
+    for x in [a.id, b.id, m.id] {
+        c.land("main", &x).await.expect("land");
+    }
+
+    // 分页遍历全部历史
+    let mut token: Option<String> = None;
+    let mut seen = Vec::new();
+    loop {
+        let page = c.log("main", None, 2, token.as_deref()).await.expect("log");
+        seen.extend(page.entries.iter().map(|e| e.id));
+        match page.next_page_token {
+            Some(t) => token = Some(t),
+            None => break,
+        }
+    }
+    assert_eq!(seen.len(), 4);
+    assert_eq!(seen[0], m.id);
+    // 大量文件的 diff 分多批流式返回
+    let mut big = c.changeset(Some(m.id));
+    for i in 0..1203 {
+        big = big.put(format!("many/f{i:04}"), format!("{i}"));
+    }
+    let big = big.create().await.expect("many files");
+    let changes = c
+        .diff(Some(&m.id.to_string()), &big.id.to_string(), None)
+        .await
+        .expect("big diff");
+    assert_eq!(changes.len(), 1203);
+    assert!(
+        changes.windows(2).all(|w| w[0].path < w[1].path),
+        "batches arrive in path order"
+    );
+    let first = c.log("main", None, 1, None).await.expect("log");
+    assert_eq!(first.entries[0].parents, vec![b.id, d.id]);
+    assert_eq!(first.entries[0].message, "merge");
+    // 按路径过滤
+    let readme = c.log("main", Some("README"), 10, None).await.expect("log");
+    assert_eq!(
+        readme.entries.iter().map(|e| e.id).collect::<Vec<_>>(),
+        vec![m.id, a.id]
+    );
+    let other = c.log("main", Some("other"), 10, None).await.expect("log");
+    assert_eq!(
+        other.entries.iter().map(|e| e.id).collect::<Vec<_>>(),
+        vec![m.id, d.id],
+        "d reached via the second parent"
+    );
+
+    assert!(c.is_ancestor(&d.id.to_string(), "main").await.expect("ok"));
+    assert!(!c.is_ancestor("main", &a.id.to_string()).await.expect("ok"));
+    assert_eq!(
+        c.merge_bases(&b.id.to_string(), &d.id.to_string()).await.expect("ok"),
+        vec![a.id]
+    );
+
+    let changes = c.diff(Some(&a.id.to_string()), "main", None).await.expect("diff");
+    let paths: Vec<_> = changes.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, ["README", "other", "src/x.rs"]);
+    assert!(changes[1].old.is_none() && changes[1].new.is_some());
+    assert_eq!(c.diff(None, "main", Some("src")).await.expect("diff").len(), 1);
+    let blame = c.blame("main", "README").await.expect("blame");
+    assert_eq!(blame.lines.len(), 1);
+    assert_eq!(blame.commits[blame.lines[0]].id, m.id);
+    assert_eq!(blame.commits[0].summary, "merge");
+    let err = c.blame("main", "nope").await.expect_err("missing path");
+    assert_eq!(err.reason(), Some(ErrorReason::PathNotFound));
+    let rev = c.resolve_revision("main").await.expect("resolve");
+    assert_eq!((rev.id, rev.parents.clone()), (m.id, vec![b.id, d.id]));
+    assert_eq!(
+        c.stat("main", "").await.expect("root").mode,
+        scion_client::EntryMode::Tree
+    );
+    assert_eq!(c.stat("main", "src/x.rs").await.expect("file").size, 1);
+    assert_eq!(
+        c.stat("main", "nope").await.expect_err("missing").reason(),
+        Some(ErrorReason::PathNotFound)
+    );
+    assert_eq!(c.git_sha("main").await.expect("sha"), None);
+    assert_eq!(c.generation("main").await.expect("gen"), (3, 3));
+    let err = c.diff(Some("nope"), "main", None).await.expect_err("bad revision");
+    assert_eq!(err.reason(), Some(ErrorReason::RefNotFound));
+}

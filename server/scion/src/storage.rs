@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use scion_store::{BlobStore, MemStore, MetaStore};
-use scion_store_blob::{ObjectBlobStore, S3Config};
+use scion_store_blob::{ObjectBlobStore, S3Config, S3Provider};
 
 /// 元数据后端。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,9 +68,14 @@ pub fn lite(data_dir: &Path) -> (MetaSpec, BlobSpec) {
 }
 
 /// 从环境变量读取 S3 连接参数。优先 `SCION_S3_*`，其次通用的 `AWS_*`。
-pub fn s3_config(bucket: &str, prefix: &str, env: impl Fn(&str) -> Option<String>) -> S3Config {
+/// `SCION_S3_PROVIDER`：auto（默认，按响应头识别）、minio、seaweedfs、aws、generic。
+pub fn s3_config(bucket: &str, prefix: &str, env: impl Fn(&str) -> Option<String>) -> anyhow::Result<S3Config> {
     let pick = |a: &str, b: &str| env(a).or_else(|| env(b)).unwrap_or_default();
-    S3Config {
+    let provider: S3Provider = env("SCION_S3_PROVIDER")
+        .unwrap_or_default()
+        .parse()
+        .context("SCION_S3_PROVIDER")?;
+    Ok(S3Config {
         endpoint: env("SCION_S3_ENDPOINT").filter(|e| !e.is_empty()),
         bucket: bucket.to_owned(),
         region: env("SCION_S3_REGION")
@@ -78,11 +83,14 @@ pub fn s3_config(bucket: &str, prefix: &str, env: impl Fn(&str) -> Option<String
             .unwrap_or_else(|| "us-east-1".into()),
         access_key_id: pick("SCION_S3_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID"),
         secret_access_key: pick("SCION_S3_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"),
+        provider,
+        // 未设置时按服务决定（只有 AWS 默认 virtual-hosted）
         virtual_hosted_style: env("SCION_S3_VIRTUAL_HOSTED")
-            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+            .filter(|v| !v.is_empty())
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true")),
         prefix: prefix.to_owned(),
         max_retries: env("SCION_S3_MAX_RETRIES").and_then(|v| v.parse().ok()),
-    }
+    })
 }
 
 /// 打开两个后端。两者都是内存时共用同一个 [`MemStore`]。对象存储会先做读写自检。
@@ -104,10 +112,10 @@ pub async fn open(
             Arc::new(s)
         }
         BlobSpec::S3 { bucket, prefix } => {
-            let s = ObjectBlobStore::s3(&s3_config(bucket, prefix, env)).context("configure s3")?;
-            s.self_test()
-                .await
-                .context("s3 self-test (check endpoint, bucket and credentials)")?;
+            let s = ObjectBlobStore::s3(&s3_config(bucket, prefix, env)?).context("configure s3")?;
+            // 识别服务（MinIO / SeaweedFS / AWS …）、健康检查、bucket 是否存在、读写自检
+            let backend = s.check().await.context("s3 check (endpoint, bucket and credentials)")?;
+            tracing::info!(%backend, bucket, "object store ready");
             Arc::new(s)
         }
     };
@@ -202,26 +210,74 @@ mod tests {
                 ("AWS_SECRET_ACCESS_KEY", "aws-secret"),
                 ("AWS_REGION", "cn-north-1"),
                 ("SCION_S3_VIRTUAL_HOSTED", "true"),
+                ("SCION_S3_PROVIDER", "MinIO"),
             ]),
-        );
+        )
+        .expect("config");
         assert_eq!(c.endpoint.as_deref(), Some("http://s3:8333"));
         assert_eq!(c.access_key_id, "scion-key");
         assert_eq!(c.secret_access_key, "aws-secret");
         assert_eq!(c.region, "cn-north-1");
-        assert!(c.virtual_hosted_style);
+        assert_eq!(c.virtual_hosted_style, Some(true));
+        assert_eq!(c.provider, S3Provider::Minio);
         assert_eq!((c.bucket.as_str(), c.prefix.as_str()), ("b", "p"));
     }
 
     #[test]
     fn s3_config_defaults() {
-        let c = s3_config("b", "", env_of(&[("SCION_S3_ENDPOINT", "")]));
+        let c = s3_config(
+            "b",
+            "",
+            env_of(&[("SCION_S3_ENDPOINT", ""), ("SCION_S3_VIRTUAL_HOSTED", "")]),
+        )
+        .expect("config");
         assert_eq!(c.endpoint, None);
         assert_eq!(c.region, "us-east-1");
-        assert!(!c.virtual_hosted_style);
+        assert_eq!(c.virtual_hosted_style, None);
+        assert_eq!(c.provider, S3Provider::Auto);
         assert!(c.access_key_id.is_empty());
         assert_eq!(c.max_retries, None);
-        let c = s3_config("b", "", env_of(&[("SCION_S3_MAX_RETRIES", "3")]));
+        let c = s3_config(
+            "b",
+            "",
+            env_of(&[("SCION_S3_MAX_RETRIES", "3"), ("SCION_S3_VIRTUAL_HOSTED", "0")]),
+        )
+        .expect("config");
         assert_eq!(c.max_retries, Some(3));
+        assert_eq!(c.virtual_hosted_style, Some(false));
+        let err = s3_config("b", "", env_of(&[("SCION_S3_PROVIDER", "ceph")])).expect_err("unknown provider");
+        assert!(format!("{err:#}").contains("SCION_S3_PROVIDER"));
+    }
+
+    /// 真实 S3 兼容服务（CI 中为 SeaweedFS 与 MinIO）：服务端用 SCION_S3_* 打开并通过启动检查。
+    #[tokio::test]
+    async fn open_s3_runs_startup_check() {
+        let Ok(endpoint) = std::env::var("SCION_TEST_S3_ENDPOINT") else {
+            eprintln!("SCION_TEST_S3_ENDPOINT not set; skipping");
+            return;
+        };
+        let var = |k: &str| std::env::var(k).unwrap_or_default();
+        let (key, secret, provider) = (
+            var("SCION_TEST_S3_ACCESS_KEY"),
+            var("SCION_TEST_S3_SECRET_KEY"),
+            var("SCION_TEST_S3_PROVIDER"),
+        );
+        let pairs = [
+            ("SCION_S3_ENDPOINT", endpoint.as_str()),
+            ("SCION_S3_ACCESS_KEY_ID", key.as_str()),
+            ("SCION_S3_SECRET_ACCESS_KEY", secret.as_str()),
+            ("SCION_S3_PROVIDER", provider.as_str()),
+        ];
+        let env = env_of(&pairs);
+        let bucket = std::env::var("SCION_TEST_S3_BUCKET").unwrap_or_else(|_| "scion-test".into());
+        let spec = parse_blobs(&format!("s3://{bucket}/server-open-test")).expect("spec");
+        open(&MetaSpec::Mem, &spec, &env).await.expect("open s3");
+        let missing = parse_blobs("s3://scion-no-such-bucket/x").expect("spec");
+        let err = open(&MetaSpec::Mem, &missing, &env)
+            .await
+            .err()
+            .expect("missing bucket");
+        assert!(format!("{err:#}").contains("does not exist"), "{err:#}");
     }
 
     #[test]
@@ -287,7 +343,7 @@ mod tests {
             ("SCION_S3_MAX_RETRIES", "0"),
         ]);
         let err = open(&MetaSpec::Mem, &s3, env).await.err().expect("unreachable s3");
-        assert!(format!("{err:#}").contains("self-test"));
+        assert!(format!("{err:#}").contains("s3 check"), "{err:#}");
         let bad_s3 = BlobSpec::S3 {
             bucket: " ".into(),
             prefix: String::new(),

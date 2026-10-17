@@ -298,6 +298,8 @@ storage_class     = ""                      # 可选
 
 **启动自检**：执行 `scion admin blobstore-check`，server 启动时也会自动跑一遍。检查项：PUT 后立即 GET 和 HEAD、Range 读、超过 5 GiB 的分块上传与 UploadPartCopy（可选）、预签名 URL 访问、批量删除时的条数上限、ListObjectsV2 分页、时钟偏差（SigV4 对时间敏感）。检查结果写成 feature 标记，例如不支持 UploadPartCopy 时自动改走「读出再写入」的方式。
 
+> **实现说明**（2026-10-17）：服务适配层在 `server/store-blob/src/provider.rs`。`SCION_S3_PROVIDER` 可选 `auto`（默认）、`minio`、`seaweedfs`、`aws`、`generic`。启动检查依次执行：按 `Server` 响应头识别服务（显式配置与识别结果冲突时报错）、该服务的健康接口（MinIO `/minio/health/ready`、SeaweedFS `/healthz`）、bucket 是否存在（不存在时提示该服务的创建方法）、读写自检。请求风格按服务决定默认值，只有 AWS 默认 virtual-hosted。CI 在 SeaweedFS 4.48 与 MinIO 2023.12.23（bitnami 镜像，与 starhub 部署一致）上各跑一遍完整的存储一致性测试。使用说明见 [`docs/guide/object-storage.md`](../guide/object-storage.md)。
+
 **直连对象存储下载（减轻服务端带宽压力）**：
 - 超过阈值（默认 64 MiB）的 blob，`GetObjects` 可以不返回数据流，而是返回 `redirect{presigned_url, expires}`。前提是请求里声明了 `accept_redirect`，并且服务端开启了 `objects.presigned` 特性。
 - 客户端直接从 MinIO 或 S3 下载，**下载后仍然校验 BLAKE3**。
@@ -597,6 +599,18 @@ SDK、工作副本、daemon 和 CLI 的完整设计见 [`rust-client-architectur
 > **M1 实现说明**（2026-10-16）：
 > - **git 导入放在客户端**（`client/gitimport`，命令 `scn import git <path> --repo NAME`），只通过公开协议写入，与普通用户走同一条校验路径；服务端不需要额外的写入通道。结果确定：`change_id` 由 git sha 推导，git sha 存入扩展字段 `git.sha1`，重复导入得到相同的提交 id；增量导入沿第一父提交链逐个快进。差分测试逐个提交比对 git 与 Scion 的文件列表、mode、内容和元数据。大仓库的批量导入（starhub 迁移，§16）后续改为服务端直写。
 > - **合入只支持快进**；工作副本的 `scn sync` 在客户端做文件级 rebase，冲突以退出码 3 报告。M3 的服务端 rebase 上线后，`Land` 直接处理落后的提交。
+
+> **M2 实现说明**（2026-10-16）：
+> - **PathHistory 索引**：创建提交时记录 delta 中的每个路径（`path_changes` 表），按路径过滤的 log 与 blame 从索引取候选提交，不逐个解码提交对象。
+> - **第一父提交链跳表**：提交记录带 `fp_depth` 与 `fp_jump`（Myers skew-binary 单指针跳表），O(log n) 找到链上任意深度的祖先；`is_ancestor` 先走这条快速路径，blame 用它判断候选是否在链上。
+> - **提交记录缓存**：记录不可变，服务端用 `CachedMeta` 在进程内缓存并在启动时后台预热（10 万条约 0.5 秒）；遍历历史时按代数批量预取，缓存未命中也不会逐条查库。
+> - **blame 缓存**：派生数据只存最终版本和每 32 个版本一个检查点，再次 blame 只算增量；沿第一父提交链追溯，经由合并进来的改动归到合并提交。
+> - **blame 缓存查询批量化**：最新版本单独查一次（重复查询的常见情况），其余版本每 64 个一次 `get_derived_many`，避免远端数据库上逐版本往返。
+> - **GitSha 索引**：导入的提交带扩展字段 `git.sha1`，创建提交时写入派生数据 `git-sha1`；`ResolveRevision` 依次按提交 id、ref、git sha 解析，`GetDerived` 可查询 git sha 与代数。
+> - **查询 RPC**：Log、IsAncestor、MergeBase、Diff（服务端流，每批 500 个条目）、Blame、ResolveRevision、Stat、GetDerived，均在 `GetServerInfo` 中以特性声明。
+> - **从 M1 升级**：M1 只在 `first_parent` 列记录父提交。迁移 0008 把它拷入 `parents`，并把这些仓库的跳表标记为未知。随后运行 `scion admin reindex [--repo NAME]`（在启动服务端之前运行；服务端会缓存提交记录），它以提交对象为准修正谱系（全部父提交、包括合并提交的其余父提交，以及跳表，错误的值会被覆盖），并补建 PathHistory 与 GitSha。可重复执行。
+> - **基准**（`server/query/tests/bench.rs`，10 万提交、对象在内存）：SQLite 与 PostgreSQL 元数据下，log、diff、ancestry、merge-base、blame 的 p99 均低于 20 ms（PostgreSQL：冷 blame p99 13.6 ms，log --path p99 15.6 ms）。对象放在 S3 时 blame / diff 的读对象开销由 M4 的缓存层解决。
+> - **推迟到后续里程碑**：通用 Deriver 框架与独立的 deriver 进程（M3/M4）；PathIndex。blame 只沿第一父提交链追溯，按路径过滤的 log 不跟踪重命名。
 | **M2 派生与查询** | 3 周 | 派生框架、Gen/SkipList/PathHistory/Blame、Log/Blame/Diff/MergeBase、deriver 进程 | 在 10 万提交的仓库上，查询 p99 小于 100 毫秒 |
 | **M3 高并发** | 3 周 | LandCoordinator 批处理和租约、幂等表、限流与过载丢弃、lincheck | 单 ref 每秒 200 次以上 land；leader 被杀时没有重复或丢失的合入 |
 | **M4 缓存层** | 3 周 | `scion cache`(foyer + rendezvous + singleflight + 对冲)、WatchRefs、预热 | L2 命中率不低于 99%；单节点 20 万对象读/秒以上 |

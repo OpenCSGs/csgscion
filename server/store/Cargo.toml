@@ -13,6 +13,7 @@ testsuite = ["dep:tokio"]
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
+moka.workspace = true
 scion-object.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, optional = true }

@@ -1,3 +1,4 @@
+mod history;
 mod land;
 mod object;
 mod query;

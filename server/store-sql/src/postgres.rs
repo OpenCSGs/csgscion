@@ -1,16 +1,20 @@
 //! Standard / Distributed 档：PostgreSQL，YugabyteDB（YSQL）走同一实现。
 
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use scion_object::ObjectId;
-use scion_store::{ChangesetRecord, Error, IndexedObject, MetaStore, RefExpect, RefState, Result, validate_repo_name};
+use scion_store::{
+    ChangesetRecord, Error, IndexedObject, MetaStore, PathChange, PathHistoryEntry, RefExpect, RefState, Result,
+    validate_repo_name,
+};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 
 use crate::common::{
-    MAX_IDS_PER_QUERY, backend, id_from_db, is_unique_violation, now_ms, size_to_db, subtract_present, version_from_db,
-    version_to_db,
+    CHANGESET_COLUMNS, ChangesetRow, MAX_IDS_PER_QUERY, backend, id_from_db, ids_to_db, is_unique_violation, now_ms,
+    record_from_row, size_to_db, subtract_present, version_from_db, version_to_db,
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
@@ -249,14 +253,17 @@ impl MetaStore for PgMetaStore {
     async fn put_changeset(&self, repo: &str, rec: &ChangesetRecord) -> Result<()> {
         let repo_id = self.repo_id(repo).await?;
         sqlx::query(
-            "INSERT INTO changesets (repo_id, cs_id, root_tree, first_parent, generation) \
-             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (repo_id, cs_id) DO NOTHING",
+            "INSERT INTO changesets (repo_id, cs_id, root_tree, first_parent, generation, parents, fp_depth, fp_jump) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (repo_id, cs_id) DO NOTHING",
         )
         .bind(repo_id)
         .bind(rec.id.to_bytes().to_vec())
         .bind(rec.root_tree.to_bytes().to_vec())
-        .bind(rec.first_parent.map(|p| p.to_bytes().to_vec()))
+        .bind(rec.first_parent().map(|p| p.to_bytes().to_vec()))
         .bind(version_to_db(rec.generation)?)
+        .bind(ids_to_db(&rec.parents))
+        .bind(version_to_db(rec.fp_depth)?)
+        .bind(rec.fp_jump.map(|j| j.to_bytes().to_vec()))
         .execute(&self.pool)
         .await
         .map_err(|e| backend("put changeset", e))?;
@@ -265,23 +272,185 @@ impl MetaStore for PgMetaStore {
 
     async fn get_changeset(&self, repo: &str, id: &ObjectId) -> Result<Option<ChangesetRecord>> {
         let repo_id = self.repo_id(repo).await?;
-        let row = sqlx::query_as::<_, (Vec<u8>, Option<Vec<u8>>, i64)>(
-            "SELECT root_tree, first_parent, generation FROM changesets WHERE repo_id = $1 AND cs_id = $2",
+        let sql = format!("SELECT {CHANGESET_COLUMNS} FROM changesets WHERE repo_id = $1 AND cs_id = $2");
+        sqlx::query_as::<_, ChangesetRow>(&sql)
+            .bind(repo_id)
+            .bind(id.to_bytes().to_vec())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| backend("get changeset", e))?
+            .map(record_from_row)
+            .transpose()
+    }
+
+    async fn changesets_below(&self, repo: &str, max_generation: u64, limit: usize) -> Result<Vec<ChangesetRecord>> {
+        let repo_id = self.repo_id(repo).await?;
+        let sql = format!(
+            "SELECT {CHANGESET_COLUMNS} FROM changesets WHERE repo_id = $1 AND generation <= $2 \
+             ORDER BY generation DESC LIMIT $3"
+        );
+        sqlx::query_as::<_, ChangesetRow>(&sql)
+            .bind(repo_id)
+            .bind(version_to_db(max_generation.min(i64::MAX as u64))?)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| backend("changesets below", e))?
+            .into_iter()
+            .map(record_from_row)
+            .collect()
+    }
+
+    async fn repair_lineage(
+        &self,
+        repo: &str,
+        id: &ObjectId,
+        parents: &[ObjectId],
+        fp_depth: u64,
+        fp_jump: Option<ObjectId>,
+    ) -> Result<()> {
+        let repo_id = self.repo_id(repo).await?;
+        sqlx::query(
+            "UPDATE changesets SET parents = $1, first_parent = $2, fp_depth = $3, fp_jump = $4 \
+             WHERE repo_id = $5 AND cs_id = $6",
         )
+        .bind(ids_to_db(parents))
+        .bind(parents.first().map(|p| p.to_bytes().to_vec()))
+        .bind(version_to_db(fp_depth)?)
+        .bind(fp_jump.map(|j| j.to_bytes().to_vec()))
         .bind(repo_id)
         .bind(id.to_bytes().to_vec())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| backend("repair lineage", e))?;
+        Ok(())
+    }
+
+    async fn index_paths(&self, repo: &str, cs: ObjectId, generation: u64, changes: &[PathChange]) -> Result<()> {
+        let repo_id = self.repo_id(repo).await?;
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let generation = version_to_db(generation)?;
+        let cs_bytes = cs.to_bytes().to_vec();
+        let mut tx = self.pool.begin().await.map_err(|e| backend("begin", e))?;
+        for chunk in changes.chunks(MAX_IDS_PER_QUERY) {
+            let mut qb = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+                "INSERT INTO path_changes (repo_id, path, cs_id, generation, deleted) ",
+            );
+            qb.push_values(chunk, |mut b, c| {
+                b.push_bind(repo_id)
+                    .push_bind(c.path.clone())
+                    .push_bind(cs_bytes.clone())
+                    .push_bind(generation)
+                    .push_bind(c.deleted);
+            });
+            qb.push(" ON CONFLICT (repo_id, path, cs_id) DO NOTHING");
+            qb.build()
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| backend("index paths", e))?;
+        }
+        tx.commit().await.map_err(|e| backend("commit", e))?;
+        Ok(())
+    }
+
+    async fn path_history(
+        &self,
+        repo: &str,
+        path: &str,
+        max_generation: u64,
+        limit: usize,
+    ) -> Result<Vec<PathHistoryEntry>> {
+        let repo_id = self.repo_id(repo).await?;
+        // 目录下的路径：区间 [path + "/", path + "0")，'0' 是 '/' 的下一个字符
+        let rows = sqlx::query_as::<_, (Vec<u8>, i64, String, bool)>(
+            "SELECT cs_id, generation, path, deleted FROM path_changes \
+             WHERE repo_id = $1 AND (path = $2 OR (path >= $3 AND path < $4)) AND generation <= $5 \
+             ORDER BY generation DESC, path LIMIT $6",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .bind(format!("{path}/"))
+        .bind(format!("{path}0"))
+        .bind(version_to_db(max_generation.min(i64::MAX as u64))?)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| backend("path history", e))?;
+        rows.into_iter()
+            .map(|(cs, generation, path, deleted)| {
+                Ok(PathHistoryEntry {
+                    cs: id_from_db(&cs)?,
+                    generation: version_from_db(generation)?,
+                    path,
+                    deleted,
+                })
+            })
+            .collect()
+    }
+
+    async fn get_derived(&self, repo: &str, kind: &str, version: u32, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let repo_id = self.repo_id(repo).await?;
+        sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT value FROM derived WHERE repo_id = $1 AND kind = $2 AND version = $3 AND key = $4",
+        )
+        .bind(repo_id)
+        .bind(kind)
+        .bind(i64::from(version))
+        .bind(key)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| backend("get changeset", e))?;
-        row.map(|(root, parent, generation)| {
-            Ok(ChangesetRecord {
-                id: *id,
-                root_tree: id_from_db(&root)?,
-                first_parent: parent.as_deref().map(id_from_db).transpose()?,
-                generation: version_from_db(generation)?,
-            })
-        })
-        .transpose()
+        .map_err(|e| backend("get derived", e))
+    }
+
+    async fn get_derived_many(
+        &self,
+        repo: &str,
+        kind: &str,
+        version: u32,
+        keys: &[Vec<u8>],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        let repo_id = self.repo_id(repo).await?;
+        let mut found: HashMap<Vec<u8>, Vec<u8>> = HashMap::with_capacity(keys.len());
+        for chunk in keys.chunks(MAX_IDS_PER_QUERY) {
+            let mut qb = sqlx::QueryBuilder::<sqlx::Postgres>::new("SELECT key, value FROM derived WHERE repo_id = ");
+            qb.push_bind(repo_id)
+                .push(" AND kind = ")
+                .push_bind(kind)
+                .push(" AND version = ")
+                .push_bind(i64::from(version))
+                .push(" AND key IN (");
+            let mut sep = qb.separated(", ");
+            for key in chunk {
+                sep.push_bind(key.as_slice());
+            }
+            qb.push(")");
+            let rows: Vec<(Vec<u8>, Vec<u8>)> = qb
+                .build_query_as()
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| backend("get derived", e))?;
+            found.extend(rows);
+        }
+        Ok(keys.iter().map(|k| found.get(k).cloned()).collect())
+    }
+
+    async fn put_derived(&self, repo: &str, kind: &str, version: u32, key: &[u8], value: &[u8]) -> Result<()> {
+        let repo_id = self.repo_id(repo).await?;
+        sqlx::query(
+            "INSERT INTO derived (repo_id, kind, version, key, value) VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (repo_id, kind, version, key) DO NOTHING",
+        )
+        .bind(repo_id)
+        .bind(kind)
+        .bind(i64::from(version))
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| backend("put derived", e))?;
+        Ok(())
     }
 
     async fn list_refs(&self, repo: &str) -> Result<Vec<(String, RefState)>> {
@@ -346,6 +515,81 @@ mod tests {
         };
     }
 
+    /// 从 M1 升级：parents 为空、只有 first_parent 的旧行被修复，跳表被标记为未知；
+    /// 没有旧行的仓库不受影响。
+    #[tokio::test]
+    async fn upgrade_restores_parents_of_m1_rows() {
+        let Ok(url) = std::env::var("SCION_TEST_PG_URL") else {
+            eprintln!("SCION_TEST_PG_URL not set; skipping");
+            return;
+        };
+        static N: AtomicU32 = AtomicU32::new(0);
+        let schema = format!("up{}_{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed));
+        let admin = PgPool::connect(&url).await.expect("connect admin");
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&admin)
+            .await
+            .expect("create schema");
+        let opts = PgConnectOptions::from_str(&url)
+            .expect("url")
+            .options([("search_path", schema.as_str())]);
+        let before = sqlx::migrate::Migrator {
+            migrations: MIGRATOR
+                .migrations
+                .iter()
+                .filter(|m| m.version <= 7)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into(),
+            ..sqlx::migrate::Migrator::DEFAULT
+        };
+        let id = |s: &[u8]| ObjectId::hash(scion_object::ObjectKind::Changeset, s);
+        let (a, b, c, d) = (id(b"a"), id(b"b"), id(b"c"), id(b"d"));
+        {
+            let pool = PgPool::connect_with(opts.clone()).await.expect("open");
+            before.run(&pool).await.expect("migrate to 0007");
+            sqlx::query("INSERT INTO repos (repo_id, name, created_at_ms) VALUES (1, 'old', 0), (2, 'new', 0)")
+                .execute(&pool)
+                .await
+                .expect("repos");
+            // old：M1 写入的行（父提交只在 first_parent），深度已被错误地算成 1
+            // new：M2 写入的正确数据
+            for (repo, cs, first, parents, depth) in [
+                (1, a, None, vec![], 1),
+                (1, b, Some(a), vec![], 1),
+                (2, c, None, vec![], 1),
+                (2, d, Some(c), c.to_bytes().to_vec(), 2),
+            ] {
+                sqlx::query(
+                    "INSERT INTO changesets (repo_id, cs_id, root_tree, first_parent, generation, parents, fp_depth) \
+                     VALUES ($1, $2, $6, $3, 1, $4, $5)",
+                )
+                .bind(repo as i64)
+                .bind(cs.to_bytes().to_vec())
+                .bind(first.map(|f: ObjectId| f.to_bytes().to_vec()))
+                .bind(parents)
+                .bind(depth as i64)
+                .bind(cs.to_bytes().to_vec())
+                .execute(&pool)
+                .await
+                .expect("row");
+            }
+            pool.close().await;
+        }
+        let s = PgMetaStore::connect_with(opts).await.expect("upgrade");
+        let get = |repo: &'static str, cs| {
+            let s = &s;
+            async move {
+                let r = s.get_changeset(repo, &cs).await.expect("ok").expect("rec");
+                (r.parents, r.fp_depth)
+            }
+        };
+        assert_eq!(get("old", b).await, (vec![a], 0), "parent restored, skip unknown");
+        assert_eq!(get("old", a).await, (vec![], 0), "whole repo marked for reindex");
+        assert_eq!(get("new", d).await, (vec![c], 2), "untouched");
+        assert_eq!(get("new", c).await, (vec![], 1), "untouched");
+    }
+
     #[tokio::test]
     async fn conformance_meta() {
         let s = pg_or_skip!();
@@ -390,6 +634,24 @@ mod tests {
     async fn conformance_changesets_and_refs() {
         let s = pg_or_skip!();
         testsuite::changesets_and_refs(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_derived() {
+        let s = pg_or_skip!();
+        testsuite::derived(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_history_index() {
+        let s = pg_or_skip!();
+        testsuite::history_index(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_fp_skip_chain() {
+        let s = pg_or_skip!();
+        testsuite::fp_skip_chain(&s).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

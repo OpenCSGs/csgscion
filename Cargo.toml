@@ -9,6 +9,7 @@ members = [
     "server/store-sql",
     "server/store-blob",
     "server/tree",
+    "server/query",
     "server/api",
     "server/scion",
     # 客户端
@@ -33,6 +34,7 @@ scion-store = { path = "server/store" }
 scion-store-sql = { path = "server/store-sql" }
 scion-store-blob = { path = "server/store-blob" }
 scion-tree = { path = "server/tree" }
+scion-query = { path = "server/query" }
 scion-api = { path = "server/api" }
 scion-client = { path = "client/sdk" }
 scion-wc = { path = "client/wc" }
@@ -62,7 +64,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 cargo_metadata = "0.23"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "postgres", "migrate", "macros"] }
 tempfile = "3"
+moka = { version = "0.12", features = ["sync"] }
 object_store = { version = "0.14", default-features = false, features = ["aws", "fs"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

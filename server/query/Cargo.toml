@@ -1,0 +1,25 @@
+[package]
+name = "scion-query"
+description = "History queries: log, ancestry, merge-base"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hex.workspace = true
+async-trait.workspace = true
+scion-tree.workspace = true
+similar = { version = "3", features = ["bytes"] }
+scion-object.workspace = true
+scion-store.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+scion-store-sql.workspace = true
+tempfile.workspace = true
+bytes.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

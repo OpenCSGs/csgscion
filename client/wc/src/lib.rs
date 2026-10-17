@@ -36,6 +36,14 @@ impl Status {
     }
 }
 
+/// 一个本地改动文件：`old` 为当前快照中的版本（新增时为 None），`new` 为本地内容（删除时为 None）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalChange {
+    pub path: String,
+    pub old: Option<(Mode, ObjectId)>,
+    pub new: Option<(Mode, Bytes)>,
+}
+
 /// sync 的结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncOutcome {
@@ -188,6 +196,36 @@ impl WorkingCopy {
 
     pub fn status(&self) -> Result<Status> {
         Ok(self.changes()?.0)
+    }
+
+    /// 本地改动的明细（供 diff 使用）：每个改动文件在当前快照中的版本，以及本地的新内容。
+    pub fn local_changes(&self) -> Result<Vec<LocalChange>> {
+        let (_, changes) = self.changes()?;
+        let dirstate = self.paths.load_dirstate()?;
+        let old_of = |path: &str| -> Result<Option<(Mode, ObjectId)>> {
+            dirstate
+                .files
+                .get(path)
+                .map(|r| Ok((r.mode, r.object_id()?)))
+                .transpose()
+        };
+        changes
+            .into_iter()
+            .map(|c| match c {
+                Change::Put {
+                    path, mode, content, ..
+                } => Ok(LocalChange {
+                    old: old_of(&path)?,
+                    new: Some((mode, content)),
+                    path,
+                }),
+                Change::Delete { path } => Ok(LocalChange {
+                    old: old_of(&path)?,
+                    new: None,
+                    path,
+                }),
+            })
+            .collect()
     }
 
     /// 把本地改动创建为提交（尚未合入）。没有改动时返回 `None`。

@@ -10,6 +10,7 @@ license.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 object_store.workspace = true
+reqwest.workspace = true
 scion-object.workspace = true
 scion-store.workspace = true
 tracing.workspace = true

@@ -3,6 +3,7 @@ syntax = "proto3";
 package scion.v1;
 
 import "scion/v1/common.proto";
+import "scion/v1/write.proto";
 
 // 不需要本地仓库的查询（「源码管理即 API」）。revision 为 ref 名或提交 id 的文本形式（c1…）。
 service QueryService {
@@ -10,6 +11,22 @@ service QueryService {
   rpc ReadFile(ReadFileRequest) returns (stream ReadFileResponse);
   // 列出目录，path 为空表示根目录。
   rpc ListDir(ListDirRequest) returns (ListDirResponse);
+  // 历史：从 revision 开始按代数从新到旧，覆盖所有父提交；可按路径过滤（相对第一个父提交）。
+  rpc Log(LogRequest) returns (LogResponse);
+  // ancestor 是否为 descendant 的祖先（含相等）。
+  rpc IsAncestor(IsAncestorRequest) returns (IsAncestorResponse);
+  // 最佳公共祖先（互不为祖先），按代数从高到低。
+  rpc MergeBase(MergeBaseRequest) returns (MergeBaseResponse);
+  // 两个版本之间的文件级差异，按路径排序分批流式返回。
+  rpc Diff(DiffRequest) returns (stream DiffResponse);
+  // 文件每一行最后被改动的提交。沿第一父提交链追溯：经由合并进来的改动归到合并提交上。
+  rpc Blame(BlameRequest) returns (BlameResponse);
+  // 把 revision（ref 名、提交 id 文本或 40 位 git sha）解析为提交。
+  rpc ResolveRevision(ResolveRevisionRequest) returns (ResolveRevisionResponse);
+  // 单个路径的条目；path 为空时返回根目录。
+  rpc Stat(StatRequest) returns (StatResponse);
+  // 按种类读取派生数据（公开的结构化格式，不暴露内部存储格式）。
+  rpc GetDerived(GetDerivedRequest) returns (GetDerivedResponse);
 }
 
 message ReadFileRequest {
@@ -39,4 +56,156 @@ message ListDirResponse {
   bytes changeset_id = 1;
   bytes tree_id = 2;
   repeated TreeEntry entries = 3;
+}
+
+message LogRequest {
+  string repo = 1;
+  string revision = 2;
+  // 只返回改动了该路径（文件或目录）的提交；为空表示不过滤。
+  string path = 3;
+  // 每页条数，默认 50，上限 1000。
+  uint32 page_size = 4;
+  // 上一页返回的 next_page_token；非空时忽略 revision。
+  string page_token = 5;
+}
+
+message LogEntry {
+  bytes changeset_id = 1;
+  repeated bytes parents = 2;
+  Signature author = 3;
+  Signature committer = 4;
+  string message = 5;
+  uint64 generation = 6;
+  bytes root_tree = 7;
+  map<string, bytes> extensions = 8;
+}
+
+message LogResponse {
+  repeated LogEntry entries = 1;
+  // 为空表示没有更多。按路径过滤时，一页可能少于 page_size 甚至为空，但仍可继续。
+  string next_page_token = 2;
+}
+
+message IsAncestorRequest {
+  string repo = 1;
+  string ancestor = 2;
+  string descendant = 3;
+}
+
+message IsAncestorResponse {
+  bool is_ancestor = 1;
+}
+
+message MergeBaseRequest {
+  string repo = 1;
+  string a = 2;
+  string b = 3;
+}
+
+message MergeBaseResponse {
+  // 没有公共祖先时为空。
+  repeated bytes bases = 1;
+}
+
+message DiffRequest {
+  string repo = 1;
+  // 为空表示空树（即列出 to 中的全部文件）。
+  string from = 2;
+  string to = 3;
+  // 只比较该路径（文件或目录）；为空表示整个仓库。
+  string path = 4;
+}
+
+// 一个文件的变化：没有 old 为新增，没有 new 为删除。
+message FileDiff {
+  string path = 1;
+  TreeEntry old = 2;
+  TreeEntry new = 3;
+}
+
+// 一批文件差异；各批按路径首尾相接。
+message DiffResponse {
+  repeated FileDiff files = 1;
+}
+
+message BlameRequest {
+  string repo = 1;
+  string revision = 2;
+  string path = 3;
+}
+
+message BlameCommit {
+  bytes changeset_id = 1;
+  Signature author = 2;
+  // 提交说明的第一行。
+  string summary = 3;
+}
+
+// 连续若干行归属同一个提交。
+message BlameRange {
+  // 从 1 开始。
+  uint32 start_line = 1;
+  uint32 line_count = 2;
+  // commits 中的下标。
+  uint32 commit_index = 3;
+}
+
+message BlameResponse {
+  bytes blob_id = 1;
+  repeated BlameCommit commits = 2;
+  // 按行号排序、首尾相接，覆盖文件的全部行。
+  repeated BlameRange ranges = 3;
+}
+
+message ResolveRevisionRequest {
+  string repo = 1;
+  string revision = 2;
+}
+
+message ResolveRevisionResponse {
+  bytes changeset_id = 1;
+  bytes root_tree = 2;
+  uint64 generation = 3;
+  repeated bytes parents = 4;
+}
+
+message StatRequest {
+  string repo = 1;
+  string revision = 2;
+  string path = 3;
+}
+
+message StatResponse {
+  bytes changeset_id = 1;
+  // 根目录时 name 为空、mode 为 TREE。
+  TreeEntry entry = 2;
+}
+
+enum DerivedKind {
+  DERIVED_KIND_UNSPECIFIED = 0;
+  // 提交对应的 git sha（仅从 git 导入的提交有）。
+  DERIVED_KIND_GIT_SHA1 = 1;
+  // 代数与第一父提交链深度。
+  DERIVED_KIND_GENERATION = 2;
+}
+
+message GetDerivedRequest {
+  string repo = 1;
+  string revision = 2;
+  DerivedKind kind = 3;
+}
+
+message Generation {
+  uint64 generation = 1;
+  // 0 表示未知（跳表建立之前写入的提交）。
+  uint64 first_parent_depth = 2;
+}
+
+message GetDerivedResponse {
+  bytes changeset_id = 1;
+  // 该提交没有这种派生数据时不设置（例如非 git 导入的提交没有 git sha）。
+  oneof value {
+    bytes git_sha1 = 2;
+    Generation generation = 3;
+  }
 }

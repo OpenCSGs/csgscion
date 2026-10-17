@@ -8,7 +8,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use scion_object::{ObjectId, ObjectKind};
 
-use crate::{BlobStore, ChangesetRecord, Error, IndexedObject, MetaStore, RefExpect, RefState};
+use crate::{
+    BlobStore, ChangesetRecord, Error, IndexedObject, MetaStore, PathChange, PathHistoryEntry, RefExpect, RefState,
+};
 
 fn cs(n: u8) -> ObjectId {
     ObjectId::hash(ObjectKind::Changeset, &[n])
@@ -172,28 +174,35 @@ pub async fn changesets_and_refs<S: MetaStore + ?Sized>(s: &S) {
     let root = ChangesetRecord {
         id: cs(1),
         root_tree: tree,
-        first_parent: None,
+        parents: vec![],
         generation: 1,
+        fp_depth: 0,
+        fp_jump: None,
     };
+    // 合并提交：多个父提交，顺序必须保留
     let child = ChangesetRecord {
         id: cs(2),
         root_tree: tree,
-        first_parent: Some(cs(1)),
+        parents: vec![cs(1), cs(9), cs(5)],
         generation: u64::from(u32::MAX) + 7,
+        fp_depth: 2,
+        fp_jump: Some(cs(1)),
     };
 
     assert_eq!(s.get_changeset("cs/a", &cs(1)).await, Ok(None));
     s.put_changeset("cs/a", &root).await.expect("put root");
     s.put_changeset("cs/a", &child).await.expect("put child");
-    assert_eq!(s.get_changeset("cs/a", &cs(1)).await, Ok(Some(root)));
-    assert_eq!(s.get_changeset("cs/a", &cs(2)).await, Ok(Some(child)));
+    assert_eq!(s.get_changeset("cs/a", &cs(1)).await, Ok(Some(root.clone())));
+    assert_eq!(s.get_changeset("cs/a", &cs(2)).await, Ok(Some(child.clone())));
+    assert_eq!(child.first_parent(), Some(cs(1)));
+    assert_eq!(root.first_parent(), None);
     // 幂等：保留第一次写入
     let other = ChangesetRecord {
         root_tree: ObjectId::hash(ObjectKind::Tree, b"other"),
-        ..root
+        ..root.clone()
     };
     s.put_changeset("cs/a", &other).await.expect("idempotent put");
-    assert_eq!(s.get_changeset("cs/a", &cs(1)).await, Ok(Some(root)));
+    assert_eq!(s.get_changeset("cs/a", &cs(1)).await, Ok(Some(root.clone())));
     // 仓库隔离
     assert_eq!(s.get_changeset("cs/b", &cs(1)).await, Ok(None));
     assert!(matches!(
@@ -227,6 +236,250 @@ pub async fn changesets_and_refs<S: MetaStore + ?Sized>(s: &S) {
     );
     assert_eq!(s.list_refs("cs/b").await, Ok(vec![]));
     assert!(matches!(s.list_refs("nope").await, Err(Error::RepoNotFound(_))));
+}
+
+/// 派生数据：按 (kind, version, key) 存取，幂等，仓库隔离。
+pub async fn derived<S: MetaStore + ?Sized>(s: &S) {
+    s.create_repo("der/a").await.expect("create");
+    s.create_repo("der/b").await.expect("create");
+    let big = vec![7u8; 100_000];
+    assert_eq!(s.get_derived("der/a", "blame", 1, b"k").await, Ok(None));
+    s.put_derived("der/a", "blame", 1, b"k", b"v1").await.expect("put");
+    s.put_derived("der/a", "blame", 1, b"k", b"other")
+        .await
+        .expect("idempotent");
+    assert_eq!(s.get_derived("der/a", "blame", 1, b"k").await, Ok(Some(b"v1".to_vec())));
+    // 版本、种类、键都参与区分
+    assert_eq!(s.get_derived("der/a", "blame", 2, b"k").await, Ok(None));
+    assert_eq!(s.get_derived("der/a", "other", 1, b"k").await, Ok(None));
+    assert_eq!(s.get_derived("der/a", "blame", 1, b"k2").await, Ok(None));
+    assert_eq!(s.get_derived("der/b", "blame", 1, b"k").await, Ok(None));
+    // 空键、空值、大值、二进制键
+    s.put_derived("der/a", "x", 1, b"", b"").await.expect("empty");
+    assert_eq!(s.get_derived("der/a", "x", 1, b"").await, Ok(Some(vec![])));
+    s.put_derived("der/a", "x", 1, &[0, 255, 0], &big).await.expect("big");
+    assert_eq!(s.get_derived("der/a", "x", 1, &[0, 255, 0]).await, Ok(Some(big)));
+    // 批量读取：顺序与输入一致，缺失为 None，重复键各自返回
+    let keys = vec![b"k2".to_vec(), b"k".to_vec(), vec![], b"k".to_vec()];
+    assert_eq!(
+        s.get_derived_many("der/a", "blame", 1, &keys).await,
+        Ok(vec![None, Some(b"v1".to_vec()), None, Some(b"v1".to_vec())])
+    );
+    assert_eq!(s.get_derived_many("der/a", "blame", 1, &[]).await, Ok(vec![]));
+    let many: Vec<Vec<u8>> = (0..2000u32).map(|i| i.to_be_bytes().to_vec()).collect();
+    for k in many.iter().step_by(7) {
+        s.put_derived("der/a", "many", 1, k, k).await.expect("put");
+    }
+    let got = s.get_derived_many("der/a", "many", 1, &many).await.expect("many");
+    for (i, (k, v)) in many.iter().zip(&got).enumerate() {
+        assert_eq!(v.as_ref(), (i % 7 == 0).then_some(k), "key {i}");
+    }
+    assert!(matches!(
+        s.get_derived_many("nope", "x", 1, &keys).await,
+        Err(Error::RepoNotFound(_))
+    ));
+    assert!(matches!(
+        s.get_derived("nope", "x", 1, b"k").await,
+        Err(Error::RepoNotFound(_))
+    ));
+    assert!(matches!(
+        s.put_derived("nope", "x", 1, b"k", b"v").await,
+        Err(Error::RepoNotFound(_))
+    ));
+}
+
+/// 批量读取提交记录与 PathHistory 索引。
+pub async fn history_index<S: MetaStore + ?Sized>(s: &S) {
+    s.create_repo("hist/a").await.expect("create");
+    s.create_repo("hist/b").await.expect("create");
+    let tree = ObjectId::hash(ObjectKind::Tree, b"t");
+    for g in 1..=5u8 {
+        let rec = ChangesetRecord {
+            id: cs(g),
+            root_tree: tree,
+            parents: vec![],
+            generation: u64::from(g),
+            fp_depth: 0,
+            fp_jump: None,
+        };
+        s.put_changeset("hist/a", &rec).await.expect("put");
+    }
+    let gens = |v: Vec<ChangesetRecord>| v.into_iter().map(|r| r.generation).collect::<Vec<_>>();
+    assert_eq!(
+        gens(s.changesets_below("hist/a", 4, 2).await.expect("below")),
+        vec![4, 3]
+    );
+    assert_eq!(
+        gens(s.changesets_below("hist/a", 100, 100).await.expect("below")),
+        vec![5, 4, 3, 2, 1]
+    );
+    assert_eq!(
+        gens(s.changesets_below("hist/a", 0, 10).await.expect("below")),
+        Vec::<u64>::new()
+    );
+    assert_eq!(s.changesets_below("hist/b", 10, 10).await.expect("below"), vec![]);
+    // 大代数（超过 i32）
+    let big = ChangesetRecord {
+        id: cs(9),
+        root_tree: tree,
+        parents: vec![cs(5)],
+        generation: u64::from(u32::MAX) + 1,
+        fp_depth: 0,
+        fp_jump: None,
+    };
+    s.put_changeset("hist/a", &big).await.expect("put");
+    assert_eq!(
+        s.changesets_below("hist/a", u64::from(u32::MAX) + 1, 1)
+            .await
+            .expect("below"),
+        vec![big]
+    );
+
+    let ch = |p: &str, deleted| PathChange {
+        path: p.into(),
+        deleted,
+    };
+    s.index_paths("hist/a", cs(1), 1, &[ch("src/a.rs", false), ch("README", false)])
+        .await
+        .expect("index");
+    s.index_paths("hist/a", cs(2), 2, &[ch("src/a.rs", false), ch("src/b/c.rs", false)])
+        .await
+        .expect("index");
+    s.index_paths(
+        "hist/a",
+        cs(3),
+        3,
+        &[ch("src/a.rs", true), ch("srcx/d.rs", false), ch("src.txt", false)],
+    )
+    .await
+    .expect("index");
+    s.index_paths("hist/a", cs(3), 3, &[ch("src/a.rs", true)])
+        .await
+        .expect("idempotent");
+    s.index_paths("hist/a", cs(4), 4, &[]).await.expect("empty");
+    let hist = |v: Vec<PathHistoryEntry>| {
+        v.into_iter()
+            .map(|e| (e.generation, e.path, e.deleted))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        hist(s.path_history("hist/a", "src/a.rs", 10, 10).await.expect("file")),
+        vec![
+            (3, "src/a.rs".into(), true),
+            (2, "src/a.rs".into(), false),
+            (1, "src/a.rs".into(), false)
+        ]
+    );
+    assert_eq!(
+        hist(s.path_history("hist/a", "src", 10, 10).await.expect("dir")),
+        vec![
+            (3, "src/a.rs".into(), true),
+            (2, "src/a.rs".into(), false),
+            (2, "src/b/c.rs".into(), false),
+            (1, "src/a.rs".into(), false)
+        ],
+        "directory matches descendants only, not src.txt or srcx/"
+    );
+    assert_eq!(s.path_history("hist/a", "src", 2, 1).await.expect("limit").len(), 1);
+    assert_eq!(
+        hist(s.path_history("hist/a", "src/a.rs", 2, 10).await.expect("max gen")).len(),
+        2
+    );
+    assert!(s.path_history("hist/a", "nope", 10, 10).await.expect("none").is_empty());
+    assert!(
+        s.path_history("hist/b", "src", 10, 10)
+            .await
+            .expect("isolated")
+            .is_empty()
+    );
+    assert!(matches!(
+        s.path_history("nope", "src", 1, 1).await,
+        Err(Error::RepoNotFound(_))
+    ));
+    assert!(matches!(
+        s.index_paths("nope", cs(1), 1, &[]).await,
+        Err(Error::RepoNotFound(_))
+    ));
+    assert!(matches!(
+        s.changesets_below("nope", 1, 1).await,
+        Err(Error::RepoNotFound(_))
+    ));
+}
+
+/// 第一父提交链跳表：线性历史上 fp_skip 的深度与跳跃指针满足 skew-binary 规则。
+pub async fn fp_skip_chain<S: MetaStore>(s: &S) {
+    s.create_repo("skip").await.expect("create");
+    let tree = ObjectId::hash(ObjectKind::Tree, b"t");
+    let mut prev: Option<ObjectId> = None;
+    let mut recs = Vec::new();
+    for n in 0..40u8 {
+        let (fp_depth, fp_jump) = crate::fp_skip(s, "skip", prev).await.expect("skip");
+        let rec = ChangesetRecord {
+            id: cs(100 + n),
+            root_tree: tree,
+            parents: prev.into_iter().collect(),
+            generation: u64::from(n) + 1,
+            fp_depth,
+            fp_jump,
+        };
+        s.put_changeset("skip", &rec).await.expect("put");
+        prev = Some(rec.id);
+        recs.push(rec);
+    }
+    assert_eq!((recs[0].fp_depth, recs[0].fp_jump), (1, None), "root jumps to itself");
+    let depth_of = |id: ObjectId| recs.iter().find(|r| r.id == id).map(|r| r.fp_depth).expect("known");
+    for r in &recs[1..] {
+        assert_eq!(r.fp_depth, r.generation);
+        let j = depth_of(r.fp_jump.expect("jump"));
+        assert!(j < r.fp_depth, "jump goes strictly up the chain");
+    }
+    // 跳跃长度覆盖多个尺度（skew-binary：1, 3, 7, 15, …）
+    let longest = recs
+        .iter()
+        .skip(1)
+        .map(|r| r.fp_depth - depth_of(r.fp_jump.expect("jump")))
+        .max()
+        .expect("max");
+    assert!(longest >= 15, "longest jump {longest}");
+    // 父提交深度未知：结果也未知
+    let legacy = ChangesetRecord {
+        id: cs(250),
+        root_tree: tree,
+        parents: vec![],
+        generation: 1,
+        fp_depth: 0,
+        fp_jump: None,
+    };
+    s.put_changeset("skip", &legacy).await.expect("put");
+    assert_eq!(crate::fp_skip(s, "skip", Some(cs(250))).await, Ok((0, None)));
+    // 修复谱系：父提交与跳表一起覆盖，其它字段不变
+    s.repair_lineage("skip", &cs(250), &[cs(1)], 2, Some(cs(1)))
+        .await
+        .expect("repair");
+    let r = s.get_changeset("skip", &cs(250)).await.expect("ok").expect("rec");
+    assert_eq!(
+        (r.parents.clone(), r.fp_depth, r.fp_jump),
+        (vec![cs(1)], 2, Some(cs(1)))
+    );
+    assert_eq!((r.root_tree, r.generation), (tree, 1));
+    // 错误的值可以再次修正（包括多个父提交、清空跳跃指针）
+    s.repair_lineage("skip", &cs(250), &[cs(1), cs(2)], 1, None)
+        .await
+        .expect("re-repair");
+    let r = s.get_changeset("skip", &cs(250)).await.expect("ok").expect("rec");
+    assert_eq!((r.parents, r.fp_depth, r.fp_jump), (vec![cs(1), cs(2)], 1, None));
+    s.repair_lineage("skip", &cs(251), &[], 1, None)
+        .await
+        .expect("unknown changeset is a no-op");
+    assert_eq!(s.get_changeset("skip", &cs(251)).await, Ok(None));
+    assert!(matches!(
+        s.repair_lineage("nope", &cs(250), &[], 1, None).await,
+        Err(Error::RepoNotFound(_))
+    ));
+    assert!(
+        matches!(crate::fp_skip(s, "skip", Some(cs(251))).await, Err(Error::Backend(_))),
+        "parent not recorded"
+    );
 }
 
 /// 并发 CAS：同一版本上的多个竞争者恰好只有一个成功，且版本严格连续。

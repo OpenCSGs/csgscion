@@ -41,7 +41,7 @@ impl LandSvc {
         let expect = match current {
             // 已经合入：直接返回，超时后重试是安全的
             Some(cur) if cur.target == cs_id => return Ok(cur),
-            Some(cur) if rec.first_parent == Some(cur.target) => RefExpect::Version(cur.version),
+            Some(cur) if rec.first_parent() == Some(cur.target) => RefExpect::Version(cur.version),
             Some(cur) => return Err(status::not_fast_forward(reference, &cur.target)),
             None => RefExpect::Absent,
         };

@@ -6,17 +6,24 @@ use std::sync::Arc;
 use bytes::Bytes;
 use scion_object::{EntryMode, ObjectId, TreeEntry};
 use scion_proto::v1::query_service_server::QueryService;
-use scion_proto::v1::{self, ListDirRequest, ListDirResponse, ReadFileRequest, ReadFileResponse};
+use scion_proto::v1::{
+    self, BlameRequest, BlameResponse, DiffRequest, DiffResponse, GetDerivedRequest, GetDerivedResponse,
+    IsAncestorRequest, IsAncestorResponse, ListDirRequest, ListDirResponse, LogRequest, LogResponse, MergeBaseRequest,
+    MergeBaseResponse, ReadFileRequest, ReadFileResponse, ResolveRevisionRequest, ResolveRevisionResponse, StatRequest,
+    StatResponse,
+};
 use scion_store::{BlobStore, MetaStore};
 use scion_tree::{BlobTreeSource, TreeSource, lookup};
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
 use crate::config::ServerConfig;
+use crate::service::history;
 use crate::service::support::resolve_revision;
 use crate::status;
 
 pub type ReadFileStream = Pin<Box<dyn Stream<Item = Result<ReadFileResponse, Status>> + Send>>;
+pub type DiffStream = Pin<Box<dyn Stream<Item = Result<DiffResponse, Status>> + Send>>;
 
 pub struct QuerySvc {
     config: Arc<ServerConfig>,
@@ -33,7 +40,7 @@ pub(crate) fn proto_mode(m: EntryMode) -> v1::EntryMode {
     }
 }
 
-fn proto_entry(e: &TreeEntry) -> v1::TreeEntry {
+pub(crate) fn proto_entry(e: &TreeEntry) -> v1::TreeEntry {
     v1::TreeEntry {
         name: e.name.clone(),
         mode: proto_mode(e.mode).into(),
@@ -42,7 +49,7 @@ fn proto_entry(e: &TreeEntry) -> v1::TreeEntry {
     }
 }
 
-fn check_path(path: &str) -> Result<(), Status> {
+pub(crate) fn check_path(path: &str) -> Result<(), Status> {
     if path.is_empty() {
         return Ok(());
     }
@@ -154,6 +161,59 @@ impl QueryService for QuerySvc {
         let req = request.into_inner();
         Ok(Response::new(
             QuerySvc::list_dir(self, &req.repo, &req.revision, &req.path).await?,
+        ))
+    }
+
+    async fn log(&self, request: Request<LogRequest>) -> Result<Response<LogResponse>, Status> {
+        Ok(Response::new(
+            history::log(self.meta.as_ref(), self.blobs.as_ref(), request.into_inner()).await?,
+        ))
+    }
+
+    async fn is_ancestor(&self, request: Request<IsAncestorRequest>) -> Result<Response<IsAncestorResponse>, Status> {
+        Ok(Response::new(
+            history::is_ancestor(self.meta.as_ref(), request.into_inner()).await?,
+        ))
+    }
+
+    async fn merge_base(&self, request: Request<MergeBaseRequest>) -> Result<Response<MergeBaseResponse>, Status> {
+        Ok(Response::new(
+            history::merge_base(self.meta.as_ref(), request.into_inner()).await?,
+        ))
+    }
+
+    async fn blame(&self, request: Request<BlameRequest>) -> Result<Response<BlameResponse>, Status> {
+        Ok(Response::new(
+            history::blame(self.meta.as_ref(), self.blobs.as_ref(), request.into_inner()).await?,
+        ))
+    }
+
+    type DiffStream = DiffStream;
+
+    async fn diff(&self, request: Request<DiffRequest>) -> Result<Response<Self::DiffStream>, Status> {
+        let resp = history::diff(self.meta.as_ref(), self.blobs.clone(), request.into_inner()).await?;
+        let batches = history::diff_batches(resp, history::DIFF_BATCH);
+        Ok(Response::new(Box::pin(tokio_stream::iter(batches.into_iter().map(Ok)))))
+    }
+
+    async fn resolve_revision(
+        &self,
+        request: Request<ResolveRevisionRequest>,
+    ) -> Result<Response<ResolveRevisionResponse>, Status> {
+        Ok(Response::new(
+            history::resolve(self.meta.as_ref(), request.into_inner()).await?,
+        ))
+    }
+
+    async fn stat(&self, request: Request<StatRequest>) -> Result<Response<StatResponse>, Status> {
+        Ok(Response::new(
+            history::stat(self.meta.as_ref(), self.blobs.clone(), request.into_inner()).await?,
+        ))
+    }
+
+    async fn get_derived(&self, request: Request<GetDerivedRequest>) -> Result<Response<GetDerivedResponse>, Status> {
+        Ok(Response::new(
+            history::get_derived(self.meta.as_ref(), self.blobs.as_ref(), request.into_inner()).await?,
         ))
     }
 }
