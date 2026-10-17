@@ -23,7 +23,7 @@ mod info;
 mod ops;
 mod watch;
 
-pub use client::{Auth, Client, ClientBuilder};
+pub use client::{Auth, Client, ClientBuilder, ReadEndpoints, UPSTREAM_HEADER};
 pub use error::{ConflictPath, Error, MergeConflict, Result};
 pub use history::{BlameCommitInfo, BlameInfo, FileChangeInfo, LogItem, LogPage, Revision};
 pub use info::{Limits, ProtocolVersion, ReadEndpoint, Role, ServerInfo};

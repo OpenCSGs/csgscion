@@ -54,7 +54,24 @@ pub struct ClientBuilder {
     auth: Auth,
     client_name: String,
     connect_timeout: Duration,
+    read_endpoints: ReadEndpoints,
+    daemon_socket: Option<std::path::PathBuf>,
 }
+
+/// 读取对象时是否使用服务端推荐的只读端点（区域缓存）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ReadEndpoints {
+    /// 使用 `ServerInfo.read_endpoints` 中与 `region` 相同的端点（`None` 或没有匹配时用第一个）。
+    #[default]
+    Auto,
+    /// 优先使用这个区域的端点。
+    Region(String),
+    /// 总是直接从服务端读取。
+    Off,
+}
+
+/// 经 daemon 转发时，告诉 daemon 真正的服务端地址的请求头。
+pub const UPSTREAM_HEADER: &str = "x-scion-upstream";
 
 impl Default for ClientBuilder {
     fn default() -> Self {
@@ -64,6 +81,8 @@ impl Default for ClientBuilder {
             auth: Auth::None,
             client_name: "scion-client".into(),
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            read_endpoints: ReadEndpoints::Auto,
+            daemon_socket: None,
         }
     }
 }
@@ -97,6 +116,19 @@ impl ClientBuilder {
         self
     }
 
+    /// 读取对象时是否、以及优先用哪个区域的只读端点（默认 [`ReadEndpoints::Auto`]）。
+    pub fn read_endpoints(mut self, mode: ReadEndpoints) -> Self {
+        self.read_endpoints = mode;
+        self
+    }
+
+    /// 经本机 daemon（`scn daemon`）连接：所有请求发到这个 Unix socket，由 daemon 就地应答（对象读取）
+    /// 或转发给服务端。daemon 不可达时 [`ClientBuilder::build`] 返回连接错误，调用方可改为直连。
+    pub fn daemon_socket(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.daemon_socket = Some(path.into());
+        self
+    }
+
     fn endpoint_config(&self) -> Result<(String, Endpoint)> {
         let url = self
             .endpoint
@@ -125,35 +157,127 @@ impl ClientBuilder {
     /// 建立连接并完成能力协商（`GetServerInfo`）。协议主版本不兼容时返回错误。
     pub async fn build(self) -> Result<Client> {
         let (url, ep) = self.endpoint_config()?;
-        let channel = ep.connect().await.map_err(|e| Error::Connect {
-            endpoint: url.clone(),
-            message: source_chain(&e),
-        })?;
-        let req = GetServerInfoRequest {
-            client_name: self.client_name,
-            client_version: env!("CARGO_PKG_VERSION").to_string(),
-            protocol_version: scion_proto::PROTOCOL_VERSION.to_string(),
+        let (channel, upstream) = match &self.daemon_socket {
+            Some(path) => {
+                let header = MetadataValue::try_from(url.as_str()).map_err(|_| Error::InvalidEndpoint(url.clone()))?;
+                (connect_daemon(path, self.connect_timeout).await?, Some(header))
+            }
+            None => (
+                ep.connect().await.map_err(|e| Error::Connect {
+                    endpoint: url.clone(),
+                    message: source_chain(&e),
+                })?,
+                None,
+            ),
         };
-        let resp = ServerInfoServiceClient::new(channel.clone())
-            .get_server_info(make_request(&self.auth, req)?)
-            .await?
-            .into_inner();
-        let info = resp
-            .info
-            .ok_or_else(|| Error::Protocol("GetServerInfo returned no info".into()))?;
-        let info = ServerInfo::from_proto(info)?;
+        let auth = self.auth.clone();
+        let info = fetch_info(&channel, &auth, upstream.as_ref(), &self.client_name).await?;
+        // 经 daemon 时由 daemon 决定从哪里读对象
+        let (objects, objects_endpoint) = match (&upstream, pick_read_endpoint(&info, &self.read_endpoints)) {
+            (None, Some(read)) => match self.read_channel(&read).await {
+                Some(ch) => (ch, read),
+                None => (channel.clone(), url.clone()),
+            },
+            _ => (channel.clone(), url.clone()),
+        };
         Ok(Client {
             channel,
+            objects,
+            objects_endpoint,
+            upstream,
             auth: self.auth,
             repo: self.repo,
             info,
         })
     }
+
+    /// 连接只读端点并确认它能应答；不可达时返回 `None`（改为直接从服务端读取）。
+    async fn read_channel(&self, url: &str) -> Option<Channel> {
+        let builder = ClientBuilder {
+            endpoint: Some(url.to_owned()),
+            ..self.clone()
+        };
+        let (_, ep) = builder.endpoint_config().ok()?;
+        let ch = ep.connect().await.ok()?;
+        fetch_info(&ch, &self.auth, None, &self.client_name).await.ok()?;
+        Some(ch)
+    }
 }
 
-/// 构造请求并附加认证头。
-fn make_request<T>(auth: &Auth, msg: T) -> Result<tonic::Request<T>> {
+async fn fetch_info(
+    channel: &Channel,
+    auth: &Auth,
+    upstream: Option<&MetadataValue<tonic::metadata::Ascii>>,
+    client_name: &str,
+) -> Result<ServerInfo> {
+    let req = GetServerInfoRequest {
+        client_name: client_name.to_owned(),
+        client_version: env!("CARGO_PKG_VERSION").to_string(),
+        protocol_version: scion_proto::PROTOCOL_VERSION.to_string(),
+    };
+    let resp = ServerInfoServiceClient::new(channel.clone())
+        .get_server_info(make_request(auth, upstream, req)?)
+        .await?
+        .into_inner();
+    let info = resp
+        .info
+        .ok_or_else(|| Error::Protocol("GetServerInfo returned no info".into()))?;
+    ServerInfo::from_proto(info)
+}
+
+/// 选择只读端点：先按区域匹配，再取第一个。
+fn pick_read_endpoint(info: &ServerInfo, mode: &ReadEndpoints) -> Option<String> {
+    let region = match mode {
+        ReadEndpoints::Off => return None,
+        ReadEndpoints::Auto => None,
+        ReadEndpoints::Region(r) => Some(r.as_str()),
+    };
+    let eps = &info.read_endpoints;
+    region
+        .and_then(|r| eps.iter().find(|e| e.region == r))
+        .or_else(|| eps.first())
+        .map(|e| e.url.clone())
+}
+
+#[cfg(unix)]
+async fn connect_daemon(path: &std::path::Path, timeout: Duration) -> Result<Channel> {
+    let p = path.to_path_buf();
+    let err = |m: String| Error::Connect {
+        endpoint: format!("unix:{}", path.display()),
+        message: m,
+    };
+    // URI 只是占位：连接器总是连到 socket
+    Endpoint::from_static("http://scion-daemon")
+        .connect_timeout(timeout)
+        .connect_with_connector(tower::service_fn(move |_: tonic::transport::Uri| {
+            let p = p.clone();
+            async move {
+                let s = tokio::net::UnixStream::connect(p).await?;
+                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(s))
+            }
+        }))
+        .await
+        .map_err(|e| err(source_chain(&e)))
+}
+
+#[cfg(not(unix))]
+async fn connect_daemon(path: &std::path::Path, _timeout: Duration) -> Result<Channel> {
+    Err(Error::Connect {
+        endpoint: format!("unix:{}", path.display()),
+        message: "the daemon is only supported on Unix".into(),
+    })
+}
+
+/// 构造请求并附加认证头（经 daemon 时还附加服务端地址）。
+fn make_request<T>(
+    auth: &Auth,
+    upstream: Option<&MetadataValue<tonic::metadata::Ascii>>,
+    msg: T,
+) -> Result<tonic::Request<T>> {
     let mut req = tonic::Request::new(msg);
+    if let Some(u) = upstream {
+        req.metadata_mut().insert(UPSTREAM_HEADER, u.clone());
+    }
     if let Auth::Bearer(token) = auth {
         let v = MetadataValue::try_from(format!("Bearer {token}"))
             .map_err(|_| Error::Protocol("token contains invalid header characters".into()))?;
@@ -178,6 +302,11 @@ fn source_chain(e: &dyn std::error::Error) -> String {
 #[derive(Debug, Clone)]
 pub struct Client {
     pub(crate) channel: Channel,
+    /// 读取对象用的连接：只读端点（区域缓存）或与 `channel` 相同。
+    objects: Channel,
+    objects_endpoint: String,
+    /// 经 daemon 时真正的服务端地址（每个请求都带上）。
+    upstream: Option<MetadataValue<tonic::metadata::Ascii>>,
     auth: Auth,
     repo: Option<String>,
     info: ServerInfo,
@@ -202,6 +331,9 @@ impl Client {
             ..Default::default()
         };
         Self {
+            objects: channel.clone(),
+            objects_endpoint: "test".into(),
+            upstream: None,
             channel,
             auth: Auth::None,
             repo: Some("r".into()),
@@ -223,7 +355,17 @@ impl Client {
     }
 
     pub(crate) fn request<T>(&self, msg: T) -> Result<tonic::Request<T>> {
-        make_request(&self.auth, msg)
+        make_request(&self.auth, self.upstream.as_ref(), msg)
+    }
+
+    /// 读取对象的地址：服务端推荐的只读端点，或服务端本身。
+    pub fn object_endpoint(&self) -> &str {
+        &self.objects_endpoint
+    }
+
+    /// 是否经本机 daemon 连接。
+    pub fn via_daemon(&self) -> bool {
+        self.upstream.is_some()
     }
 
     /// 返回 `ids` 中服务端不存在的对象。超过服务端批量上限时自动分批。
@@ -250,25 +392,49 @@ impl Client {
 
     /// 读取一个对象的完整字节，并校验 BLAKE3（不信任任何缓存层）。
     pub async fn get_object(&self, id: &ObjectId) -> Result<Bytes> {
-        let req = GetObjectsRequest {
-            repo: self.repo()?,
-            wants: vec![ObjectWant {
-                id: Bytes::copy_from_slice(&id.to_bytes()),
-                offset: 0,
-            }],
-            accept_encodings: vec![],
-        };
-        let mut stream = ObjectServiceClient::new(self.channel.clone())
-            .get_objects(self.request(req)?)
-            .await?
-            .into_inner();
-        let mut buf = Assembler::new(*id);
-        while let Some(part) = stream.message().await? {
-            if buf.push(part)? {
-                return buf.finish();
+        let mut v = self.get_objects(std::slice::from_ref(id)).await?;
+        v.pop().ok_or_else(|| Error::Protocol(format!("no data for {id}")))
+    }
+
+    /// 批量读取对象（顺序与 `ids` 相同），每个都校验 BLAKE3。超过服务端批量上限时自动分批。
+    pub async fn get_objects(&self, ids: &[ObjectId]) -> Result<Vec<Bytes>> {
+        let repo = self.repo()?;
+        let batch = (self.server_info().limits.max_batch_objects as usize).max(1);
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(batch) {
+            let req = GetObjectsRequest {
+                repo: repo.clone(),
+                wants: chunk
+                    .iter()
+                    .map(|id| ObjectWant {
+                        id: Bytes::copy_from_slice(&id.to_bytes()),
+                        offset: 0,
+                    })
+                    .collect(),
+                accept_encodings: vec![],
+            };
+            let mut stream = ObjectServiceClient::new(self.objects.clone())
+                .get_objects(self.request(req)?)
+                .await?
+                .into_inner();
+            let mut pending = chunk.iter();
+            let mut buf = pending.next().map(|id| Assembler::new(*id));
+            while let Some(part) = stream.message().await? {
+                let Some(b) = buf.as_mut() else {
+                    return Err(Error::Protocol("GetObjects sent more objects than requested".into()));
+                };
+                if b.push(part)? {
+                    if let Some(done) = buf.take() {
+                        out.push(done.finish()?);
+                    }
+                    buf = pending.next().map(|id| Assembler::new(*id));
+                }
+            }
+            if let Some(b) = buf {
+                return Err(Error::Protocol(format!("stream for {} ended before last chunk", b.id)));
             }
         }
-        Err(Error::Protocol(format!("stream for {id} ended before last chunk")))
+        Ok(out)
     }
 }
 
@@ -411,17 +577,61 @@ mod tests {
 
     #[test]
     fn make_request_sets_bearer_header() {
-        let req = make_request(&Auth::Bearer("abc".into()), ()).expect("ok");
+        let req = make_request(&Auth::Bearer("abc".into()), None, ()).expect("ok");
         assert_eq!(
             req.metadata().get("authorization").map(|v| v.to_str().ok()),
             Some(Some("Bearer abc"))
         );
-        let req = make_request(&Auth::None, ()).expect("ok");
+        let up = MetadataValue::from_static("http://server:7080");
+        let req = make_request(&Auth::None, Some(&up), ()).expect("ok");
         assert!(req.metadata().get("authorization").is_none());
+        assert_eq!(
+            req.metadata().get(UPSTREAM_HEADER).map(|v| v.to_str().ok()),
+            Some(Some("http://server:7080"))
+        );
         assert!(matches!(
-            make_request(&Auth::Bearer("bad\ntoken".into()), ()),
+            make_request(&Auth::Bearer("bad\ntoken".into()), None, ()),
             Err(Error::Protocol(_))
         ));
+    }
+
+    #[test]
+    fn read_endpoint_selection() {
+        let info = ServerInfo::from_proto(scion_proto::v1::ServerInfo {
+            protocol_version: scion_proto::PROTOCOL_VERSION.into(),
+            hash_algo: scion_proto::v1::HashAlgo::Blake3256.into(),
+            read_endpoints: vec![
+                scion_proto::v1::Endpoint {
+                    url: "http://a".into(),
+                    region: "east".into(),
+                },
+                scion_proto::v1::Endpoint {
+                    url: "http://b".into(),
+                    region: "west".into(),
+                },
+            ],
+            limits: Some(scion_proto::v1::Limits {
+                max_batch_objects: 10,
+                max_chunk_bytes: 10,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .expect("info");
+        assert_eq!(
+            pick_read_endpoint(&info, &ReadEndpoints::Auto).as_deref(),
+            Some("http://a")
+        );
+        assert_eq!(
+            pick_read_endpoint(&info, &ReadEndpoints::Region("west".into())).as_deref(),
+            Some("http://b")
+        );
+        assert_eq!(
+            pick_read_endpoint(&info, &ReadEndpoints::Region("mars".into())).as_deref(),
+            Some("http://a"),
+            "falls back to the first endpoint"
+        );
+        assert_eq!(pick_read_endpoint(&info, &ReadEndpoints::Off), None);
     }
 
     #[test]

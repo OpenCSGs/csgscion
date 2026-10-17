@@ -2798,7 +2798,9 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "hex",
+ "hyper-util",
  "scion-api",
+ "scion-cache",
  "scion-object",
  "scion-proto",
  "scion-store",
@@ -2807,6 +2809,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tonic-types",
+ "tower",
  "uuid",
 ]
 

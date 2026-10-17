@@ -17,11 +17,14 @@ tokio-stream.workspace = true
 tonic.workspace = true
 tonic-types.workspace = true
 uuid = { version = "1", features = ["v7"] }
+tower = { workspace = true, features = ["util"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 
 [dev-dependencies]
 # 只有测试可以在进程内拉起服务端（客户端文档 §0）
 scion-api.workspace = true
 scion-store.workspace = true
+scion-cache.workspace = true
 tokio.workspace = true
 
 [lints]

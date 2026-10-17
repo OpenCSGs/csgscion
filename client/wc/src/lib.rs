@@ -88,28 +88,55 @@ pub struct WorkingCopy {
     state: State,
 }
 
-/// 递归展开目录树，得到 `路径 → 文件`。
+/// 每次批量读取的对象数（SDK 还会按服务端上限再分批）。
+const FETCH_BATCH: usize = 256;
+
+/// 递归展开目录树，得到 `路径 → 文件`。按层批量读取目录树。
 async fn flatten(client: &Client, root: ObjectId) -> Result<BTreeMap<String, TreeFile>> {
     let mut out = BTreeMap::new();
-    let mut stack = vec![(String::new(), root)];
-    while let Some((prefix, id)) = stack.pop() {
-        let bytes = client.get_object(&id).await?;
-        let tree = Tree::decode(&bytes).map_err(|e| Error::Corrupt(format!("tree {id}: {e}")))?;
-        for e in tree.entries() {
-            let path = if prefix.is_empty() {
-                e.name.clone()
-            } else {
-                format!("{prefix}/{}", e.name)
-            };
-            match Mode::from_entry(e.mode) {
-                Some(mode) => {
-                    out.insert(path, TreeFile { mode, id: e.id });
+    let mut level = vec![(String::new(), root)];
+    while !level.is_empty() {
+        let mut next = Vec::new();
+        for part in level.chunks(FETCH_BATCH) {
+            let ids: Vec<ObjectId> = part.iter().map(|(_, id)| *id).collect();
+            let trees = client.get_objects(&ids).await?;
+            for ((prefix, id), bytes) in part.iter().zip(trees) {
+                let tree = Tree::decode(&bytes).map_err(|e| Error::Corrupt(format!("tree {id}: {e}")))?;
+                for e in tree.entries() {
+                    let path = if prefix.is_empty() {
+                        e.name.clone()
+                    } else {
+                        format!("{prefix}/{}", e.name)
+                    };
+                    match Mode::from_entry(e.mode) {
+                        Some(mode) => {
+                            out.insert(path, TreeFile { mode, id: e.id });
+                        }
+                        None => next.push((path, e.id)),
+                    }
                 }
-                None => stack.push((path, e.id)),
             }
         }
+        level = next;
     }
     Ok(out)
+}
+
+/// 批量读取一组文件的内容，按顺序交给 `f`。
+async fn fetch_files<'a>(
+    client: &Client,
+    files: impl IntoIterator<Item = (&'a String, &'a TreeFile)>,
+    mut f: impl FnMut(&'a String, &'a TreeFile, bytes::Bytes) -> Result<()>,
+) -> Result<()> {
+    let files: Vec<_> = files.into_iter().collect();
+    for part in files.chunks(FETCH_BATCH) {
+        let ids: Vec<ObjectId> = part.iter().map(|(_, t)| t.id).collect();
+        let data = client.get_objects(&ids).await?;
+        for ((path, file), d) in part.iter().zip(data) {
+            f(path, file, d)?;
+        }
+    }
+    Ok(())
 }
 
 impl WorkingCopy {
@@ -125,13 +152,14 @@ impl WorkingCopy {
         let mut dirstate = DirState::default();
         if let Some(tip) = client.resolve_ref(reference).await? {
             let files = flatten(client, tip.root_tree).await?;
-            for (path, f) in &files {
-                let data = client.get_object(&f.id).await?;
+            fetch_files(client, &files, |path, f, data| {
                 let mtime_ns = fsutil::write_file(dir, path, f.mode, &data)?;
                 dirstate
                     .files
                     .insert(path.clone(), record(f.mode, f.id, data.len() as u64, mtime_ns));
-            }
+                Ok(())
+            })
+            .await?;
             state.base = Some(tip.changeset.to_string());
         }
         paths.save_dirstate(&mut dirstate)?;
@@ -366,24 +394,54 @@ impl WorkingCopy {
         delta: &BTreeMap<String, Option<TreeFile>>,
     ) -> Result<(usize, usize)> {
         let (mut written, mut removed) = (0, 0);
-        for (path, change) in delta {
+        let entries: Vec<_> = delta.iter().collect();
+        // 按原顺序处理（删除与写入的先后影响文件/目录互换），每段的文件内容一次批量读取
+        for part in entries.chunks(FETCH_BATCH) {
+            let ids: Vec<ObjectId> = part.iter().filter_map(|(_, c)| c.as_ref().map(|f| f.id)).collect();
+            let mut contents = client.get_objects(&ids).await?.into_iter();
+            for (path, change) in part {
+                self.apply_one(
+                    dirstate,
+                    path,
+                    change.as_ref(),
+                    &mut contents,
+                    &mut written,
+                    &mut removed,
+                )?;
+            }
+        }
+        Ok((written, removed))
+    }
+
+    fn apply_one(
+        &self,
+        dirstate: &mut DirState,
+        path: &str,
+        change: Option<&TreeFile>,
+        contents: &mut impl Iterator<Item = bytes::Bytes>,
+        written: &mut usize,
+        removed: &mut usize,
+    ) -> Result<()> {
+        {
             match change {
                 Some(f) => {
-                    let data = client.get_object(&f.id).await?;
+                    let data = contents
+                        .next()
+                        .ok_or_else(|| Error::Corrupt(format!("no content fetched for {path}")))?;
                     let mtime_ns = fsutil::write_file(self.root(), path, f.mode, &data)?;
                     dirstate
                         .files
-                        .insert(path.clone(), record(f.mode, f.id, data.len() as u64, mtime_ns));
-                    written += 1;
+                        .insert(path.to_owned(), record(f.mode, f.id, data.len() as u64, mtime_ns));
+                    *written += 1;
                 }
                 None => {
                     fsutil::remove_file(self.root(), path)?;
                     dirstate.files.remove(path);
-                    removed += 1;
+                    *removed += 1;
                 }
             }
         }
-        Ok((written, removed))
+        Ok(())
     }
 
     async fn rebase(&mut self, client: &Client, onto: ObjectId, onto_root: ObjectId) -> Result<SyncOutcome> {
