@@ -373,7 +373,7 @@ xtask/                 仓库维护任务：cargo xtask layers（依赖方向检
 
 **分层规则**（`cargo xtask layers` 在 CI 中检查，只检查普通依赖，dev-dependencies 不受限）：
 - 区域规则：`common` 只依赖 `common`；`client` 只依赖 `common` 和 `client`；`server` 只依赖 `common` 和 `server`。区域由 crate 所在的顶层目录自动判定。
-- 服务端内部按层：`store` ← `store-sql/store-blob` ← `tree/merge/derive` ← `land/query` ← `api` ← `scion`，只能依赖更低层；新增服务端 crate 必须在 xtask 中登记层级，否则检查失败。`authz` 只在 `api` 层生效。
+- 服务端内部按层：`store` ← `store-sql/store-blob` ← `tree` ← `merge/derive/query` ← `land` ← `api` ← `scion`，只能依赖更低层；新增服务端 crate 必须在 xtask 中登记层级，否则检查失败。`authz` 只在 `api` 层生效。
 
 ### 5.2 运行时与关键依赖
 | 用途 | crate |

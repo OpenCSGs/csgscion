@@ -36,10 +36,11 @@ fn server_rank(name: &str) -> Option<u32> {
     Some(match name {
         "scion-store" => 1,
         "scion-store-sql" | "scion-store-blob" => 2,
-        "scion-tree" | "scion-merge" | "scion-derive" => 3,
-        "scion-land" | "scion-query" => 4,
-        "scion-api" => 5,
-        "scion" => 6,
+        "scion-tree" => 3,
+        "scion-merge" | "scion-derive" | "scion-query" => 4,
+        "scion-land" => 5,
+        "scion-api" => 6,
+        "scion" => 7,
         _ => return None,
     })
 }

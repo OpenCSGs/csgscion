@@ -75,6 +75,7 @@ server/              server side (may depend on common and lower server crates)
   store-sql/         scion-store-sql   SQLite / PostgreSQL metadata store
   store-blob/        scion-store-blob  local directory / S3-compatible object store
   tree/              scion-tree        incremental tree building
+  merge/             scion-merge       server-side rebase: replay a delta onto a newer tree with three-way merge
   query/             scion-query       history queries (log / diff / blame / merge-base) and reindexing
   api/               scion-api         gRPC services and server bootstrap
   scion/             scion             server binary (scion server --lite / --meta / --blobs)

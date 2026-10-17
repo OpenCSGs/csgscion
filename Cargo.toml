@@ -9,6 +9,7 @@ members = [
     "server/store-sql",
     "server/store-blob",
     "server/tree",
+    "server/merge",
     "server/query",
     "server/api",
     "server/scion",
@@ -34,6 +35,7 @@ scion-store = { path = "server/store" }
 scion-store-sql = { path = "server/store-sql" }
 scion-store-blob = { path = "server/store-blob" }
 scion-tree = { path = "server/tree" }
+scion-merge = { path = "server/merge" }
 scion-query = { path = "server/query" }
 scion-api = { path = "server/api" }
 scion-client = { path = "client/sdk" }
@@ -66,6 +68,7 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 tempfile = "3"
 moka = { version = "0.12", features = ["sync"] }
 object_store = { version = "0.14", default-features = false, features = ["aws", "fs"] }
+diffy = "0.5"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 
 [workspace.lints.rust]

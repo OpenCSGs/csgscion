@@ -37,6 +37,7 @@ server/              服务端（可依赖 common 与更低层的 server crate�
   store-sql/         scion-store-sql   SQLite / PostgreSQL 元数据存储
   store-blob/        scion-store-blob  本地目录 / S3 兼容对象存储
   tree/              scion-tree        增量建树
+  merge/             scion-merge       服务端 rebase：把 delta 重放到更新的目录树上，三方合并
   query/             scion-query       历史查询（log / diff / blame / merge-base）与重建索引
   api/               scion-api         gRPC 服务实现与启动入口
   scion/             scion             服务端二进制（scion server --lite / --meta / --blobs）
