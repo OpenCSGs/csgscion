@@ -55,7 +55,7 @@ scn blame src/lib.rs                # the commit that last changed each line
 # (see docs/guide/git-import.md)
 scn import git ~/src/my-repo --repo mono
 
-# After upgrading a server that already has data: backfill derived indexes (idempotent)
+# After upgrading a server that already has data, before starting it: repair lineage and backfill derived indexes (idempotent)
 cargo run -p scion -- admin reindex --lite --data-dir ./.scion-data
 ```
 

@@ -608,7 +608,7 @@ SDK、工作副本、daemon 和 CLI 的完整设计见 [`rust-client-architectur
 > - **blame 缓存查询批量化**：最新版本单独查一次（重复查询的常见情况），其余版本每 64 个一次 `get_derived_many`，避免远端数据库上逐版本往返。
 > - **GitSha 索引**：导入的提交带扩展字段 `git.sha1`，创建提交时写入派生数据 `git-sha1`；`ResolveRevision` 依次按提交 id、ref、git sha 解析，`GetDerived` 可查询 git sha 与代数。
 > - **查询 RPC**：Log、IsAncestor、MergeBase、Diff（服务端流，每批 500 个条目）、Blame、ResolveRevision、Stat、GetDerived，均在 `GetServerInfo` 中以特性声明。
-> - **旧数据补建**：`scion admin reindex [--repo NAME]` 为迁移前写入的提交补齐跳表指针、PathHistory 与 GitSha，可重复执行。
+> - **从 M1 升级**：M1 只在 `first_parent` 列记录父提交。迁移 0008 把它拷入 `parents`，并把这些仓库的跳表标记为未知。随后运行 `scion admin reindex [--repo NAME]`（在启动服务端之前运行；服务端会缓存提交记录），它以提交对象为准修正谱系（全部父提交、包括合并提交的其余父提交，以及跳表，错误的值会被覆盖），并补建 PathHistory 与 GitSha。可重复执行。
 > - **基准**（`server/query/tests/bench.rs`，10 万提交、对象在内存）：SQLite 与 PostgreSQL 元数据下，log、diff、ancestry、merge-base、blame 的 p99 均低于 20 ms（PostgreSQL：冷 blame p99 13.6 ms，log --path p99 15.6 ms）。对象放在 S3 时 blame / diff 的读对象开销由 M4 的缓存层解决。
 > - **推迟到后续里程碑**：通用 Deriver 框架与独立的 deriver 进程（M3/M4）；PathIndex。blame 只沿第一父提交链追溯，按路径过滤的 log 不跟踪重命名。
 | **M2 派生与查询** | 3 周 | 派生框架、Gen/SkipList/PathHistory/Blame、Log/Blame/Diff/MergeBase、deriver 进程 | 在 10 万提交的仓库上，查询 p99 小于 100 毫秒 |

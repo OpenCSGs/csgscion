@@ -86,7 +86,7 @@ scn blame src/lib.rs                # 每一行最后被哪个提交改动
 # 导入已有的 git 仓库（保留全部历史、作者与时间），详见 docs/guide/git-import.md
 scn import git ~/src/my-repo --repo mono
 
-# 升级已有数据的服务端后：补建派生索引（可重复执行）
+# 升级已有数据的服务端后、启动之前：修复谱系并补建派生索引（可重复执行）
 cargo run -p scion -- admin reindex --lite --data-dir ./.scion-data
 ```
 

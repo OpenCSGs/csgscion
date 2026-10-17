@@ -41,7 +41,8 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum AdminCmd {
-    /// 为旧数据补建派生索引（跳表、PathHistory、GitSha）。可重复执行。
+    /// 为旧数据补建派生索引（父提交与跳表、PathHistory、GitSha）。可重复执行。
+    /// 运行中的服务端会缓存提交记录：请在启动服务端之前运行，或运行后重启服务端。
     Reindex(ReindexArgs),
 }
 
@@ -334,8 +335,8 @@ mod tests {
         assert_eq!(
             all,
             [
-                "a: 0 changesets, 0 skip pointers filled, 0 path entries, 0 git shas",
-                "b: 0 changesets, 0 skip pointers filled, 0 path entries, 0 git shas"
+                "a: 0 changesets, 0 lineage repaired, 0 path entries, 0 git shas",
+                "b: 0 changesets, 0 lineage repaired, 0 path entries, 0 git shas"
             ]
         );
         assert_eq!(reindex(&parse(&["--repo", "a"]), no_env).await.expect("one").len(), 1);

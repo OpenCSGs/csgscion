@@ -125,9 +125,16 @@ impl MetaStore for CachedMeta {
         Ok(recs)
     }
 
-    async fn set_fp_skip(&self, repo: &str, id: &ObjectId, fp_depth: u64, fp_jump: Option<ObjectId>) -> Result<()> {
-        self.inner.set_fp_skip(repo, id, fp_depth, fp_jump).await?;
-        // 唯一会变化的字段：清掉旧记录，下次从存储读取
+    async fn repair_lineage(
+        &self,
+        repo: &str,
+        id: &ObjectId,
+        parents: &[ObjectId],
+        fp_depth: u64,
+        fp_jump: Option<ObjectId>,
+    ) -> Result<()> {
+        self.inner.repair_lineage(repo, id, parents, fp_depth, fp_jump).await?;
+        // 记录唯一会变化的情形：清掉旧记录，下次从存储读取
         self.records.invalidate(&Self::key(repo, *id));
         Ok(())
     }
@@ -262,8 +269,15 @@ mod tests {
         ) -> Result<Vec<ChangesetRecord>> {
             self.inner.changesets_below(repo, max_generation, limit).await
         }
-        async fn set_fp_skip(&self, repo: &str, id: &ObjectId, d: u64, j: Option<ObjectId>) -> Result<()> {
-            self.inner.set_fp_skip(repo, id, d, j).await
+        async fn repair_lineage(
+            &self,
+            repo: &str,
+            id: &ObjectId,
+            p: &[ObjectId],
+            d: u64,
+            j: Option<ObjectId>,
+        ) -> Result<()> {
+            self.inner.repair_lineage(repo, id, p, d, j).await
         }
         async fn index_paths(&self, repo: &str, cs: ObjectId, generation: u64, changes: &[PathChange]) -> Result<()> {
             self.inner.index_paths(repo, cs, generation, changes).await
@@ -361,7 +375,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_fp_skip_invalidates_cached_record() {
+    async fn repair_lineage_invalidates_cached_record() {
         let c = cached();
         c.create_repo("r").await.expect("repo");
         let id = ObjectId::hash(ObjectKind::Changeset, b"legacy");
@@ -378,7 +392,7 @@ mod tests {
             c.get_changeset("r", &id).await.expect("ok").map(|r| r.fp_depth),
             Some(0)
         );
-        c.set_fp_skip("r", &id, 1, None).await.expect("set");
+        c.repair_lineage("r", &id, &[], 1, None).await.expect("set");
         assert_eq!(c.cached_changeset("r", &id), None, "stale entry dropped");
         assert_eq!(
             c.get_changeset("r", &id).await.expect("ok").map(|r| r.fp_depth),

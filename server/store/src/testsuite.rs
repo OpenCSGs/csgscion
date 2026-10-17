@@ -452,24 +452,28 @@ pub async fn fp_skip_chain<S: MetaStore>(s: &S) {
     };
     s.put_changeset("skip", &legacy).await.expect("put");
     assert_eq!(crate::fp_skip(s, "skip", Some(cs(250))).await, Ok((0, None)));
-    // 补写：只在深度未知时生效
-    s.set_fp_skip("skip", &cs(250), 1, None).await.expect("backfill");
-    assert_eq!(
-        s.get_changeset("skip", &cs(250)).await.expect("ok").map(|r| r.fp_depth),
-        Some(1)
-    );
-    s.set_fp_skip("skip", &cs(250), 9, Some(cs(1))).await.expect("no-op");
+    // 修复谱系：父提交与跳表一起覆盖，其它字段不变
+    s.repair_lineage("skip", &cs(250), &[cs(1)], 2, Some(cs(1)))
+        .await
+        .expect("repair");
     let r = s.get_changeset("skip", &cs(250)).await.expect("ok").expect("rec");
     assert_eq!(
-        (r.fp_depth, r.fp_jump),
-        (1, None),
-        "existing values are never overwritten"
+        (r.parents.clone(), r.fp_depth, r.fp_jump),
+        (vec![cs(1)], 2, Some(cs(1)))
     );
-    s.set_fp_skip("skip", &cs(251), 1, None)
+    assert_eq!((r.root_tree, r.generation), (tree, 1));
+    // 错误的值可以再次修正（包括多个父提交、清空跳跃指针）
+    s.repair_lineage("skip", &cs(250), &[cs(1), cs(2)], 1, None)
+        .await
+        .expect("re-repair");
+    let r = s.get_changeset("skip", &cs(250)).await.expect("ok").expect("rec");
+    assert_eq!((r.parents, r.fp_depth, r.fp_jump), (vec![cs(1), cs(2)], 1, None));
+    s.repair_lineage("skip", &cs(251), &[], 1, None)
         .await
         .expect("unknown changeset is a no-op");
+    assert_eq!(s.get_changeset("skip", &cs(251)).await, Ok(None));
     assert!(matches!(
-        s.set_fp_skip("nope", &cs(250), 1, None).await,
+        s.repair_lineage("nope", &cs(250), &[], 1, None).await,
         Err(Error::RepoNotFound(_))
     ));
     assert!(

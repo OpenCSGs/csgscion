@@ -1,7 +1,10 @@
-//! 为旧数据补建派生索引：跳表（fp_depth / fp_jump）、PathHistory、GitSha。
+//! 为旧数据补建派生索引：谱系（父提交列表、跳表 fp_depth / fp_jump）、PathHistory、GitSha。
 //!
-//! 按代数从低到高处理全部提交，保证父提交先完成。可以重复执行：已有的跳表值不会被覆盖，
-//! 索引写入都是幂等的。
+//! 按代数从低到高处理全部提交，保证父提交先完成。谱系以提交对象为准：记录中的父提交或跳表与
+//! 对象推导的结果不一致时（M1 的数据只记录了第一个父提交，或者之前按错误的父提交算过跳表）直接覆盖。
+//! 可以重复执行，索引写入都是幂等的。
+//!
+//! 运行中的服务端会缓存提交记录：应在服务端启动之前运行，或者运行后重启服务端。
 
 use scion_object::FileOp;
 use scion_store::{BlobStore, ChangesetRecord, MetaStore, PathChange, fp_skip};
@@ -12,8 +15,8 @@ use crate::{Result, index_git_sha, load_changeset};
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReindexStats {
     pub changesets: usize,
-    /// 补上跳表字段的提交数。
-    pub skip_filled: usize,
+    /// 修正了父提交列表或跳表的提交数。
+    pub lineage_repaired: usize,
     /// 写入的 PathHistory 条目数（含早已存在的）。
     pub paths: usize,
     /// 带 git sha 的提交数。
@@ -64,14 +67,13 @@ pub(crate) async fn reindex_with_window(
     let mut stats = ReindexStats::default();
     for rec in all_records(meta, repo, window).await? {
         stats.changesets += 1;
-        if rec.fp_depth == 0 {
-            let (depth, jump) = fp_skip(meta, repo, rec.first_parent()).await?;
-            if depth > 0 {
-                meta.set_fp_skip(repo, &rec.id, depth, jump).await?;
-                stats.skip_filled += 1;
-            }
-        }
         let cs = load_changeset(blobs, rec.id).await?;
+        // 父提交已按代数顺序修复完毕，这里的计算基于正确的数据
+        let (depth, jump) = fp_skip(meta, repo, cs.parents.first().copied()).await?;
+        if rec.parents != cs.parents || (rec.fp_depth, rec.fp_jump) != (depth, jump) {
+            meta.repair_lineage(repo, &rec.id, &cs.parents, depth, jump).await?;
+            stats.lineage_repaired += 1;
+        }
         let changes: Vec<PathChange> = cs
             .delta
             .iter()
@@ -93,8 +95,8 @@ pub(crate) async fn reindex_with_window(
 /// 一行文字摘要（供命令行和日志使用）。
 pub fn describe(stats: &ReindexStats, repo: &str) -> String {
     format!(
-        "{repo}: {} changesets, {} skip pointers filled, {} path entries, {} git shas",
-        stats.changesets, stats.skip_filled, stats.paths, stats.git_shas
+        "{repo}: {} changesets, {} lineage repaired, {} path entries, {} git shas",
+        stats.changesets, stats.lineage_repaired, stats.paths, stats.git_shas
     )
 }
 
@@ -170,7 +172,7 @@ mod tests {
             stats,
             ReindexStats {
                 changesets: 30,
-                skip_filled: 30,
+                lineage_repaired: 30,
                 paths: 30,
                 git_shas: 30
             }
@@ -182,13 +184,84 @@ mod tests {
         assert_eq!(lookup_git_sha(&s, REPO, &[7; 20]).await, Ok(Some(ids[7])));
         // blame 走索引路径并给出正确结果
         assert_eq!(blame(&s, &s, REPO, tip, "f").await.expect("blame").lines, ids);
-        // 再执行一次：不重复补写跳表
+        // 再执行一次：谱系已正确，不再写入
         let again = reindex(&s, &s, REPO).await.expect("again");
-        assert_eq!(again.skip_filled, 0);
+        assert_eq!(again.lineage_repaired, 0);
         assert_eq!(
             describe(&again, REPO),
-            "r: 30 changesets, 0 skip pointers filled, 30 path entries, 30 git shas"
+            "r: 30 changesets, 0 lineage repaired, 30 path entries, 30 git shas"
         );
+    }
+
+    /// M1 升级上来的数据：记录里父提交为空（只在旧的 first_parent 列），跳表还可能已按"根提交"算错。
+    /// reindex 以提交对象为准全部修正，修正后历史查询能走过这些提交。
+    #[tokio::test]
+    async fn repairs_missing_parents_and_wrong_skip_pointers() {
+        let s = MemStore::new();
+        let ids = legacy_history(&s, 20).await;
+        for id in &ids {
+            // 父提交丢失，深度被错误地算成 1（根）
+            s.repair_lineage(REPO, id, &[], 1, None).await.expect("corrupt");
+        }
+        let tip = *ids.last().expect("tip");
+        let broken = crate::log(&s, &s, REPO, &[tip], None, 100, 1000).await.expect("log");
+        assert_eq!(broken.entries.len(), 1, "history stops at the first legacy commit");
+
+        let stats = reindex(&s, &s, REPO).await.expect("reindex");
+        // 根提交（无父提交、深度 1）本来就是对的
+        assert_eq!(stats.lineage_repaired, 19);
+        for (i, id) in ids.iter().enumerate() {
+            let rec = s.get_changeset(REPO, id).await.expect("ok").expect("rec");
+            let parents: Vec<_> = i.checked_sub(1).map(|p| ids[p]).into_iter().collect();
+            assert_eq!((rec.parents, rec.fp_depth), (parents, i as u64 + 1), "commit {i}");
+        }
+        let log = crate::log(&s, &s, REPO, &[tip], None, 100, 1000).await.expect("log");
+        assert_eq!(log.entries.len(), 20);
+        assert_eq!(crate::is_ancestor(&s, REPO, ids[0], tip).await, Ok(true));
+        assert_eq!(blame(&s, &s, REPO, tip, "f").await.expect("blame").lines, ids);
+        assert_eq!(reindex(&s, &s, REPO).await.expect("again").lineage_repaired, 0);
+    }
+
+    /// 合并提交的记录只有第一个父提交（M1 只存 first_parent）：从对象补全全部父提交。
+    #[tokio::test]
+    async fn restores_all_parents_of_merge_commits() {
+        let s = MemStore::new();
+        let ids = legacy_history(&s, 3).await;
+        let sig = Signature {
+            name: "a".into(),
+            email: "a@x".into(),
+            time_ms: 0,
+            tz_offset_minutes: 0,
+        };
+        let merge = Changeset::new(
+            vec![ids[2], ids[0]],
+            sig.clone(),
+            sig,
+            "merge",
+            [9; 16],
+            vec![],
+            BTreeMap::new(),
+        )
+        .expect("cs");
+        s.put(merge.id(), Bytes::from(merge.encode())).await.expect("cs");
+        let root = s
+            .get_changeset(REPO, &ids[2])
+            .await
+            .expect("ok")
+            .expect("rec")
+            .root_tree;
+        let rec = ChangesetRecord {
+            id: merge.id(),
+            root_tree: root,
+            parents: vec![ids[2]],
+            generation: 4,
+            fp_depth: 0,
+            fp_jump: None,
+        };
+        s.put_changeset(REPO, &rec).await.expect("rec");
+        reindex(&s, &s, REPO).await.expect("reindex");
+        let rec = s.get_changeset(REPO, &merge.id()).await.expect("ok").expect("rec");
+        assert_eq!((rec.parents, rec.fp_depth), (vec![ids[2], ids[0]], 4));
     }
 
     #[tokio::test]
@@ -229,7 +302,7 @@ mod tests {
         }
         let stats = reindex_with_window(&s, &s, REPO, 2).await.expect("reindex");
         assert_eq!(stats.changesets, 15);
-        assert_eq!(stats.skip_filled, 15);
+        assert_eq!(stats.lineage_repaired, 15);
         assert_eq!(
             reindex_with_window(&s, &s, "r", 0)
                 .await

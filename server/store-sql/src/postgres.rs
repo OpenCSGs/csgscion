@@ -301,18 +301,28 @@ impl MetaStore for PgMetaStore {
             .collect()
     }
 
-    async fn set_fp_skip(&self, repo: &str, id: &ObjectId, fp_depth: u64, fp_jump: Option<ObjectId>) -> Result<()> {
+    async fn repair_lineage(
+        &self,
+        repo: &str,
+        id: &ObjectId,
+        parents: &[ObjectId],
+        fp_depth: u64,
+        fp_jump: Option<ObjectId>,
+    ) -> Result<()> {
         let repo_id = self.repo_id(repo).await?;
         sqlx::query(
-            "UPDATE changesets SET fp_depth = $1, fp_jump = $2 WHERE repo_id = $3 AND cs_id = $4 AND fp_depth = 0",
+            "UPDATE changesets SET parents = $1, first_parent = $2, fp_depth = $3, fp_jump = $4 \
+             WHERE repo_id = $5 AND cs_id = $6",
         )
+        .bind(ids_to_db(parents))
+        .bind(parents.first().map(|p| p.to_bytes().to_vec()))
         .bind(version_to_db(fp_depth)?)
         .bind(fp_jump.map(|j| j.to_bytes().to_vec()))
         .bind(repo_id)
         .bind(id.to_bytes().to_vec())
         .execute(&self.pool)
         .await
-        .map_err(|e| backend("set fp skip", e))?;
+        .map_err(|e| backend("repair lineage", e))?;
         Ok(())
     }
 
@@ -503,6 +513,81 @@ mod tests {
                 }
             }
         };
+    }
+
+    /// 从 M1 升级：parents 为空、只有 first_parent 的旧行被修复，跳表被标记为未知；
+    /// 没有旧行的仓库不受影响。
+    #[tokio::test]
+    async fn upgrade_restores_parents_of_m1_rows() {
+        let Ok(url) = std::env::var("SCION_TEST_PG_URL") else {
+            eprintln!("SCION_TEST_PG_URL not set; skipping");
+            return;
+        };
+        static N: AtomicU32 = AtomicU32::new(0);
+        let schema = format!("up{}_{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed));
+        let admin = PgPool::connect(&url).await.expect("connect admin");
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&admin)
+            .await
+            .expect("create schema");
+        let opts = PgConnectOptions::from_str(&url)
+            .expect("url")
+            .options([("search_path", schema.as_str())]);
+        let before = sqlx::migrate::Migrator {
+            migrations: MIGRATOR
+                .migrations
+                .iter()
+                .filter(|m| m.version <= 7)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into(),
+            ..sqlx::migrate::Migrator::DEFAULT
+        };
+        let id = |s: &[u8]| ObjectId::hash(scion_object::ObjectKind::Changeset, s);
+        let (a, b, c, d) = (id(b"a"), id(b"b"), id(b"c"), id(b"d"));
+        {
+            let pool = PgPool::connect_with(opts.clone()).await.expect("open");
+            before.run(&pool).await.expect("migrate to 0007");
+            sqlx::query("INSERT INTO repos (repo_id, name, created_at_ms) VALUES (1, 'old', 0), (2, 'new', 0)")
+                .execute(&pool)
+                .await
+                .expect("repos");
+            // old：M1 写入的行（父提交只在 first_parent），深度已被错误地算成 1
+            // new：M2 写入的正确数据
+            for (repo, cs, first, parents, depth) in [
+                (1, a, None, vec![], 1),
+                (1, b, Some(a), vec![], 1),
+                (2, c, None, vec![], 1),
+                (2, d, Some(c), c.to_bytes().to_vec(), 2),
+            ] {
+                sqlx::query(
+                    "INSERT INTO changesets (repo_id, cs_id, root_tree, first_parent, generation, parents, fp_depth) \
+                     VALUES ($1, $2, $6, $3, 1, $4, $5)",
+                )
+                .bind(repo as i64)
+                .bind(cs.to_bytes().to_vec())
+                .bind(first.map(|f: ObjectId| f.to_bytes().to_vec()))
+                .bind(parents)
+                .bind(depth as i64)
+                .bind(cs.to_bytes().to_vec())
+                .execute(&pool)
+                .await
+                .expect("row");
+            }
+            pool.close().await;
+        }
+        let s = PgMetaStore::connect_with(opts).await.expect("upgrade");
+        let get = |repo: &'static str, cs| {
+            let s = &s;
+            async move {
+                let r = s.get_changeset(repo, &cs).await.expect("ok").expect("rec");
+                (r.parents, r.fp_depth)
+            }
+        };
+        assert_eq!(get("old", b).await, (vec![a], 0), "parent restored, skip unknown");
+        assert_eq!(get("old", a).await, (vec![], 0), "whole repo marked for reindex");
+        assert_eq!(get("new", d).await, (vec![c], 2), "untouched");
+        assert_eq!(get("new", c).await, (vec![], 1), "untouched");
     }
 
     #[tokio::test]
