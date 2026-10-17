@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use scion_api::{App, ServerConfig, serve};
 use scion_client::Client;
-use scion_gitimport::{Error, GIT_SHA1_EXTENSION, import, parse_commit};
+use scion_gitimport::{Error, GIT_SHA1_EXTENSION, Options, import, import_with, parse_commit};
 use scion_object::{Changeset, EntryMode, ObjectId, Tree};
 use scion_store::{MemStore, MetaStore};
 use tokio::net::TcpListener;
@@ -18,13 +18,17 @@ struct Server {
 }
 
 async fn server() -> Server {
+    server_with(ServerConfig::default()).await
+}
+
+async fn server_with(config: ServerConfig) -> Server {
     let store = Arc::new(MemStore::new());
     store.create_repo("imported").await.expect("repo");
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let url = format!("http://{}", listener.local_addr().expect("addr"));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let app = App {
-        config: Arc::new(ServerConfig::default()),
+        config: Arc::new(config),
         meta: store.clone(),
         blobs: store,
     };
@@ -266,7 +270,7 @@ async fn reimport_is_idempotent_and_incremental_import_fast_forwards() {
         "nothing to land"
     );
 
-    // 新增两个提交：沿第一父提交链逐个快进
+    // 新增两个提交：一次快进到新的 tip
     write(dir, "a", b"2");
     commit(dir, "two", "1700000100 +0000");
     write(dir, "b", b"b");
@@ -274,7 +278,9 @@ async fn reimport_is_idempotent_and_incremental_import_fast_forwards() {
     let third = import(&c, dir, "main", "main", |_, _| {}).await.expect("incremental");
     let tip = c.resolve_ref("main").await.expect("ok").expect("ref");
     assert_eq!(Some(tip.changeset), third.tip);
-    assert_eq!(tip.version, 3);
+    assert_eq!(tip.version, 2, "one fast-forward for both commits");
+    let log = c.log("main", None, 10, None).await.expect("log");
+    assert_eq!(log.entries.len(), 3, "every imported commit is in the history");
 
     // 改写历史后再导入：拒绝
     git(dir, &["reset", "-q", "--hard", "HEAD~2"]);
@@ -282,6 +288,37 @@ async fn reimport_is_idempotent_and_incremental_import_fast_forwards() {
     commit(dir, "rewritten", "1700000300 +0000");
     let err = import(&c, dir, "main", "main", |_, _| {}).await.expect_err("diverged");
     assert!(matches!(err, Error::Diverged { .. }), "{err:?}");
+}
+
+/// 历史超过服务端单次合入上限时分段快进，每个提交的 change id 都被记录。
+#[tokio::test(flavor = "multi_thread")]
+async fn long_history_lands_in_steps() {
+    let mut config = ServerConfig::default();
+    config.land.stack.max_stack = 2;
+    let srv = server_with(config).await;
+    let c = Client::builder()
+        .endpoint(&srv.url)
+        .repo("imported")
+        .build()
+        .await
+        .expect("connect");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    git(dir, &["init", "-q", "-b", "main"]);
+    for i in 0..5 {
+        write(dir, "a", format!("{i}").as_bytes());
+        commit(dir, &format!("c{i}"), &format!("{} +0000", 1_700_000_000 + i));
+    }
+    // 一次快进 5 个提交超过上限
+    let err = import(&c, dir, "main", "main", |_, _| {}).await.expect_err("too many");
+    assert!(err.to_string().contains("more than 2"), "{err}");
+    let summary = import_with(&c, dir, "main", "main", Options { land_step: 2 }, |_, _| {})
+        .await
+        .expect("in steps");
+    let tip = c.resolve_ref("main").await.expect("ok").expect("ref");
+    assert_eq!(Some(tip.changeset), summary.tip);
+    assert_eq!(tip.version, 3, "2 + 2 + 1 commits");
+    assert_eq!(c.log("main", None, 10, None).await.expect("log").entries.len(), 5);
 }
 
 #[tokio::test(flavor = "multi_thread")]

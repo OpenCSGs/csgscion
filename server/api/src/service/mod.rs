@@ -7,7 +7,7 @@ mod server_info;
 mod support;
 mod write;
 
-pub use land::LandSvc;
+pub use land::{FORWARDED_HEADER, LandSvc};
 pub use object::ObjectSvc;
 pub use query::QuerySvc;
 pub use refs::RefSvc;

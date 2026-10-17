@@ -4,21 +4,59 @@ package scion.v1;
 
 // 合入：把 ref 移到指定提交。
 service LandService {
-  // M1：直接 CAS。ref 不存在时创建；存在时提交的 first parent 必须等于 ref 当前提交，否则返回
-  // NOT_FAST_FORWARD。提交已经是 ref 当前提交时直接成功（重试安全）。服务端 rebase 在后续版本加入。
+  // ref 不存在时创建。提交已在 ref 的历史中时直接返回当前状态（重试安全）。提交是 ref 当前提交的
+  // 后继时快进；否则在服务端把提交栈（从提交沿第一父往回、直到 ref 历史中的提交为止）rebase 到
+  // ref 当前提交上，与 ref 上的改动冲突时返回 MERGE_CONFLICT（详情见 ErrorReason 的说明）。
+  // 服务端声明 feature "land.rebase" 时可用；fast_forward_only 为 true 时保持只快进的行为。
   rpc Land(LandRequest) returns (LandResponse);
+  // 按 request_id 查询合入结果（客户端超时后确认是否已合入）。成功的合入结果保留 24 小时；
+  // 未收到、仍在处理、失败或已过期的请求返回 LAND_STATE_UNKNOWN，可以用同一个 request_id 重试。
+  rpc GetLandStatus(GetLandStatusRequest) returns (GetLandStatusResponse);
 }
 
 message LandRequest {
   string repo = 1;
-  // 客户端生成的 UUIDv7，用于幂等。
+  // 客户端生成的 UUIDv7，用于幂等：同一个 id 的重试直接返回第一次成功的结果（保留 24 小时），
+  // 参数不同则返回 INVALID_ARGUMENT。
   string request_id = 2;
   string ref = 3;
   bytes changeset_id = 4;
+  // 只允许快进：提交不是 ref 当前提交的后继时返回 NOT_FAST_FORWARD，不做 rebase。
+  bool fast_forward_only = 5;
 }
 
 message LandResponse {
   // 合入后 ref 指向的提交。
   bytes tip = 1;
   uint64 ref_version = 2;
+  // 本次合入的提交，从旧到新。经过 rebase 时 landed_id 与 changeset_id 不同。
+  // 为空表示提交早已在 ref 的历史中。
+  repeated LandedChangeset landed = 3;
+  // 栈中早已合入过这个 ref 的 change（同一 ref 上每个 change_id 只合入一次），不会重复合入。
+  repeated LandedChangeset previously_landed = 4;
+}
+
+enum LandState {
+  LAND_STATE_UNSPECIFIED = 0;
+  LAND_STATE_UNKNOWN = 1;
+  LAND_STATE_LANDED = 2;
+}
+
+message GetLandStatusRequest {
+  string repo = 1;
+  string request_id = 2;
+}
+
+message GetLandStatusResponse {
+  LandState state = 1;
+  // state 为 LAND_STATE_LANDED 时是第一次合入的结果。
+  LandResponse result = 2;
+}
+
+message LandedChangeset {
+  // 客户端提交的 changeset。
+  bytes changeset_id = 1;
+  // 进入 ref 历史的 changeset（未经 rebase 时与 changeset_id 相同）。
+  bytes landed_id = 2;
+  bytes change_id = 3;
 }

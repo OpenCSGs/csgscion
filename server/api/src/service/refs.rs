@@ -73,8 +73,8 @@ mod tests {
             .create(REPO, &spec_to_changeset(spec(&[], vec![]), 10).expect("s"))
             .await
             .expect("a");
-        LandSvc::new(store.clone())
-            .land(REPO, "main", a.id)
+        LandSvc::new(scion_land::Coordinator::new(w.writer().clone(), Default::default()))
+            .land(REPO, "main", a.id, false)
             .await
             .expect("land");
 

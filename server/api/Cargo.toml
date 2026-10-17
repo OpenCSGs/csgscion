@@ -13,12 +13,16 @@ scion-proto.workspace = true
 scion-store.workspace = true
 scion-tree.workspace = true
 scion-query.workspace = true
+scion-land.workspace = true
+scion-merge.workspace = true
 hex.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true
 tonic-health.workspace = true
 tonic-types.workspace = true
+tower.workspace = true
+http.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

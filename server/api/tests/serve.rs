@@ -171,3 +171,65 @@ async fn upload_blobs_stream_errors() {
     tx.send(()).expect("shutdown");
     server.await.expect("join").expect("clean exit");
 }
+
+/// 按仓库的写入速率限制：超过后返回可重试的 RESOURCE_EXHAUSTED / RATE_LIMITED，其它仓库不受影响。
+#[tokio::test]
+async fn repo_write_rate_limit() {
+    use scion_proto::v1::write_service_client::WriteServiceClient;
+    use scion_proto::v1::{ChangesetSpec, CreateChangesetRequest, Signature};
+    use tonic_types::StatusExt;
+
+    let store = Arc::new(MemStore::new());
+    store.create_repo("hot").await.expect("repo");
+    store.create_repo("cold").await.expect("repo");
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let (tx, rx) = oneshot::channel::<()>();
+    let config = ServerConfig {
+        repo_write_rate: Some(scion_api::WriteRate {
+            per_second: 1,
+            burst: 2,
+        }),
+        ..ServerConfig::default()
+    };
+    let app = App {
+        config: Arc::new(config),
+        meta: store.clone(),
+        blobs: store,
+    };
+    let server = tokio::spawn(serve(listener, app, async {
+        let _ = rx.await;
+    }));
+    let mut c = WriteServiceClient::connect(format!("http://{addr}"))
+        .await
+        .expect("connect");
+    let sig = Signature {
+        name: "a".into(),
+        email: "a@x".into(),
+        time_ms: 0,
+        tz_offset_minutes: 0,
+    };
+    let req = |repo: &str, n: u8| CreateChangesetRequest {
+        repo: repo.into(),
+        request_id: String::new(),
+        changeset: Some(ChangesetSpec {
+            parents: vec![],
+            author: Some(sig.clone()),
+            committer: Some(sig.clone()),
+            message: format!("m{n}"),
+            change_id: Bytes::from(vec![n; 16]),
+            delta: vec![],
+            extensions: Default::default(),
+        }),
+    };
+    c.create_changeset(req("hot", 1)).await.expect("1");
+    c.create_changeset(req("hot", 2)).await.expect("2 (burst)");
+    let err = c.create_changeset(req("hot", 3)).await.expect_err("limited");
+    assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+    let info = err.get_error_details().error_info().cloned().expect("info");
+    assert_eq!(info.reason, "RATE_LIMITED");
+    assert!(info.metadata["retry_after_ms"].parse::<u64>().expect("ms") > 0);
+    c.create_changeset(req("cold", 4)).await.expect("other repo unaffected");
+    let _ = tx.send(());
+    server.await.expect("join").expect("serve");
+}

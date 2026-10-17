@@ -249,10 +249,10 @@ Changeset { parents, author, committer, time, message, change_id, delta: [FileCh
 | `cs_tree` | (repo_id, cs_id) | root tree id |
 | `refs` | (repo_id, name) | target, version；**唯一的可变状态** |
 | `ref_log` | (repo_id, name, version) | 审计记录 |
-| `landed` | (repo_id, ref, change_id) UNIQUE | 防止同一个 change 重复合入 |
+| `landed` | (repo_id, ref, change_id) | 防止同一个 change 重复合入（M3 实现） |
 | `derived` | (repo_id, kind, kind_version, cs_id) | 派生数据的值或指针 |
-| `idempotency` | (repo_id, request_id) | 带 TTL |
-| `leases` | (scope) | land leader 和 deriver 分片的租约 |
+| `idempotency` | (repo_id, request_id) | 带 TTL（M3 实现，默认 24 小时） |
+| `leases` | (scope) | land leader 和 deriver 分片的租约（M3 实现 land leader） |
 
 热点规避：Distributed 档的表都以 `HASH(repo_id)` 作为分片键，避免同一个仓库的写入集中到单个 tablet；`cs_log` 的序号做法见上表。Standard 和 Lite 档不需要处理热点。
 
@@ -373,7 +373,7 @@ xtask/                 仓库维护任务：cargo xtask layers（依赖方向检
 
 **分层规则**（`cargo xtask layers` 在 CI 中检查，只检查普通依赖，dev-dependencies 不受限）：
 - 区域规则：`common` 只依赖 `common`；`client` 只依赖 `common` 和 `client`；`server` 只依赖 `common` 和 `server`。区域由 crate 所在的顶层目录自动判定。
-- 服务端内部按层：`store` ← `store-sql/store-blob` ← `tree/merge/derive` ← `land/query` ← `api` ← `scion`，只能依赖更低层；新增服务端 crate 必须在 xtask 中登记层级，否则检查失败。`authz` 只在 `api` 层生效。
+- 服务端内部按层：`store` ← `store-sql/store-blob` ← `tree` ← `merge/derive/query` ← `land` ← `api` ← `scion`，只能依赖更低层；新增服务端 crate 必须在 xtask 中登记层级，否则检查失败。`authz` 只在 `api` 层生效。
 
 ### 5.2 运行时与关键依赖
 | 用途 | crate |
@@ -613,6 +613,16 @@ SDK、工作副本、daemon 和 CLI 的完整设计见 [`rust-client-architectur
 > - **推迟到后续里程碑**：通用 Deriver 框架与独立的 deriver 进程（M3/M4）；PathIndex。blame 只沿第一父提交链追溯，按路径过滤的 log 不跟踪重命名。
 | **M2 派生与查询** | 3 周 | 派生框架、Gen/SkipList/PathHistory/Blame、Log/Blame/Diff/MergeBase、deriver 进程 | 在 10 万提交的仓库上，查询 p99 小于 100 毫秒 |
 | **M3 高并发** | 3 周 | LandCoordinator 批处理和租约、幂等表、限流与过载丢弃、lincheck | 单 ref 每秒 200 次以上 land；leader 被杀时没有重复或丢失的合入 |
+
+> **M3 实现说明**（2026-10-17）：
+> - **服务端 rebase**（`server/merge`）：只比较 delta 涉及的路径在 base 与 onto 中的条目，未变化的直接应用，代价与仓库大小和中间提交数无关；双方都改的文件按行 diff3（diffy），可执行位按三方规则合并；二进制、符号链接、超过 8 MiB、修改/删除、双方新增、文件/目录冲突都报 MERGE_CONFLICT，详情放在 ErrorInfo metadata（`path.N`、`kind.N`、`base.N`、`ours.N`、`theirs.N`）。比 §6.3 的「path_history 求交集」更直接，结果相同。
+> - **Land 默认 rebase**：从提交沿第一父往回到 ref 历史中的提交为止是待合入的栈，快进或逐个 rebase；`fast_forward_only` 保留只快进的语义（git 导入使用）。rebase 后的提交保留作者、说明与 change id，去掉 `git.sha1`。
+> - **幂等与去重**：`land_commit` 在一个事务里更新 ref、写 `landed`（同一 ref 上每个 change id 只合入一次）和 `idempotency`（同一 request id 返回第一次成功的结果，参数不同则 INVALID_ARGUMENT，保留 24 小时）。只记录成功的结果：失败的请求什么都没写，重试会重新执行。`GetLandStatus` 按 request id 查询。SDK 在可重试错误下用同一个 request id 重试。
+> - **LandCoordinator**（`server/land`）：每个 ref 一个任务，最多 64 个请求或 5 ms 一批，按顺序 rebase，冲突的请求单独失败；批内的 rebase 结果先放在内存（写后缓冲），后续请求直接在上面继续，整批最后批量写入（对象并发写，`index_paths_many` / `put_changesets` 多行插入），一次 `land_commit` 提交。
+> - **集群**：`scion server --advertise-url URL` 开启。每个 ref 的任务持有租约（`leases` 表，TTL 5 秒，2 秒续约），其它节点收到 `NotLeader` 后通过 gRPC 转发（`x-scion-forwarded`，不再二次转发）。正常退出时释放租约，其它节点立即接管；进程被杀时等租约到期。ref 版本号是 fencing token，两个节点短暂同时认为自己是 leader 也不会写坏 ref。
+> - **过载保护**：全局在途请求上限（超过立即拒绝，RESOURCE_EXHAUSTED / RATE_LIMITED，带 `retry_after_ms`），按仓库的写入令牌桶（`--repo-write-rate`）。
+> - **验收**：`server/land/tests/bench.rs`（2000 个请求、200 个并发客户端、同一个 ref、对象在内存）：PostgreSQL 885 次/秒（p99 379 ms），SQLite 1921 次/秒（p99 173 ms）。`server/land/tests/lincheck.rs` 检查不重复、不丢失、不凭空出现和实时顺序，覆盖单节点并发冲突、两节点转发、合入进行中杀掉 leader（SQLite 元数据，客户端用同一个 request id 重试）。
+> - **推迟**：冷 ref 不启用 leader 的自动判定（目前所有 ref 都走批处理任务，空闲退出）；按租户限流与 deadline 传递在 M5 与认证一起做。
 | **M4 缓存层** | 3 周 | `scion cache`(foyer + rendezvous + singleflight + 对冲)、WatchRefs、预热 | L2 命中率不低于 99%；单节点 20 万对象读/秒以上 |
 | **M5 生产化** | 4 周 | YugabyteDB 档与 `migrate-meta` 工具、ACL/OIDC/JWT、redaction、OTel、Helm、混沌测试、多区域 follower read、`conformance` 发布 | 全部 SLO 达标；单 AZ 故障演练通过 |
 

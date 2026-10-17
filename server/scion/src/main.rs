@@ -89,8 +89,49 @@ struct ServerArgs {
     /// 启动时确保存在的仓库（已存在则跳过），可重复指定。
     #[arg(long = "repo", value_name = "NAME")]
     repos: Vec<String>,
+    /// 集群模式：本节点供其它节点访问的地址（如 http://10.0.0.5:7080）。多个节点共享同一个元数据库与
+    /// 对象存储时，每个 ref 的合入由持有租约的节点处理，其它节点转发给它。
+    #[arg(long, value_name = "URL", env = "SCION_ADVERTISE_URL", conflicts_with = "lite")]
+    advertise_url: Option<String>,
+    /// 全局在途请求上限，超过时立即拒绝（客户端可重试）。
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 10_000,
+        env = "SCION_MAX_CONCURRENT_REQUESTS"
+    )]
+    max_concurrent_requests: usize,
+    /// 按仓库的写入速率限制：每秒 RATE 次，可选突发 BURST（默认等于 2×RATE），如 200 或 200/1000。
+    #[arg(long, value_name = "RATE[/BURST]", value_parser = parse_write_rate, env = "SCION_REPO_WRITE_RATE")]
+    repo_write_rate: Option<scion_api::WriteRate>,
     #[command(flatten)]
     storage: StorageArgs,
+}
+
+fn parse_write_rate(s: &str) -> Result<scion_api::WriteRate, String> {
+    let (rate, burst) = match s.split_once('/') {
+        Some((r, b)) => (r, Some(b)),
+        None => (s, None),
+    };
+    let rate: u32 = rate
+        .trim()
+        .parse()
+        .ok()
+        .filter(|r| *r > 0)
+        .ok_or_else(|| format!("invalid rate {rate:?}; expected a positive integer"))?;
+    let burst = match burst {
+        Some(b) => b
+            .trim()
+            .parse()
+            .ok()
+            .filter(|b| *b > 0)
+            .ok_or_else(|| format!("invalid burst {b:?}; expected a positive integer"))?,
+        None => rate.saturating_mul(2),
+    };
+    Ok(scion_api::WriteRate {
+        per_second: rate,
+        burst,
+    })
 }
 
 fn init_tracing(format: LogFormat) {
@@ -123,6 +164,13 @@ fn scion_proto_version() -> &'static str {
 
 /// 打开存储并确保 `--repo` 指定的仓库存在。
 async fn build_app(args: &ServerArgs, env: impl Fn(&str) -> Option<String>) -> anyhow::Result<(App, String)> {
+    let cluster = match &args.advertise_url {
+        Some(url) if url.starts_with("http://") || url.starts_with("https://") => {
+            Some(scion_land::ClusterConfig::new(url.trim_end_matches('/')))
+        }
+        Some(url) => anyhow::bail!("--advertise-url must be an http:// or https:// URL, got {url:?}"),
+        None => None,
+    };
     let (meta_spec, blob_spec) = args.storage.specs()?;
     let (meta, blobs) = storage::open(&meta_spec, &blob_spec, env).await?;
     for repo in &args.repos {
@@ -132,7 +180,12 @@ async fn build_app(args: &ServerArgs, env: impl Fn(&str) -> Option<String>) -> a
         }
     }
     let app = App {
-        config: Arc::new(ServerConfig::default()),
+        config: Arc::new(ServerConfig {
+            cluster,
+            max_concurrent_requests: args.max_concurrent_requests,
+            repo_write_rate: args.repo_write_rate,
+            ..ServerConfig::default()
+        }),
         meta,
         blobs,
     };
@@ -295,6 +348,68 @@ mod tests {
         // 重启时仓库已存在，不应失败
         let (app, _) = build_app(&a, no_env).await.expect("restart");
         assert_eq!(app.meta.list_repos().await.expect("list"), ["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn build_app_cluster_mode_from_advertise_url() {
+        let (app, _) = build_app(&args(&["--advertise-url", "http://10.0.0.5:7080/"]), no_env)
+            .await
+            .expect("app");
+        assert_eq!(
+            app.config.cluster.as_ref().map(|c| c.node.as_str()),
+            Some("http://10.0.0.5:7080")
+        );
+        let (app, _) = build_app(&args(&[]), no_env).await.expect("app");
+        assert!(app.config.cluster.is_none());
+        assert!(
+            build_app(&args(&["--advertise-url", "10.0.0.5:7080"]), no_env)
+                .await
+                .is_err()
+        );
+        let lite = Cli::try_parse_from([
+            "scion",
+            "server",
+            "--lite",
+            "--data-dir",
+            "/d",
+            "--advertise-url",
+            "http://x",
+        ]);
+        assert!(lite.is_err(), "lite mode is single-node");
+    }
+
+    #[test]
+    fn write_rate_flag() {
+        let r = |v| parse_write_rate(v).map(|w| (w.per_second, w.burst));
+        assert_eq!(r("200"), Ok((200, 400)));
+        assert_eq!(r("200/1000"), Ok((200, 1000)));
+        assert_eq!(r(" 5 / 7 "), Ok((5, 7)));
+        for bad in ["", "0", "-1", "x", "5/0", "5/x"] {
+            assert!(r(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn build_app_applies_overload_settings() {
+        let (app, _) = build_app(
+            &args(&["--max-concurrent-requests", "64", "--repo-write-rate", "10/20"]),
+            no_env,
+        )
+        .await
+        .expect("app");
+        assert_eq!(app.config.max_concurrent_requests, 64);
+        assert_eq!(
+            app.config.repo_write_rate,
+            Some(scion_api::WriteRate {
+                per_second: 10,
+                burst: 20
+            })
+        );
+        let (app, _) = build_app(&args(&[]), no_env).await.expect("defaults");
+        assert_eq!(
+            (app.config.max_concurrent_requests, app.config.repo_write_rate),
+            (10_000, None)
+        );
     }
 
     #[tokio::test]

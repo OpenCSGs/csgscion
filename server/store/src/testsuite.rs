@@ -9,7 +9,8 @@ use bytes::Bytes;
 use scion_object::{ObjectId, ObjectKind};
 
 use crate::{
-    BlobStore, ChangesetRecord, Error, IndexedObject, MetaStore, PathChange, PathHistoryEntry, RefExpect, RefState,
+    BlobStore, ChangesetRecord, Error, IdempotencyRecord, IndexedObject, LandedChange, Lease, MetaStore, PathChange,
+    PathHistoryEntry, RefExpect, RefState,
 };
 
 fn cs(n: u8) -> ObjectId {
@@ -483,6 +484,252 @@ pub async fn fp_skip_chain<S: MetaStore>(s: &S) {
 }
 
 /// 并发 CAS：同一版本上的多个竞争者恰好只有一个成功，且版本严格连续。
+/// 批量写入记录与路径索引：结果与逐条写入相同，跨越 SQL 分块边界，已存在的记录保留第一次的值。
+pub async fn batch_writes<S: MetaStore + ?Sized>(s: &S) {
+    s.create_repo("batch").await.expect("create");
+    let tree = ObjectId::hash(ObjectKind::Tree, b"t");
+    let id = |n: u32| ObjectId::hash(ObjectKind::Changeset, &n.to_be_bytes());
+    let recs: Vec<ChangesetRecord> = (1..=200u32)
+        .map(|n| ChangesetRecord {
+            id: id(n),
+            root_tree: tree,
+            parents: if n == 1 { vec![] } else { vec![id(n - 1), id(1)] },
+            generation: u64::from(n),
+            fp_depth: u64::from(n),
+            fp_jump: (n > 1).then(|| id(1)),
+        })
+        .collect();
+    // 第一条先单独写入一个不同的值：批量写入不覆盖
+    let first = ChangesetRecord {
+        fp_depth: 0,
+        ..recs[0].clone()
+    };
+    s.put_changeset("batch", &first).await.expect("put");
+    s.put_changesets("batch", &recs).await.expect("batch put");
+    s.put_changesets("batch", &[]).await.expect("empty");
+    assert_eq!(s.get_changeset("batch", &id(1)).await, Ok(Some(first)));
+    for r in &recs[1..] {
+        assert_eq!(s.get_changeset("batch", &r.id).await.as_ref(), Ok(&Some(r.clone())));
+    }
+    // 路径索引：300 条，跨越多个提交
+    let entries: Vec<(ObjectId, u64, Vec<PathChange>)> = (1..=30u32)
+        .map(|n| {
+            let changes = (0..10)
+                .map(|k| PathChange {
+                    path: format!("d{k}/f"),
+                    deleted: n % 7 == 0,
+                })
+                .collect();
+            (id(n), u64::from(n), changes)
+        })
+        .collect();
+    s.index_paths_many("batch", &entries).await.expect("index");
+    s.index_paths_many("batch", &entries).await.expect("idempotent");
+    s.index_paths_many("batch", &[]).await.expect("empty");
+    s.index_paths_many("batch", &[(id(31), 31, vec![])])
+        .await
+        .expect("no changes");
+    let hist = s.path_history("batch", "d3", 100, 100).await.expect("history");
+    assert_eq!(hist.len(), 30);
+    assert_eq!((hist[0].cs, hist[0].generation), (id(30), 30));
+    assert!(hist.iter().find(|e| e.cs == id(7)).expect("7").deleted);
+    assert_eq!(s.path_history("batch", "d0/f", 100, 100).await.expect("file").len(), 30);
+    for r in [
+        s.put_changesets("nope", &recs[..1]).await.err(),
+        s.index_paths_many("nope", &entries[..1]).await.err(),
+    ] {
+        assert!(matches!(r, Some(Error::RepoNotFound(_))), "{r:?}");
+    }
+}
+
+/// 租约：空闲时可以申请、持有者续约不换 token、未过期时别人申请不到、过期后被接管（token 加 1）、释放后立即可被接管。
+pub async fn leases<S: MetaStore + ?Sized>(s: &S) {
+    let l = s
+        .acquire_lease("land/r/main", "node-a", 1_000, 10_000)
+        .await
+        .expect("acquire");
+    assert_eq!(
+        l,
+        Lease {
+            holder: "node-a".into(),
+            token: 1,
+            expires_at_ms: 11_000
+        }
+    );
+    // 续约
+    let l = s
+        .acquire_lease("land/r/main", "node-a", 1_000, 10_500)
+        .await
+        .expect("renew");
+    assert_eq!((l.token, l.expires_at_ms), (1, 11_500));
+    // 未过期：别人申请到的是现有租约
+    let l = s
+        .acquire_lease("land/r/main", "node-b", 1_000, 11_000)
+        .await
+        .expect("contend");
+    assert_eq!((l.holder.as_str(), l.token, l.expires_at_ms), ("node-a", 1, 11_500));
+    // 其它 scope 互不影响
+    let other = s
+        .acquire_lease("land/r/dev", "node-b", 1_000, 11_000)
+        .await
+        .expect("other scope");
+    assert_eq!((other.holder.as_str(), other.token), ("node-b", 1));
+    // 到期（含边界）后被接管
+    let l = s
+        .acquire_lease("land/r/main", "node-b", 1_000, 11_500)
+        .await
+        .expect("take over");
+    assert_eq!((l.holder.as_str(), l.token, l.expires_at_ms), ("node-b", 2, 12_500));
+    // 非持有者释放无效；持有者释放后立即可被接管
+    s.release_lease("land/r/main", "node-a").await.expect("noop release");
+    let l = s
+        .acquire_lease("land/r/main", "node-a", 1_000, 11_600)
+        .await
+        .expect("still b");
+    assert_eq!(l.holder, "node-b");
+    s.release_lease("land/r/main", "node-b").await.expect("release");
+    let l = s
+        .acquire_lease("land/r/main", "node-a", 1_000, 11_700)
+        .await
+        .expect("after release");
+    assert_eq!((l.holder.as_str(), l.token), ("node-a", 3));
+    s.release_lease("missing", "node-a")
+        .await
+        .expect("release missing scope");
+}
+
+/// 合入的原子提交：ref CAS、landed 行与幂等记录同成同败；已存在的记录保留第一次的值。
+pub async fn landing<S: MetaStore + ?Sized>(s: &S) {
+    s.create_repo("land").await.expect("create");
+    s.create_repo("land2").await.expect("create");
+    let change = |n: u8, v: u64| LandedChange {
+        change_id: [n; 16],
+        changeset: cs(n),
+        landed: cs(n + 100),
+        ref_version: v,
+    };
+    let req = |id: &str, fp: &[u8], t: i64| IdempotencyRecord {
+        request_id: id.to_owned(),
+        fingerprint: fp.to_vec(),
+        response: format!("resp-{id}").into_bytes(),
+        created_at_ms: t,
+    };
+    assert_eq!(s.landed_changes("land", "main", &[[1; 16]]).await, Ok(vec![]));
+    assert_eq!(s.get_idempotency("land", "r1").await, Ok(None));
+
+    let st = s
+        .land_commit(
+            "land",
+            "main",
+            RefExpect::Absent,
+            cs(101),
+            &[change(1, 1)],
+            &[req("r1", b"fp1", 1_000)],
+        )
+        .await
+        .expect("first land");
+    assert_eq!(
+        st,
+        RefState {
+            target: cs(101),
+            version: 1
+        }
+    );
+    assert_eq!(s.get_ref("land", "main").await, Ok(Some(st)));
+    assert_eq!(
+        s.landed_changes("land", "main", &[[1; 16], [2; 16]]).await,
+        Ok(vec![change(1, 1)])
+    );
+    assert_eq!(
+        s.get_idempotency("land", "r1").await,
+        Ok(Some(req("r1", b"fp1", 1_000)))
+    );
+    // 作用域：ref 与仓库都参与区分
+    assert_eq!(s.landed_changes("land", "dev", &[[1; 16]]).await, Ok(vec![]));
+    assert_eq!(s.get_idempotency("land2", "r1").await, Ok(None));
+
+    // 批量：多个 change 与请求；已存在的 change / 请求保留第一次的记录
+    let st = s
+        .land_commit(
+            "land",
+            "main",
+            RefExpect::Version(1),
+            cs(103),
+            &[change(1, 2), change(2, 2), change(3, 2)],
+            &[
+                req("r1", b"other", 2_000),
+                req("r2", b"fp2", 2_000),
+                req("r3", b"fp3", 3_000),
+            ],
+        )
+        .await
+        .expect("batch");
+    assert_eq!(st.version, 2);
+    let mut got = s
+        .landed_changes("land", "main", &[[1; 16], [2; 16], [3; 16]])
+        .await
+        .expect("landed");
+    got.sort_by_key(|c| c.change_id);
+    assert_eq!(got, vec![change(1, 1), change(2, 2), change(3, 2)]);
+    assert_eq!(
+        s.get_idempotency("land", "r1").await,
+        Ok(Some(req("r1", b"fp1", 1_000)))
+    );
+    assert_eq!(
+        s.get_idempotency("land", "r3").await,
+        Ok(Some(req("r3", b"fp3", 3_000)))
+    );
+
+    // 条件不满足：什么都不写
+    let err = s
+        .land_commit(
+            "land",
+            "main",
+            RefExpect::Version(1),
+            cs(104),
+            &[change(4, 2)],
+            &[req("r4", b"fp4", 4_000)],
+        )
+        .await;
+    assert!(matches!(err, Err(Error::RefVersionMismatch { current: Some(2), .. })));
+    assert_eq!(s.landed_changes("land", "main", &[[4; 16]]).await, Ok(vec![]));
+    assert_eq!(s.get_idempotency("land", "r4").await, Ok(None));
+    assert_eq!(
+        s.get_ref("land", "main").await.expect("get").map(|r| r.version),
+        Some(2)
+    );
+    // cas_ref 等价于不带记录的 land_commit
+    assert_eq!(
+        s.cas_ref("land", "main", RefExpect::Version(2), cs(105))
+            .await
+            .map(|r| r.version),
+        Ok(3)
+    );
+
+    // 过期清理：只删除早于界限的记录，跨仓库生效
+    s.land_commit("land2", "main", RefExpect::Absent, cs(1), &[], &[req("old", b"x", 500)])
+        .await
+        .expect("land2");
+    assert_eq!(s.expire_idempotency(2_000).await, Ok(2), "r1 (1000) and old (500)");
+    assert_eq!(s.get_idempotency("land", "r1").await, Ok(None));
+    assert_eq!(s.get_idempotency("land2", "old").await, Ok(None));
+    assert!(
+        s.get_idempotency("land", "r2").await.expect("ok").is_some(),
+        "boundary is exclusive"
+    );
+    assert_eq!(s.expire_idempotency(0).await, Ok(0));
+
+    for r in [
+        s.landed_changes("nope", "main", &[[1; 16]]).await.err(),
+        s.get_idempotency("nope", "r").await.err(),
+        s.land_commit("nope", "main", RefExpect::Absent, cs(1), &[], &[])
+            .await
+            .err(),
+    ] {
+        assert!(matches!(r, Some(Error::RepoNotFound(_))), "{r:?}");
+    }
+}
+
 pub async fn concurrent_cas<S: MetaStore>(s: Arc<S>) {
     const WRITERS: u8 = 16;
     const ROUNDS: u64 = 20;

@@ -121,6 +121,9 @@ fn fail(e: &CliError, json: bool) -> ExitCode {
         println!("{}", serde_json::to_string(&out).unwrap_or_default());
     } else {
         eprintln!("scn: {}", out.error);
+        for c in &out.conflicts {
+            eprintln!("  conflict ({}): {}", c.kind, c.path);
+        }
         if let Some(h) = out.hint {
             eprintln!("hint: {h}");
         }

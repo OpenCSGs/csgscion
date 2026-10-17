@@ -10,7 +10,10 @@ use async_trait::async_trait;
 use moka::sync::Cache;
 use scion_object::ObjectId;
 
-use crate::{ChangesetRecord, IndexedObject, MetaStore, PathChange, PathHistoryEntry, RefExpect, RefState, Result};
+use crate::{
+    ChangesetRecord, IdempotencyRecord, IndexedObject, LandedChange, Lease, MetaStore, PathChange, PathHistoryEntry,
+    RefExpect, RefState, Result,
+};
 
 /// 在任意 [`MetaStore`] 外加一层提交记录缓存。
 pub struct CachedMeta {
@@ -77,8 +80,38 @@ impl MetaStore for CachedMeta {
         self.inner.get_ref(repo, name).await
     }
 
-    async fn cas_ref(&self, repo: &str, name: &str, expect: RefExpect, target: ObjectId) -> Result<RefState> {
-        self.inner.cas_ref(repo, name, expect, target).await
+    async fn land_commit(
+        &self,
+        repo: &str,
+        name: &str,
+        expect: RefExpect,
+        target: ObjectId,
+        landed: &[LandedChange],
+        requests: &[IdempotencyRecord],
+    ) -> Result<RefState> {
+        self.inner
+            .land_commit(repo, name, expect, target, landed, requests)
+            .await
+    }
+
+    async fn landed_changes(&self, repo: &str, name: &str, change_ids: &[[u8; 16]]) -> Result<Vec<LandedChange>> {
+        self.inner.landed_changes(repo, name, change_ids).await
+    }
+
+    async fn get_idempotency(&self, repo: &str, request_id: &str) -> Result<Option<IdempotencyRecord>> {
+        self.inner.get_idempotency(repo, request_id).await
+    }
+
+    async fn expire_idempotency(&self, before_ms: i64) -> Result<u64> {
+        self.inner.expire_idempotency(before_ms).await
+    }
+
+    async fn acquire_lease(&self, scope: &str, holder: &str, ttl_ms: i64, now_ms: i64) -> Result<Lease> {
+        self.inner.acquire_lease(scope, holder, ttl_ms, now_ms).await
+    }
+
+    async fn release_lease(&self, scope: &str, holder: &str) -> Result<()> {
+        self.inner.release_lease(scope, holder).await
     }
 
     async fn index_objects(&self, repo: &str, objects: &[IndexedObject]) -> Result<()> {
@@ -96,6 +129,10 @@ impl MetaStore for CachedMeta {
     async fn put_changeset(&self, repo: &str, rec: &ChangesetRecord) -> Result<()> {
         // 不在写入时缓存：写入可能因为已存在而被忽略，以存储中的第一次写入为准
         self.inner.put_changeset(repo, rec).await
+    }
+
+    async fn put_changesets(&self, repo: &str, recs: &[ChangesetRecord]) -> Result<()> {
+        self.inner.put_changesets(repo, recs).await
     }
 
     async fn get_changeset(&self, repo: &str, id: &ObjectId) -> Result<Option<ChangesetRecord>> {
@@ -141,6 +178,10 @@ impl MetaStore for CachedMeta {
 
     async fn index_paths(&self, repo: &str, cs: ObjectId, generation: u64, changes: &[PathChange]) -> Result<()> {
         self.inner.index_paths(repo, cs, generation, changes).await
+    }
+
+    async fn index_paths_many(&self, repo: &str, entries: &[(ObjectId, u64, Vec<PathChange>)]) -> Result<()> {
+        self.inner.index_paths_many(repo, entries).await
     }
 
     async fn path_history(
@@ -205,6 +246,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_landing() {
+        testsuite::landing(&cached()).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_leases() {
+        testsuite::leases(&cached()).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_batch_writes() {
+        testsuite::batch_writes(&cached()).await;
+    }
+
+    #[tokio::test]
     async fn conformance_history_index() {
         testsuite::history_index(&cached()).await;
     }
@@ -239,8 +295,38 @@ mod tests {
         async fn get_ref(&self, repo: &str, name: &str) -> Result<Option<RefState>> {
             self.inner.get_ref(repo, name).await
         }
-        async fn cas_ref(&self, repo: &str, name: &str, expect: RefExpect, target: ObjectId) -> Result<RefState> {
-            self.inner.cas_ref(repo, name, expect, target).await
+        async fn land_commit(
+            &self,
+            repo: &str,
+            name: &str,
+            expect: RefExpect,
+            target: ObjectId,
+            landed: &[LandedChange],
+            requests: &[IdempotencyRecord],
+        ) -> Result<RefState> {
+            self.inner
+                .land_commit(repo, name, expect, target, landed, requests)
+                .await
+        }
+
+        async fn landed_changes(&self, repo: &str, name: &str, change_ids: &[[u8; 16]]) -> Result<Vec<LandedChange>> {
+            self.inner.landed_changes(repo, name, change_ids).await
+        }
+
+        async fn get_idempotency(&self, repo: &str, request_id: &str) -> Result<Option<IdempotencyRecord>> {
+            self.inner.get_idempotency(repo, request_id).await
+        }
+
+        async fn expire_idempotency(&self, before_ms: i64) -> Result<u64> {
+            self.inner.expire_idempotency(before_ms).await
+        }
+
+        async fn acquire_lease(&self, scope: &str, holder: &str, ttl_ms: i64, now_ms: i64) -> Result<Lease> {
+            self.inner.acquire_lease(scope, holder, ttl_ms, now_ms).await
+        }
+
+        async fn release_lease(&self, scope: &str, holder: &str) -> Result<()> {
+            self.inner.release_lease(scope, holder).await
         }
         async fn index_objects(&self, repo: &str, objects: &[IndexedObject]) -> Result<()> {
             self.inner.index_objects(repo, objects).await

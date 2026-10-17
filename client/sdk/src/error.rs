@@ -36,6 +36,26 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// 合入时的冲突详情（服务端最多列出 32 个路径，`count` 为总数）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeConflict {
+    /// 冲突的原提交（待合入栈中的提交）。
+    pub changeset: Option<ObjectId>,
+    pub count: usize,
+    pub paths: Vec<ConflictPath>,
+}
+
+/// 一个冲突路径。blob id 为 `None` 表示该方没有这个文件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictPath {
+    pub path: String,
+    /// content、add_add、modify_delete、delete_modify、binary、too_large、symlink、path。
+    pub kind: String,
+    pub base: Option<ObjectId>,
+    pub ours: Option<ObjectId>,
+    pub theirs: Option<ObjectId>,
+}
+
 impl Error {
     /// `ErrorInfo.reason`（仅 `Rpc` 错误）。
     pub fn reason(&self) -> Option<ErrorReason> {
@@ -60,6 +80,40 @@ impl Error {
             Error::Corrupt(_) => true,
             _ => false,
         }
+    }
+
+    /// MERGE_CONFLICT 错误的详情（服务端 rebase 时与 ref 上的改动冲突）。
+    pub fn merge_conflict(&self) -> Option<MergeConflict> {
+        let Error::Rpc {
+            reason: Some(ErrorReason::MergeConflict),
+            metadata,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let id = |k: &str| metadata.get(k).and_then(|v| v.parse::<ObjectId>().ok());
+        let mut paths = Vec::new();
+        for i in 0.. {
+            let Some(path) = metadata.get(&format!("path.{i}")) else {
+                break;
+            };
+            paths.push(ConflictPath {
+                path: path.clone(),
+                kind: metadata.get(&format!("kind.{i}")).cloned().unwrap_or_default(),
+                base: id(&format!("base.{i}")),
+                ours: id(&format!("ours.{i}")),
+                theirs: id(&format!("theirs.{i}")),
+            });
+        }
+        Some(MergeConflict {
+            changeset: id("changeset"),
+            count: metadata
+                .get("count")
+                .and_then(|c| c.parse().ok())
+                .unwrap_or(paths.len()),
+            paths,
+        })
     }
 
     pub fn is_not_found(&self) -> bool {
@@ -114,6 +168,54 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn merge_conflict_details_are_parsed() {
+        let blob = ObjectId::of_blob(b"b");
+        let cs = ObjectId::hash(scion_object::ObjectKind::Changeset, b"c");
+        let md = HashMap::from([
+            ("changeset".to_string(), cs.to_string()),
+            ("count".to_string(), "40".to_string()),
+            ("path.0".to_string(), "f".to_string()),
+            ("kind.0".to_string(), "content".to_string()),
+            ("base.0".to_string(), blob.to_string()),
+            ("ours.0".to_string(), blob.to_string()),
+            ("theirs.0".to_string(), String::new()),
+            ("path.1".to_string(), "g".to_string()),
+        ]);
+        let s = tonic::Status::with_error_details(
+            Code::Aborted,
+            "conflict",
+            ErrorDetails::with_error_info("MERGE_CONFLICT", "scion.dev", md),
+        );
+        let c = Error::from(s).merge_conflict().expect("conflict");
+        assert_eq!((c.changeset, c.count, c.paths.len()), (Some(cs), 40, 2));
+        assert_eq!(
+            c.paths[0],
+            ConflictPath {
+                path: "f".into(),
+                kind: "content".into(),
+                base: Some(blob),
+                ours: Some(blob),
+                theirs: None,
+            }
+        );
+        assert_eq!((c.paths[1].kind.as_str(), c.paths[1].base), ("", None));
+        // 缺少 count 时按列出的路径数
+        let s = tonic::Status::with_error_details(
+            Code::Aborted,
+            "conflict",
+            ErrorDetails::with_error_info("MERGE_CONFLICT", "scion.dev", HashMap::new()),
+        );
+        let c = Error::from(s).merge_conflict().expect("conflict");
+        assert_eq!((c.changeset, c.count), (None, 0));
+        assert!(
+            Error::from(status(Code::Aborted, "NOT_FAST_FORWARD", "scion.dev"))
+                .merge_conflict()
+                .is_none()
+        );
+        assert!(Error::MissingRepo.merge_conflict().is_none());
     }
 
     #[test]

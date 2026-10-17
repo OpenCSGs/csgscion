@@ -4,132 +4,58 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
+use scion_land::ChangesetWriter;
 use scion_object::{Changeset, EntryMode, FileChange, ObjectId, ObjectKind, Signature};
 use scion_proto::v1::write_service_server::WriteService;
 use scion_proto::v1::{
     self, ChangesetSpec, CreateChangesetRequest, CreateChangesetResponse, UploadBlobsRequest, UploadBlobsResponse,
     file_change,
 };
-use scion_store::{BlobStore, ChangesetRecord, IndexedObject, MetaStore, PathChange};
-use scion_tree::{BlobTreeSource, apply_delta};
+use scion_store::{BlobStore, ChangesetRecord, MetaStore};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::config::ServerConfig;
+use crate::limit::RateLimiter;
 use crate::service::support::{check_repo, parse_id};
 use crate::status;
 
 pub struct WriteSvc {
     config: Arc<ServerConfig>,
     meta: Arc<dyn MetaStore>,
-    blobs: Arc<dyn BlobStore>,
+    writer: Arc<ChangesetWriter>,
+    limiter: Option<Arc<RateLimiter>>,
 }
 
 impl WriteSvc {
     pub fn new(config: Arc<ServerConfig>, meta: Arc<dyn MetaStore>, blobs: Arc<dyn BlobStore>) -> Self {
-        Self { config, meta, blobs }
+        let writer = Arc::new(ChangesetWriter::new(meta.clone(), blobs.clone()));
+        Self {
+            config,
+            meta,
+            writer,
+            limiter: None,
+        }
     }
 
-    /// 写入对象字节并登记到仓库索引。顺序：先字节、后索引（索引里有的对象一定可读）。
+    /// 按仓库限制写入速率（上传与创建提交各算一次）。
+    pub fn with_rate_limit(mut self, limiter: Arc<RateLimiter>) -> Self {
+        self.limiter = Some(limiter);
+        self
+    }
+
+    pub(crate) fn writer(&self) -> &Arc<ChangesetWriter> {
+        &self.writer
+    }
+
+    /// 写入对象字节并登记到仓库索引（先字节、后索引）。
     async fn store(&self, repo: &str, objects: &[(ObjectId, Bytes)]) -> Result<(), Status> {
-        for (id, bytes) in objects {
-            self.blobs.put(*id, bytes.clone()).await.map_err(status::from_store)?;
-        }
-        let index: Vec<_> = objects
-            .iter()
-            .map(|(id, b)| IndexedObject {
-                id: *id,
-                size: b.len() as u64,
-            })
-            .collect();
-        self.meta.index_objects(repo, &index).await.map_err(status::from_store)
+        self.writer.store(repo, objects).await.map_err(status::from_land)
     }
 
     /// 校验并创建提交：父提交必须已存在，引用的文件必须已上传，delta 必须能应用到 first parent 上。
     pub(crate) async fn create(&self, repo: &str, cs: &Changeset) -> Result<ChangesetRecord, Status> {
         check_repo(self.meta.as_ref(), repo).await?;
-
-        let mut generation = 0u64;
-        let mut base = None;
-        let mut missing_parents = Vec::new();
-        for (i, p) in cs.parents.iter().enumerate() {
-            match self.meta.get_changeset(repo, p).await.map_err(status::from_store)? {
-                Some(rec) => {
-                    generation = generation.max(rec.generation);
-                    if i == 0 {
-                        base = Some(rec.root_tree);
-                    }
-                }
-                None => missing_parents.push(*p),
-            }
-        }
-        if !missing_parents.is_empty() {
-            return Err(status::objects_not_uploaded(&missing_parents));
-        }
-
-        let puts: Vec<(&str, ObjectId, u64)> = cs
-            .delta
-            .iter()
-            .filter_map(|c| match &c.op {
-                scion_object::FileOp::Put { id, size, .. } => Some((c.path.as_str(), *id, *size)),
-                scion_object::FileOp::Delete => None,
-            })
-            .collect();
-        let ids: Vec<ObjectId> = puts.iter().map(|(_, id, _)| *id).collect();
-        let sizes = self.meta.object_sizes(repo, &ids).await.map_err(status::from_store)?;
-        let mut missing: Vec<ObjectId> = ids.iter().filter(|id| !sizes.contains_key(id)).copied().collect();
-        missing.dedup();
-        if !missing.is_empty() {
-            return Err(status::objects_not_uploaded(&missing));
-        }
-        // 目录树里的 size 来自客户端声明，必须与实际上传的大小一致
-        for (path, id, declared) in &puts {
-            let actual = sizes[id];
-            if actual != *declared {
-                return Err(status::invalid_changeset(
-                    path,
-                    format!("{path:?} declares {declared} bytes but {id} is {actual} bytes"),
-                ));
-            }
-        }
-
-        let src = BlobTreeSource(self.blobs.clone());
-        let built = apply_delta(&src, base, &cs.delta).await.map_err(status::from_tree)?;
-
-        let cs_bytes = Bytes::from(cs.encode());
-        let cs_id = ObjectId::hash(ObjectKind::Changeset, &cs_bytes);
-        let mut objects = built.new_trees;
-        objects.push((cs_id, cs_bytes));
-        self.store(repo, &objects).await?;
-
-        let (fp_depth, fp_jump) = scion_store::fp_skip(self.meta.as_ref(), repo, cs.first_parent().copied())
-            .await
-            .map_err(status::from_store)?;
-        let rec = ChangesetRecord {
-            id: cs_id,
-            root_tree: built.root,
-            parents: cs.parents.clone(),
-            generation: generation.saturating_add(1),
-            fp_depth,
-            fp_jump,
-        };
-        // 先写路径索引，再写记录：记录存在即表示索引完整
-        let changes: Vec<PathChange> = cs
-            .delta
-            .iter()
-            .map(|c| PathChange {
-                path: c.path.clone(),
-                deleted: matches!(c.op, scion_object::FileOp::Delete),
-            })
-            .collect();
-        self.meta
-            .index_paths(repo, cs_id, rec.generation, &changes)
-            .await
-            .map_err(status::from_store)?;
-        scion_query::index_git_sha(self.meta.as_ref(), repo, cs_id, cs)
-            .await
-            .map_err(crate::service::history::from_query)?;
-        self.meta.put_changeset(repo, &rec).await.map_err(status::from_store)?;
-        Ok(rec)
+        self.writer.create(repo, cs).await.map_err(status::from_land)
     }
 }
 
@@ -298,6 +224,7 @@ impl WriteService for WriteSvc {
             let repo = asm.repo().unwrap_or_default().to_owned();
             if !checked {
                 check_repo(self.meta.as_ref(), &repo).await?;
+                RateLimiter::admit(self.limiter.as_deref(), &repo)?;
                 checked = true;
             }
             if let Some((id, bytes)) = done {
@@ -318,6 +245,7 @@ impl WriteService for WriteSvc {
             .changeset
             .ok_or_else(|| Status::invalid_argument("changeset is required"))?;
         let cs = spec_to_changeset(spec, self.config.limits.max_changes_per_changeset)?;
+        RateLimiter::admit(self.limiter.as_deref(), &req.repo)?;
         let rec = self.create(&req.repo, &cs).await?;
         tracing::info!(repo = %req.repo, changeset = %rec.id, request_id = %req.request_id, "changeset created");
         Ok(Response::new(CreateChangesetResponse {

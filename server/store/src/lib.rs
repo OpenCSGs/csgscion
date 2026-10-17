@@ -32,6 +32,38 @@ pub struct RefState {
     pub version: u64,
 }
 
+/// 合入过 ref 的 change（`landed` 表）：同一 ref 上每个 change id 只合入一次。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LandedChange {
+    pub change_id: [u8; 16],
+    /// 客户端提交的 changeset。
+    pub changeset: ObjectId,
+    /// 进入 ref 历史的 changeset（经过 rebase 时与 `changeset` 不同）。
+    pub landed: ObjectId,
+    /// 合入后 ref 的版本。
+    pub ref_version: u64,
+}
+
+/// 租约（`leases` 表）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lease {
+    pub holder: String,
+    /// 每换一次持有者加 1。
+    pub token: u64,
+    pub expires_at_ms: i64,
+}
+
+/// 写请求的结果（`idempotency` 表），按 (仓库, request id) 保存一段时间。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdempotencyRecord {
+    pub request_id: String,
+    /// 请求参数的指纹：同一 request id 参数不同时拒绝。
+    pub fingerprint: Vec<u8>,
+    /// 编码后的结果，原样返回给重试的请求。
+    pub response: Vec<u8>,
+    pub created_at_ms: i64,
+}
+
 /// ref CAS 的前置条件。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefExpect {
@@ -55,7 +87,43 @@ pub trait MetaStore: Send + Sync + 'static {
 
     /// 条件更新 ref：前置条件满足时把 target 设为 `target`，版本加 1（新建时版本为 1）。
     /// 条件不满足时返回 [`Error::RefVersionMismatch`]，其中带上当前版本。
-    async fn cas_ref(&self, repo: &str, name: &str, expect: RefExpect, target: ObjectId) -> Result<RefState>;
+    async fn cas_ref(&self, repo: &str, name: &str, expect: RefExpect, target: ObjectId) -> Result<RefState> {
+        self.land_commit(repo, name, expect, target, &[], &[]).await
+    }
+
+    /// 合入的原子提交（服务端设计文档 §6.2）：在同一个事务里条件更新 ref、登记合入的 change
+    /// （`landed`）和请求结果（`requests`，用于幂等）。ref 条件不满足时什么都不写。
+    ///
+    /// 同一 ref 上已登记过的 change id、已存在的 request id 保留第一次的记录。
+    async fn land_commit(
+        &self,
+        repo: &str,
+        name: &str,
+        expect: RefExpect,
+        target: ObjectId,
+        landed: &[LandedChange],
+        requests: &[IdempotencyRecord],
+    ) -> Result<RefState>;
+
+    /// 查询 change 是否已经合入过 ref，返回已登记的记录（顺序不定）。
+    async fn landed_changes(&self, repo: &str, name: &str, change_ids: &[[u8; 16]]) -> Result<Vec<LandedChange>>;
+
+    /// 读取请求结果（幂等表）。
+    async fn get_idempotency(&self, repo: &str, request_id: &str) -> Result<Option<IdempotencyRecord>>;
+
+    /// 删除 `created_at_ms` 早于 `before_ms` 的请求结果，返回删除的条数。
+    async fn expire_idempotency(&self, before_ms: i64) -> Result<u64>;
+
+    /// 申请或续约租约（服务端设计文档 §6.2、§10）：租约不存在、已过期（`expires_at_ms <= now_ms`）或
+    /// 已由 `holder` 持有时，把它交给 `holder`，有效期到 `now_ms + ttl_ms`；换了持有者时 `token` 加 1。
+    /// 返回申请之后的租约（持有者可能是别人）。
+    ///
+    /// 时间由调用方给出，节点间的时钟偏差会让两个节点短暂地都认为自己持有租约；租约只用来减少
+    /// 竞争，正确性由 ref 的条件更新保证。
+    async fn acquire_lease(&self, scope: &str, holder: &str, ttl_ms: i64, now_ms: i64) -> Result<Lease>;
+
+    /// 释放 `holder` 持有的租约（让它立即过期）；别人持有时不做任何事。
+    async fn release_lease(&self, scope: &str, holder: &str) -> Result<()>;
 
     /// 把对象登记到仓库的对象索引（幂等）。调用前对象字节必须已写入 [`BlobStore`]：
     /// 索引里有的对象一定可读，这是写入顺序不变式（服务端设计文档 §4.5）。
@@ -71,6 +139,15 @@ pub trait MetaStore: Send + Sync + 'static {
     /// 记录一个已创建的 changeset 及其根目录树（服务端设计文档 §4.3 的 `cs_tree`）。
     /// 幂等：同一 id 重复写入时保留第一次的记录（相同 changeset 建出的树必然相同）。
     async fn put_changeset(&self, repo: &str, rec: &ChangesetRecord) -> Result<()>;
+
+    /// 批量记录 changeset（合入批处理一次写入整批 rebase 结果）。语义与逐个 [`MetaStore::put_changeset`]
+    /// 相同；远端数据库应覆盖默认实现，用一个事务完成。
+    async fn put_changesets(&self, repo: &str, recs: &[ChangesetRecord]) -> Result<()> {
+        for r in recs {
+            self.put_changeset(repo, r).await?;
+        }
+        Ok(())
+    }
 
     async fn get_changeset(&self, repo: &str, id: &ObjectId) -> Result<Option<ChangesetRecord>>;
 
@@ -102,6 +179,14 @@ pub trait MetaStore: Send + Sync + 'static {
     /// 登记提交改动的路径（PathHistory 索引，相对第一个父提交）。幂等。
     /// 应在 [`MetaStore::put_changeset`] 之前写入：记录存在即表示索引完整。
     async fn index_paths(&self, repo: &str, cs: ObjectId, generation: u64, changes: &[PathChange]) -> Result<()>;
+
+    /// 批量登记多个提交的改动路径，每项为 (提交, 代数, 改动)。语义与逐个 [`MetaStore::index_paths`] 相同。
+    async fn index_paths_many(&self, repo: &str, entries: &[(ObjectId, u64, Vec<PathChange>)]) -> Result<()> {
+        for (cs, generation, changes) in entries {
+            self.index_paths(repo, *cs, *generation, changes).await?;
+        }
+        Ok(())
+    }
 
     /// 改动了 `path` 或其下任意路径、且代数不大于 `max_generation` 的提交，按代数从高到低，最多 `limit` 条。
     async fn path_history(
@@ -186,12 +271,18 @@ pub async fn fp_skip(
         .get_changeset(repo, &j.jump())
         .await?
         .ok_or_else(|| missing(j.jump()))?;
+    Ok(fp_skip_step(&p, &j, &jj))
+}
+
+/// 已知第一父提交 `p`、它的跳跃目标 `j`、`j` 的跳跃目标 `jj` 时，新提交的 (深度, 跳跃指针)。
+/// `p` 的深度必须已知（非 0）。供需要从其它来源（例如尚未写入的批处理结果）读记录的调用方使用。
+pub fn fp_skip_step(p: &ChangesetRecord, j: &ChangesetRecord, jj: &ChangesetRecord) -> (u64, Option<ObjectId>) {
     let jump = if p.fp_depth - j.fp_depth == j.fp_depth - jj.fp_depth {
         jj.id
     } else {
         p.id
     };
-    Ok((p.fp_depth + 1, Some(jump)))
+    (p.fp_depth + 1, Some(jump))
 }
 
 /// 提交对一个路径的改动。

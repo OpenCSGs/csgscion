@@ -74,6 +74,23 @@ fn sha_bytes(sha: &str) -> Result<([u8; 16], Vec<u8>)> {
     Ok((change_id, raw))
 }
 
+/// 每次合入的提交数上限，与服务端默认的单次合入上限一致：服务端要记录每个进入 ref 的提交的 change id，
+/// 一次合入过多提交会被拒绝。
+pub const LAND_STEP: usize = 256;
+
+/// 导入选项。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Options {
+    /// 每次合入（快进）最多包含的提交数，见 [`LAND_STEP`]。
+    pub land_step: usize,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self { land_step: LAND_STEP }
+    }
+}
+
 /// 导入 `repo_dir` 中 `git_ref` 可达的全部提交，并把 Scion 的 `target_ref` 快进到最新提交。
 ///
 /// `progress` 在每个提交导入后被调用（已完成数, 总数）。
@@ -82,6 +99,18 @@ pub async fn import(
     repo_dir: &Path,
     git_ref: &str,
     target_ref: &str,
+    progress: impl FnMut(usize, usize),
+) -> Result<Summary> {
+    import_with(client, repo_dir, git_ref, target_ref, Options::default(), progress).await
+}
+
+/// 同 [`import`]，可指定选项。
+pub async fn import_with(
+    client: &Client,
+    repo_dir: &Path,
+    git_ref: &str,
+    target_ref: &str,
+    options: Options,
     mut progress: impl FnMut(usize, usize),
 ) -> Result<Summary> {
     let repo = git::Repo::open(repo_dir)?;
@@ -136,7 +165,7 @@ pub async fn import(
 
     let tip = commits.last().and_then(|sha| mapping.get(sha).copied());
     if let Some(tip) = tip {
-        land_chain(client, target_ref, tip, &first_parent_of).await?;
+        land_chain(client, target_ref, tip, &first_parent_of, options.land_step).await?;
     }
     Ok(Summary {
         commits: commits.len(),
@@ -146,12 +175,14 @@ pub async fn import(
     })
 }
 
-/// 沿第一父提交链，从 ref 当前位置开始逐个快进到 `tip`。
+/// 把 ref 快进到 `tip`：ref 当前提交必须在 `tip` 的第一父提交链上（否则 git 历史被改写过）。
+/// 沿第一父提交链分段快进，每段最多 `step` 个提交。
 async fn land_chain(
     client: &Client,
     target_ref: &str,
     tip: ObjectId,
     first_parent_of: &HashMap<ObjectId, Option<ObjectId>>,
+    step: usize,
 ) -> Result<()> {
     let current = client.resolve_ref(target_ref).await?.map(|t| t.changeset);
     let mut chain = Vec::new();
@@ -170,13 +201,13 @@ async fn land_chain(
                 current: cur_tip,
             });
         }
-    } else {
-        // ref 不存在：直接创建在 tip 上即可
-        client.land(target_ref, &tip).await?;
-        return Ok(());
     }
-    for c in chain.into_iter().rev() {
-        client.land(target_ref, &c).await?;
+    // 只允许快进：导入的历史必须原样进入 ref，期间 ref 被别人移动时报错而不是 rebase
+    chain.reverse();
+    for part in chain.chunks(step.max(1)) {
+        if let Some(last) = part.last() {
+            client.land_fast_forward(target_ref, last).await?;
+        }
     }
     Ok(())
 }

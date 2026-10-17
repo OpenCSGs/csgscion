@@ -52,6 +52,25 @@ pub struct ServerConfig {
     pub record_cache_capacity: u64,
     /// 启动后在后台把各仓库的提交记录预热进缓存。
     pub warm_record_cache: bool,
+    /// 写请求结果（幂等表）的保留时间。
+    pub idempotency_ttl: std::time::Duration,
+    /// 清理过期幂等记录的间隔。
+    pub janitor_interval: std::time::Duration,
+    /// 合入批处理参数（每个 ref 一个批处理任务）。
+    pub land: scion_land::CoordinatorConfig,
+    /// 集群模式（多个节点共享存储）：每个 ref 由持有租约的节点处理，其它节点转发。`None` 为单节点。
+    pub cluster: Option<scion_land::ClusterConfig>,
+    /// 全局在途请求上限，超过时立即拒绝（RESOURCE_EXHAUSTED，可重试）。
+    pub max_concurrent_requests: usize,
+    /// 按仓库的写入速率限制（上传、创建提交、合入各算一次）；`None` 不限制。
+    pub repo_write_rate: Option<WriteRate>,
+}
+
+/// 令牌桶参数：每秒补充 `per_second` 个，最多积攒 `burst` 个。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteRate {
+    pub per_second: u32,
+    pub burst: u32,
 }
 
 impl Default for ServerConfig {
@@ -62,6 +81,12 @@ impl Default for ServerConfig {
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             record_cache_capacity: 1_000_000,
             warm_record_cache: true,
+            idempotency_ttl: std::time::Duration::from_secs(24 * 3600),
+            janitor_interval: std::time::Duration::from_secs(600),
+            land: scion_land::CoordinatorConfig::default(),
+            cluster: None,
+            max_concurrent_requests: 10_000,
+            repo_write_rate: None,
         }
     }
 }

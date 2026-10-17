@@ -282,7 +282,9 @@ impl WorkingCopy {
         Ok(Some(created))
     }
 
-    /// 合入已提交的改动（快进）。
+    /// 合入已提交的改动。ref 已前进时由服务端 rebase，随后把上游改动更新到工作区。
+    ///
+    /// 有未提交的改动时只允许快进：rebase 后要把上游改动写入工作区，不能和本地未提交的改动交织。
     pub async fn land(&mut self, client: &Client) -> Result<Landed> {
         let _lock = self.paths.lock()?;
         let head = match &self.state.head {
@@ -291,7 +293,19 @@ impl WorkingCopy {
                 .map_err(|e| Error::Corrupt(format!("head: {e}")))?,
             None => return Err(Error::NothingToLand),
         };
-        let landed = client.land(&self.state.reference, &head).await?;
+        let landed = if self.changes()?.0.is_clean() {
+            client.land(&self.state.reference, &head).await?
+        } else {
+            client.land_fast_forward(&self.state.reference, &head).await?
+        };
+        if landed.tip != head {
+            // ref 上包含了别人的改动（rebase 或提交早已在历史中）：工作区从 head 更新到新的 tip
+            let from = flatten(client, client.root_tree(&head.to_string()).await?).await?;
+            let to = flatten(client, client.root_tree(&landed.tip.to_string()).await?).await?;
+            let mut dirstate = self.paths.load_dirstate()?;
+            self.apply(client, &mut dirstate, &diff(&from, &to)).await?;
+            self.paths.save_dirstate(&mut dirstate)?;
+        }
         self.state.base = Some(landed.tip.to_string());
         self.clear_head();
         self.paths.save_state(&self.state)?;

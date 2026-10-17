@@ -7,8 +7,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use scion_object::ObjectId;
 use scion_store::{
-    ChangesetRecord, Error, IndexedObject, MetaStore, PathChange, PathHistoryEntry, RefExpect, RefState, Result,
-    validate_repo_name,
+    ChangesetRecord, Error, IdempotencyRecord, IndexedObject, LandedChange, Lease, MetaStore, PathChange,
+    PathHistoryEntry, RefExpect, RefState, Result, validate_repo_name,
 };
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 
@@ -118,7 +118,15 @@ impl MetaStore for PgMetaStore {
         .transpose()
     }
 
-    async fn cas_ref(&self, repo: &str, name: &str, expect: RefExpect, target: ObjectId) -> Result<RefState> {
+    async fn land_commit(
+        &self,
+        repo: &str,
+        name: &str,
+        expect: RefExpect,
+        target: ObjectId,
+        landed: &[LandedChange],
+        requests: &[IdempotencyRecord],
+    ) -> Result<RefState> {
         let repo_id = self.repo_id(repo).await?;
         let target_bytes = target.to_bytes().to_vec();
         let mut tx = self.pool.begin().await.map_err(|e| backend("begin", e))?;
@@ -173,11 +181,144 @@ impl MetaStore for PgMetaStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| backend("append ref log", e))?;
+        let now = now_ms();
+        for l in landed {
+            sqlx::query(
+                "INSERT INTO landed (repo_id, ref, change_id, changeset, landed, ref_version, landed_at_ms) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (repo_id, ref, change_id) DO NOTHING",
+            )
+            .bind(repo_id)
+            .bind(name)
+            .bind(l.change_id.to_vec())
+            .bind(l.changeset.to_bytes().to_vec())
+            .bind(l.landed.to_bytes().to_vec())
+            .bind(version_to_db(l.ref_version)?)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| backend("record landed change", e))?;
+        }
+        for r in requests {
+            sqlx::query(
+                "INSERT INTO idempotency (repo_id, request_id, fingerprint, response, created_at_ms) \
+                 VALUES ($1, $2, $3, $4, $5) ON CONFLICT (repo_id, request_id) DO NOTHING",
+            )
+            .bind(repo_id)
+            .bind(&r.request_id)
+            .bind(&r.fingerprint)
+            .bind(&r.response)
+            .bind(r.created_at_ms)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| backend("record request result", e))?;
+        }
         tx.commit().await.map_err(|e| backend("commit", e))?;
         Ok(RefState {
             target,
             version: new_version,
         })
+    }
+
+    async fn landed_changes(&self, repo: &str, name: &str, change_ids: &[[u8; 16]]) -> Result<Vec<LandedChange>> {
+        let repo_id = self.repo_id(repo).await?;
+        let mut out = Vec::new();
+        for chunk in change_ids.chunks(MAX_IDS_PER_QUERY) {
+            let mut qb = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+                "SELECT change_id, changeset, landed, ref_version FROM landed WHERE repo_id = ",
+            );
+            qb.push_bind(repo_id)
+                .push(" AND ref = ")
+                .push_bind(name)
+                .push(" AND change_id IN (");
+            let mut sep = qb.separated(", ");
+            for c in chunk {
+                sep.push_bind(c.to_vec());
+            }
+            qb.push(")");
+            let rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, i64)> = qb
+                .build_query_as()
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| backend("landed changes", e))?;
+            for (change_id, changeset, landed, version) in rows {
+                out.push(LandedChange {
+                    change_id: change_id
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| Error::Backend(format!("corrupt change id ({} bytes)", change_id.len())))?,
+                    changeset: id_from_db(&changeset)?,
+                    landed: id_from_db(&landed)?,
+                    ref_version: version_from_db(version)?,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    async fn get_idempotency(&self, repo: &str, request_id: &str) -> Result<Option<IdempotencyRecord>> {
+        let repo_id = self.repo_id(repo).await?;
+        let row: Option<(Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT fingerprint, response, created_at_ms FROM idempotency WHERE repo_id = $1 AND request_id = $2",
+        )
+        .bind(repo_id)
+        .bind(request_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| backend("get request result", e))?;
+        Ok(row.map(|(fingerprint, response, created_at_ms)| IdempotencyRecord {
+            request_id: request_id.to_owned(),
+            fingerprint,
+            response,
+            created_at_ms,
+        }))
+    }
+
+    async fn acquire_lease(&self, scope: &str, holder: &str, ttl_ms: i64, now_ms: i64) -> Result<Lease> {
+        // 条件 upsert：没有、已过期或自己持有时写入；否则不变。随后读出当前租约
+        sqlx::query(
+            "INSERT INTO leases (scope, holder, token, expires_at_ms) VALUES ($1, $2, 1, $3) \
+             ON CONFLICT (scope) DO UPDATE SET \
+               token = CASE WHEN leases.holder = excluded.holder THEN leases.token ELSE leases.token + 1 END, \
+               holder = excluded.holder, expires_at_ms = excluded.expires_at_ms \
+             WHERE leases.holder = excluded.holder OR leases.expires_at_ms <= $4",
+        )
+        .bind(scope)
+        .bind(holder)
+        .bind(now_ms.saturating_add(ttl_ms))
+        .bind(now_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| backend("acquire lease", e))?;
+        let (holder, token, expires_at_ms): (String, i64, i64) =
+            sqlx::query_as("SELECT holder, token, expires_at_ms FROM leases WHERE scope = $1")
+                .bind(scope)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| backend("read lease", e))?;
+        Ok(Lease {
+            holder,
+            token: version_from_db(token)?,
+            expires_at_ms,
+        })
+    }
+
+    async fn release_lease(&self, scope: &str, holder: &str) -> Result<()> {
+        sqlx::query("UPDATE leases SET expires_at_ms = 0 WHERE scope = $1 AND holder = $2")
+            .bind(scope)
+            .bind(holder)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| backend("release lease", e))?;
+        Ok(())
+    }
+
+    async fn expire_idempotency(&self, before_ms: i64) -> Result<u64> {
+        let r = sqlx::query("DELETE FROM idempotency WHERE created_at_ms < $1")
+            .bind(before_ms)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| backend("expire request results", e))?;
+        Ok(r.rows_affected())
     }
 
     async fn index_objects(&self, repo: &str, objects: &[IndexedObject]) -> Result<()> {
@@ -270,6 +411,49 @@ impl MetaStore for PgMetaStore {
         Ok(())
     }
 
+    async fn put_changesets(&self, repo: &str, recs: &[ChangesetRecord]) -> Result<()> {
+        let repo_id = self.repo_id(repo).await?;
+        if recs.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await.map_err(|e| backend("begin", e))?;
+        // 每行 8 个参数
+        for chunk in recs.chunks(MAX_IDS_PER_QUERY / 8) {
+            let mut rows = Vec::with_capacity(chunk.len());
+            for r in chunk {
+                rows.push((
+                    r.id.to_bytes().to_vec(),
+                    r.root_tree.to_bytes().to_vec(),
+                    r.first_parent().map(|p| p.to_bytes().to_vec()),
+                    version_to_db(r.generation)?,
+                    ids_to_db(&r.parents),
+                    version_to_db(r.fp_depth)?,
+                    r.fp_jump.map(|j| j.to_bytes().to_vec()),
+                ));
+            }
+            let mut qb = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+                "INSERT INTO changesets (repo_id, cs_id, root_tree, first_parent, generation, parents, fp_depth, fp_jump) ",
+            );
+            qb.push_values(rows, |mut b, (id, root, first, generation, parents, depth, jump)| {
+                b.push_bind(repo_id)
+                    .push_bind(id)
+                    .push_bind(root)
+                    .push_bind(first)
+                    .push_bind(generation)
+                    .push_bind(parents)
+                    .push_bind(depth)
+                    .push_bind(jump);
+            });
+            qb.push(" ON CONFLICT (repo_id, cs_id) DO NOTHING");
+            qb.build()
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| backend("put changesets", e))?;
+        }
+        tx.commit().await.map_err(|e| backend("commit", e))?;
+        Ok(())
+    }
+
     async fn get_changeset(&self, repo: &str, id: &ObjectId) -> Result<Option<ChangesetRecord>> {
         let repo_id = self.repo_id(repo).await?;
         let sql = format!("SELECT {CHANGESET_COLUMNS} FROM changesets WHERE repo_id = $1 AND cs_id = $2");
@@ -344,6 +528,44 @@ impl MetaStore for PgMetaStore {
                     .push_bind(cs_bytes.clone())
                     .push_bind(generation)
                     .push_bind(c.deleted);
+            });
+            qb.push(" ON CONFLICT (repo_id, path, cs_id) DO NOTHING");
+            qb.build()
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| backend("index paths", e))?;
+        }
+        tx.commit().await.map_err(|e| backend("commit", e))?;
+        Ok(())
+    }
+
+    async fn index_paths_many(&self, repo: &str, entries: &[(ObjectId, u64, Vec<PathChange>)]) -> Result<()> {
+        let repo_id = self.repo_id(repo).await?;
+        let mut rows = Vec::new();
+        for (cs, generation, changes) in entries {
+            let generation = version_to_db(*generation)?;
+            let cs = cs.to_bytes().to_vec();
+            rows.extend(
+                changes
+                    .iter()
+                    .map(|c| (c.path.clone(), cs.clone(), generation, c.deleted)),
+            );
+        }
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await.map_err(|e| backend("begin", e))?;
+        // 每行 5 个参数
+        for chunk in rows.chunks(MAX_IDS_PER_QUERY / 5) {
+            let mut qb = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+                "INSERT INTO path_changes (repo_id, path, cs_id, generation, deleted) ",
+            );
+            qb.push_values(chunk, |mut b, (path, cs, generation, deleted)| {
+                b.push_bind(repo_id)
+                    .push_bind(path.clone())
+                    .push_bind(cs.clone())
+                    .push_bind(*generation)
+                    .push_bind(*deleted);
             });
             qb.push(" ON CONFLICT (repo_id, path, cs_id) DO NOTHING");
             qb.build()
@@ -640,6 +862,24 @@ mod tests {
     async fn conformance_derived() {
         let s = pg_or_skip!();
         testsuite::derived(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_landing() {
+        let s = pg_or_skip!();
+        testsuite::landing(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_leases() {
+        let s = pg_or_skip!();
+        testsuite::leases(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_batch_writes() {
+        let s = pg_or_skip!();
+        testsuite::batch_writes(&s).await;
     }
 
     #[tokio::test]

@@ -9,6 +9,8 @@ members = [
     "server/store-sql",
     "server/store-blob",
     "server/tree",
+    "server/merge",
+    "server/land",
     "server/query",
     "server/api",
     "server/scion",
@@ -34,6 +36,8 @@ scion-store = { path = "server/store" }
 scion-store-sql = { path = "server/store-sql" }
 scion-store-blob = { path = "server/store-blob" }
 scion-tree = { path = "server/tree" }
+scion-merge = { path = "server/merge" }
+scion-land = { path = "server/land" }
 scion-query = { path = "server/query" }
 scion-api = { path = "server/api" }
 scion-client = { path = "client/sdk" }
@@ -51,13 +55,15 @@ proptest = "1.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "net", "signal", "sync"] }
+tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots"] }
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 tonic-types = "0.14"
 tonic-health = "0.14"
+tower = { version = "0.5", default-features = false }
+http = "1"
 protox = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
@@ -66,6 +72,7 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 tempfile = "3"
 moka = { version = "0.12", features = ["sync"] }
 object_store = { version = "0.14", default-features = false, features = ["aws", "fs"] }
+diffy = "0.5"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 
 [workspace.lints.rust]

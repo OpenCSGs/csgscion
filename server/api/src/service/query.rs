@@ -243,8 +243,8 @@ mod tests {
             )
             .await
             .expect("create");
-        LandSvc::new(store.clone())
-            .land(REPO, "main", cs.id)
+        LandSvc::new(scion_land::Coordinator::new(w.writer().clone(), Default::default()))
+            .land(REPO, "main", cs.id, false)
             .await
             .expect("land");
         let cfg = ServerConfig {

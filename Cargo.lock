@@ -602,6 +602,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "diffy"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e3dc2f773b6aaa63b1a7684b8589f670a8a0146a510b74d23a401c882364b49"
+dependencies = [
+ "hashbrown 0.17.1",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -732,6 +741,12 @@ name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
+
+[[package]]
+name = "foldhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "form_urlencoded"
@@ -895,7 +910,7 @@ checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
  "allocator-api2",
  "equivalent",
- "foldhash",
+ "foldhash 0.1.5",
 ]
 
 [[package]]
@@ -903,6 +918,9 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "hashlink"
@@ -2393,6 +2411,7 @@ dependencies = [
  "clap",
  "scion-api",
  "scion-client",
+ "scion-land",
  "scion-object",
  "scion-query",
  "scion-store",
@@ -2411,6 +2430,9 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "hex",
+ "http",
+ "scion-land",
+ "scion-merge",
  "scion-object",
  "scion-proto",
  "scion-query",
@@ -2421,6 +2443,7 @@ dependencies = [
  "tonic",
  "tonic-health",
  "tonic-types",
+ "tower",
  "tracing",
 ]
 
@@ -2472,6 +2495,38 @@ dependencies = [
  "scion-object",
  "scion-store",
  "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "scion-land"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "scion-merge",
+ "scion-object",
+ "scion-query",
+ "scion-store",
+ "scion-store-sql",
+ "scion-tree",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "scion-merge"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "diffy",
+ "scion-object",
+ "scion-store",
+ "scion-tree",
  "thiserror",
  "tokio",
 ]

@@ -214,12 +214,19 @@ pub struct LandOut {
     pub reference: String,
     pub tip: String,
     pub version: u64,
+    /// 服务端是否 rebase 了提交（ref 在提交之后前进过）。
+    pub rebased: bool,
 }
 
 impl Render for LandOut {
     fn text(&self) -> String {
+        let rebased = if self.rebased {
+            format!(", rebased onto the latest {}", self.reference)
+        } else {
+            String::new()
+        };
         format!(
-            "landed {} on {} (version {})",
+            "landed {} on {} (version {}{rebased})",
             short(&self.tip),
             self.reference,
             self.version
@@ -235,6 +242,7 @@ pub async fn land(ctx: &Ctx) -> Result<LandOut, CliError> {
         reference: wc.state().reference.clone(),
         tip: landed.tip.to_string(),
         version: landed.version,
+        rebased: landed.rebased(),
     })
 }
 
@@ -565,10 +573,22 @@ mod tests {
                 schema: "s",
                 reference: "main".into(),
                 tip: "c1t".into(),
-                version: 3
+                version: 3,
+                rebased: false,
             }
             .text()
-            .contains("version 3")
+            .contains("version 3)")
+        );
+        assert!(
+            LandOut {
+                schema: "s",
+                reference: "main".into(),
+                tip: "c1t".into(),
+                version: 4,
+                rebased: true,
+            }
+            .text()
+            .contains("rebased onto the latest main")
         );
 
         let mut so = SyncOut {

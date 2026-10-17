@@ -136,6 +136,92 @@ pub fn from_tree(err: scion_tree::TreeError) -> Status {
     }
 }
 
+/// 过载或超过速率限制：RESOURCE_EXHAUSTED + RATE_LIMITED（可重试），metadata `retry_after_ms` 为建议的等待时间。
+pub fn rate_limited(message: &str, retry_after: std::time::Duration) -> Status {
+    with_reason(
+        Code::ResourceExhausted,
+        ErrorReason::RateLimited,
+        message,
+        HashMap::from([("retry_after_ms".to_string(), retry_after.as_millis().max(1).to_string())]),
+    )
+}
+
+/// 冲突详情：`changeset`、`count`，以及每个冲突的 `path.N` / `kind.N` / `base.N` / `ours.N` / `theirs.N`。
+pub fn merge_conflict(changeset: &ObjectId, conflicts: &[scion_merge::Conflict]) -> Status {
+    let id = |v: Option<ObjectId>| v.map(|i| i.to_string()).unwrap_or_default();
+    let mut md = HashMap::from([
+        ("changeset".to_string(), changeset.to_string()),
+        ("count".to_string(), conflicts.len().to_string()),
+    ]);
+    for (i, c) in conflicts.iter().take(MAX_IDS_IN_ERROR).enumerate() {
+        md.insert(format!("path.{i}"), c.path.clone());
+        md.insert(format!("kind.{i}"), c.kind.as_str().to_string());
+        md.insert(format!("base.{i}"), id(c.base));
+        md.insert(format!("ours.{i}"), id(c.ours));
+        md.insert(format!("theirs.{i}"), id(c.theirs));
+    }
+    let first = conflicts.first().map(|c| c.path.as_str()).unwrap_or("");
+    with_reason(
+        Code::Aborted,
+        ErrorReason::MergeConflict,
+        format!(
+            "changeset {changeset} conflicts with the ref on {} path(s), first {first:?}",
+            conflicts.len()
+        ),
+        md,
+    )
+}
+
+/// 写路径错误的映射。
+pub fn from_land(err: scion_land::LandError) -> Status {
+    use scion_land::LandError as E;
+    match err {
+        E::RepoNotFound(repo) => repo_not_found(&repo),
+        E::InvalidRef(name) => Status::invalid_argument(format!("invalid ref name {name:?}")),
+        E::ObjectsNotUploaded(ids) => objects_not_uploaded(&ids),
+        E::InvalidChangeset { path, message } => invalid_changeset(&path, message),
+        E::NotFastForward { tip } => with_reason(
+            Code::Aborted,
+            ErrorReason::NotFastForward,
+            format!("not a fast-forward of {tip}"),
+            HashMap::from([("tip".to_string(), tip.to_string())]),
+        ),
+        E::Conflict { changeset, conflicts } => merge_conflict(&changeset, &conflicts),
+        e @ (E::UnrelatedHistory { .. } | E::MergeInStack(_) | E::StackTooDeep(_)) => {
+            Status::failed_precondition(e.to_string())
+        }
+        E::RequestIdReused(id) => {
+            Status::invalid_argument(format!("request_id {id:?} was already used for a different request"))
+        }
+        E::NotLeader { leader } => with_reason(
+            Code::Unavailable,
+            ErrorReason::LandContention,
+            "the land leader for this ref moved; retry",
+            HashMap::from([("leader".to_string(), leader)]),
+        ),
+        E::Overloaded => with_reason(
+            Code::ResourceExhausted,
+            ErrorReason::RateLimited,
+            "too many pending lands on this ref; retry with backoff",
+            HashMap::new(),
+        ),
+        E::Contention => with_reason(
+            Code::Unavailable,
+            ErrorReason::LandContention,
+            "ref changed concurrently too many times; retry",
+            HashMap::new(),
+        ),
+        E::Corrupt(msg) => {
+            tracing::error!(error = %msg, "corrupt data on write path");
+            Status::internal("corrupt data in storage")
+        }
+        E::Unavailable(msg) => {
+            tracing::error!(error = %msg, "storage error on write path");
+            Status::unavailable("storage backend unavailable")
+        }
+    }
+}
+
 /// 存储层错误到 Status 的映射。
 pub fn from_store(err: scion_store::Error) -> Status {
     use scion_store::Error as E;
@@ -286,5 +372,75 @@ mod tests {
         let s = from_store(E::Backend("db down: password=secret".into()));
         assert_eq!(s.code(), Code::Unavailable);
         assert!(!s.message().contains("secret"), "backend details must not leak");
+    }
+
+    #[test]
+    fn from_land_maps_every_variant() {
+        use scion_land::LandError as E;
+        let id = ObjectId::hash(scion_object::ObjectKind::Changeset, b"c");
+        assert_eq!(from_land(E::RepoNotFound("r".into())).code(), Code::NotFound);
+        assert_eq!(from_land(E::InvalidRef("x".into())).code(), Code::InvalidArgument);
+        assert_eq!(
+            from_land(E::ObjectsNotUploaded(vec![id])).code(),
+            Code::FailedPrecondition
+        );
+        let s = from_land(E::InvalidChangeset {
+            path: "p".into(),
+            message: "bad".into(),
+        });
+        assert_eq!((s.code(), info(&s).2["path"].as_str()), (Code::InvalidArgument, "p"));
+        let s = from_land(E::NotFastForward { tip: id });
+        assert_eq!((s.code(), info(&s).0.as_str()), (Code::Aborted, "NOT_FAST_FORWARD"));
+        for e in [E::UnrelatedHistory { tip: id }, E::MergeInStack(id), E::StackTooDeep(3)] {
+            assert_eq!(from_land(e).code(), Code::FailedPrecondition);
+        }
+        assert_eq!(from_land(E::RequestIdReused("r".into())).code(), Code::InvalidArgument);
+        let s = from_land(E::NotLeader {
+            leader: "http://n2".into(),
+        });
+        assert_eq!(
+            (s.code(), info(&s).2["leader"].as_str()),
+            (Code::Unavailable, "http://n2")
+        );
+        let s = from_land(E::Overloaded);
+        assert_eq!(
+            (s.code(), info(&s).0.as_str()),
+            (Code::ResourceExhausted, "RATE_LIMITED")
+        );
+        let s = from_land(E::Contention);
+        assert_eq!((s.code(), info(&s).0.as_str()), (Code::Unavailable, "LAND_CONTENTION"));
+        let s = from_land(E::Corrupt("secret".into()));
+        assert!(s.code() == Code::Internal && !s.message().contains("secret"));
+        let s = from_land(E::Unavailable("secret".into()));
+        assert!(s.code() == Code::Unavailable && !s.message().contains("secret"));
+    }
+
+    #[test]
+    fn merge_conflict_lists_at_most_32_conflicts() {
+        use scion_merge::{Conflict, ConflictKind};
+        let id = ObjectId::hash(scion_object::ObjectKind::Changeset, b"c");
+        let blob = ObjectId::of_blob(b"b");
+        let conflicts: Vec<Conflict> = (0..40)
+            .map(|i| Conflict {
+                path: format!("f{i}"),
+                kind: ConflictKind::ModifyDelete,
+                base: Some(blob),
+                ours: Some(blob),
+                theirs: None,
+            })
+            .collect();
+        let s = from_land(scion_land::LandError::Conflict {
+            changeset: id,
+            conflicts,
+        });
+        let (reason, _, md) = info(&s);
+        assert_eq!((s.code(), reason.as_str()), (Code::Aborted, "MERGE_CONFLICT"));
+        assert_eq!((md["count"].as_str(), md["kind.0"].as_str()), ("40", "modify_delete"));
+        assert_eq!((md["theirs.0"].as_str(), md["base.31"].clone()), ("", blob.to_string()));
+        assert!(!md.contains_key("path.32"));
+        assert!(s.message().contains("\"f0\""));
+        // 空列表也能生成（防御性）
+        let s = merge_conflict(&id, &[]);
+        assert_eq!(info(&s).2["count"], "0");
     }
 }

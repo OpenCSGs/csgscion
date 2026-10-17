@@ -1,0 +1,27 @@
+[package]
+name = "scion-land"
+description = "Changeset creation, server-side stack rebase and landing onto refs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+scion-merge.workspace = true
+scion-object.workspace = true
+scion-query.workspace = true
+scion-store.workspace = true
+scion-tree.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+scion-store-sql.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
