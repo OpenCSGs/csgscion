@@ -13,13 +13,25 @@
 **使用指南**
 - [从 git 导入](docs/guide/git-import.md)：把已有的 git 仓库连同全部历史导入 Scion
 - [对象存储](docs/guide/object-storage.md)：SeaweedFS、MinIO 与其他 S3 兼容服务；服务识别与启动检查
+- [多节点部署与合入](docs/guide/cluster.md)：合入语义（rebase、恰好一次）、`--advertise-url` 集群模式、故障切换与过载保护
 
 **设计与规范**
 - 设计文档：[服务端](docs/design/rust-server-architecture.md) · [客户端](docs/design/rust-client-architecture.md) · [接入 starhub / CSGLite](docs/design/starhub-integration.md)
 - 对象格式规范：[`SPEC.md`](SPEC.md)，golden 测试向量在 [`testdata/vectors/`](testdata/vectors/)
 - 协议：[`proto/scion/v1/`](proto/scion/v1/)
 
-当前进度：**M2 派生数据与查询**已完成：log、blame、diff、merge-base、祖先判断和版本解析（提交 id、ref 或导入的 git sha），由 PathHistory 索引和第一父提交链跳表支撑。10 万提交的仓库上，SQLite 与 PostgreSQL 下所有查询 p99 均低于 20 ms。M1 已完成写入路径、Lite 模式、`scn` 工作副本和 git 导入。下一步 M3：服务端 rebase 与合并。
+当前进度：**M3 高并发**已完成：
+- **服务端 rebase**：落后的提交在合入时自动三方合并，冲突时返回 base / ours / theirs 三个版本的 id。
+- **恰好一次合入**：request id 幂等，同一 ref 上每个 change 只合入一次。
+- **LandCoordinator**：同一个 ref 上的合入合成批次处理。
+- **多节点集群**：按 ref 的 leader 租约，非 leader 节点转发请求。
+- **过载保护**：过载丢弃与按仓库的写入限流。
+
+PostgreSQL 下单个 ref 每秒合入 885 次（p99 379 ms）。线性一致性测试覆盖并发合入与合入中途杀掉 leader。
+
+之前的里程碑：M2 实现了历史查询（log / blame / diff / merge-base，10 万提交 p99 低于 20 ms）；M1 实现了写入路径、Lite 模式、`scn` 工作副本与 git 导入。
+
+下一步 M4：缓存层。
 
 ## 目录结构
 
@@ -38,6 +50,7 @@ server/              服务端（可依赖 common 与更低层的 server crate�
   store-blob/        scion-store-blob  本地目录 / S3 兼容对象存储
   tree/              scion-tree        增量建树
   merge/             scion-merge       服务端 rebase：把 delta 重放到更新的目录树上，三方合并
+  land/              scion-land        创建提交、提交栈 rebase、LandCoordinator、租约
   query/             scion-query       历史查询（log / diff / blame / merge-base）与重建索引
   api/               scion-api         gRPC 服务实现与启动入口
   scion/             scion             服务端二进制（scion server --lite / --meta / --blobs）

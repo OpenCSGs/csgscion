@@ -13,6 +13,7 @@ A server-first source control system: history, merges and rebases are computed o
 **Guides**
 - [Importing from git](docs/guide/git-import.md) (Chinese): import an existing git repository with its full history
 - [Object storage](docs/guide/object-storage.md) (Chinese): SeaweedFS, MinIO and other S3-compatible services; provider detection and startup checks
+- [Clusters and landing](docs/guide/cluster.md) (Chinese): land semantics (rebase, exactly once), multi-node mode with `--advertise-url`, failover and overload protection
 
 **Design and specifications** (Chinese)
 - Design docs: [server](docs/design/rust-server-architecture.md) · [client](docs/design/rust-client-architecture.md) · [starhub / CSGLite integration](docs/design/starhub-integration.md)
@@ -21,7 +22,18 @@ A server-first source control system: history, merges and rebases are computed o
 
 ## Status
 
-**M2 (derived data and queries) is complete**: log, blame, diff, merge-base, ancestry and revision resolution (by changeset id, ref or imported git sha), backed by a path-history index and a first-parent skip list. On a 100k-commit repository every query has p99 under 20 ms with both SQLite and PostgreSQL. M1 delivered the write path, Lite mode, the `scn` working copy and git import. Next is M3: server-side rebase and merge.
+**M3 (high concurrency) is complete**:
+- **Server-side rebase:** a stale commit is rebased with three-way merge when it lands, and conflicts are reported with base/ours/theirs ids.
+- **Exactly-once lands:** idempotent request ids, plus one landing per change id per ref.
+- **LandCoordinator:** lands to the same ref are batched.
+- **Multi-node clusters:** per-ref leader leases and forwarding.
+- **Overload protection:** load shedding and per-repo write rate limits.
+
+One ref sustains 885 lands/s on PostgreSQL (p99 379 ms). Linearizability tests cover concurrent lands and killing the leader mid-run.
+
+Earlier milestones: M2 added history queries (log / blame / diff / merge-base, p99 under 20 ms on 100k commits). M1 added the write path, Lite mode, the `scn` working copy and git import.
+
+Next is M4: the cache layer.
 
 ## Quick start
 
@@ -76,6 +88,7 @@ server/              server side (may depend on common and lower server crates)
   store-blob/        scion-store-blob  local directory / S3-compatible object store
   tree/              scion-tree        incremental tree building
   merge/             scion-merge       server-side rebase: replay a delta onto a newer tree with three-way merge
+  land/              scion-land        changeset creation, stack rebase, LandCoordinator, leases
   query/             scion-query       history queries (log / diff / blame / merge-base) and reindexing
   api/               scion-api         gRPC services and server bootstrap
   scion/             scion             server binary (scion server --lite / --meta / --blobs)
