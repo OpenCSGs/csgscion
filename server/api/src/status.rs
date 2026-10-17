@@ -66,6 +66,27 @@ pub fn object_missing(ids: &[ObjectId]) -> Status {
     )
 }
 
+/// 对象已被 redact：NOT_FOUND / REDACTED，metadata `ids` 与 `redaction_ids` 一一对应（逗号分隔，
+/// 最多 [`MAX_IDS_IN_ERROR`] 个），`count` 为总数。不可重试。
+pub fn redacted(objects: &[(ObjectId, String)]) -> Status {
+    let shown = &objects[..objects.len().min(MAX_IDS_IN_ERROR)];
+    let ids: Vec<String> = shown.iter().map(|(id, _)| id.to_string()).collect();
+    let rids: Vec<&str> = shown.iter().map(|(_, r)| r.as_str()).collect();
+    with_reason(
+        Code::NotFound,
+        ErrorReason::Redacted,
+        match objects {
+            [(id, rid)] => format!("object {id} is redacted ({rid})"),
+            _ => format!("{} object(s) are redacted", objects.len()),
+        },
+        HashMap::from([
+            ("ids".to_string(), ids.join(",")),
+            ("redaction_ids".to_string(), rids.join(",")),
+            ("count".to_string(), objects.len().to_string()),
+        ]),
+    )
+}
+
 /// 写入时引用了尚未上传的对象：FAILED_PRECONDITION，客户端应先上传再重试（§3.5）。
 pub fn objects_not_uploaded(ids: &[ObjectId]) -> Status {
     let listed: Vec<String> = ids.iter().take(MAX_IDS_IN_ERROR).map(ToString::to_string).collect();
@@ -219,6 +240,7 @@ pub fn from_land(err: scion_land::LandError) -> Status {
             tracing::error!(error = %msg, "storage error on write path");
             Status::unavailable("storage backend unavailable")
         }
+        E::Redacted { id, redaction_id } => redacted(&[(id, redaction_id)]),
     }
 }
 
@@ -241,6 +263,7 @@ pub fn from_store(err: scion_store::Error) -> Status {
                 ),
             ]),
         ),
+        E::Redacted { id, redaction_id } => redacted(&[(id, redaction_id)]),
         E::Backend(msg) => {
             tracing::error!(error = %msg, "storage backend error");
             Status::unavailable("storage backend unavailable")
@@ -369,6 +392,32 @@ mod tests {
             current: None,
         });
         assert_eq!(info(&s).2["current_version"], "");
+        let id = ObjectId::of_blob(b"secret");
+        let s = from_store(E::Redacted {
+            id,
+            redaction_id: "rd1".into(),
+        });
+        let (reason, _, md) = info(&s);
+        assert_eq!((s.code(), reason.as_str()), (Code::NotFound, "REDACTED"));
+        assert_eq!(
+            (md["ids"].clone(), md["redaction_ids"].as_str()),
+            (id.to_string(), "rd1")
+        );
+        assert!(s.message().contains("rd1"));
+        let many: Vec<(ObjectId, String)> = (0..40u8).map(|i| (ObjectId::of_blob(&[i]), format!("rd{i}"))).collect();
+        let s = redacted(&many);
+        let (_, _, md) = info(&s);
+        assert_eq!(md["count"], "40");
+        assert_eq!(md["ids"].split(',').count(), MAX_IDS_IN_ERROR);
+        assert_eq!(md["redaction_ids"].split(',').count(), MAX_IDS_IN_ERROR);
+        assert_eq!(
+            from_land(scion_land::LandError::Redacted {
+                id,
+                redaction_id: "rd1".into()
+            })
+            .code(),
+            Code::NotFound
+        );
         let s = from_store(E::Backend("db down: password=secret".into()));
         assert_eq!(s.code(), Code::Unavailable);
         assert!(!s.message().contains("secret"), "backend details must not leak");

@@ -5,7 +5,7 @@ mod object;
 mod query;
 mod refs;
 mod server_info;
-mod support;
+pub(crate) mod support;
 mod write;
 
 pub use auth::{AdminSvc, AuthSvc};

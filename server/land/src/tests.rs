@@ -664,6 +664,9 @@ impl MetaStore for Hooked {
     async fn missing_objects(&self, r: &str, ids: &[ObjectId]) -> scion_store::Result<Vec<ObjectId>> {
         self.inner.missing_objects(r, ids).await
     }
+    async fn get_redactions(&self, r: &str, ids: &[ObjectId]) -> scion_store::Result<Vec<scion_store::Redaction>> {
+        self.inner.get_redactions(r, ids).await
+    }
     async fn object_sizes(
         &self,
         r: &str,
@@ -779,6 +782,26 @@ fn error_conversions() {
     assert_eq!(
         LandError::from(MergeError::Storage("s".into())),
         LandError::Unavailable("s".into())
+    );
+    assert_eq!(
+        LandError::from(MergeError::Redacted {
+            id,
+            redaction_id: "rd".into()
+        }),
+        LandError::Redacted {
+            id,
+            redaction_id: "rd".into()
+        }
+    );
+    assert_eq!(
+        LandError::from(scion_store::Error::Redacted {
+            id,
+            redaction_id: "rd".into()
+        }),
+        LandError::Redacted {
+            id,
+            redaction_id: "rd".into()
+        }
     );
     assert_eq!(
         LandError::from(MergeError::Tree(TreeError::Storage("t".into()))),

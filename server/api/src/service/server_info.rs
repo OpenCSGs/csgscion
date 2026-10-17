@@ -50,6 +50,7 @@ impl ServerInfoSvc {
             features::QUERY_DERIVED,
             features::AUTH,
             features::ADMIN,
+            features::REDACTION,
         ]
         .map(String::from)
         .to_vec();

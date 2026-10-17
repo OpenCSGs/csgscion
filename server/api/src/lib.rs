@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod config;
 pub mod limit;
+pub mod redaction;
 mod service;
 pub mod status;
 pub mod watch;
@@ -37,13 +38,29 @@ pub struct App {
 
 /// 预热全部仓库的提交记录缓存。失败只记录日志：缓存未命中时照常按需读取。
 /// 定期删除过期的幂等记录。多个节点同时执行是安全的（删除是幂等的）。
-async fn janitor(meta: Arc<dyn scion_store::MetaStore>, ttl: std::time::Duration, interval: std::time::Duration) {
+async fn janitor(
+    meta: Arc<dyn scion_store::MetaStore>,
+    redactor: Arc<redaction::Redactor>,
+    ttl: std::time::Duration,
+    interval: std::time::Duration,
+) {
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
         if let Err(e) = expire_once(meta.as_ref(), ttl).await {
             tracing::warn!(error = %e, "expiring request results failed");
+        }
+        // 到期的 redaction 清除：删除幂等，集群中多个节点同时执行也没有问题
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX);
+        if let Err(e) = redactor.run_purges(now).await {
+            tracing::warn!(error = %e.message(), "purging redacted objects failed");
         }
     }
 }
@@ -157,8 +174,10 @@ pub async fn serve(
         blobs,
         ..app
     };
+    let redactor = Arc::new(redaction::Redactor::new(app.meta.clone(), app.blobs.clone()));
     tokio::spawn(janitor(
         app.meta.clone(),
+        redactor.clone(),
         app.config.idempotency_ttl,
         app.config.janitor_interval,
     ));
@@ -209,7 +228,8 @@ pub async fn serve(
         QueryServiceServer::new(QuerySvc::new(app.config.clone(), app.meta, app.blobs).with_guard(guard.clone()))
             .max_encoding_message_size(max_msg);
     let auth_svc = AuthServiceServer::new(AuthSvc::new(guard.clone()));
-    let admin_svc = AdminServiceServer::new(AdminSvc::new(guard.clone()));
+    let admin_svc =
+        AdminServiceServer::new(AdminSvc::new(guard.clone()).with_redactor(redactor, app.config.purge_grace));
 
     let result = tonic::transport::Server::builder()
         .layer(limit::ConcurrencyLimitLayer::new(app.config.max_concurrent_requests))
@@ -307,6 +327,10 @@ mod tests {
         let s = seeded().await;
         let task = tokio::spawn(janitor(
             s.clone(),
+            Arc::new(redaction::Redactor::new(
+                s.clone(),
+                Arc::new(scion_store::MemStore::new()),
+            )),
             std::time::Duration::from_secs(3600),
             std::time::Duration::from_secs(60),
         ));

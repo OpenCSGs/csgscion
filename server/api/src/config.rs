@@ -73,6 +73,8 @@ pub struct ServerConfig {
     pub auth: scion_auth::GuardConfig,
     /// 从元数据库重新加载访问控制策略的间隔（其它节点修改策略后的最大生效延迟）。
     pub policy_poll_interval: std::time::Duration,
+    /// Purge 未指定宽限期时，从安排到物理删除对象字节的等待时间（期间可以撤销）。
+    pub purge_grace: std::time::Duration,
 }
 
 /// 令牌桶参数：每秒补充 `per_second` 个，最多积攒 `burst` 个。
@@ -98,6 +100,7 @@ impl Default for ServerConfig {
             repo_write_rate: None,
             ref_poll_interval: std::time::Duration::from_secs(1),
             blob_cache: scion_store::BlobCacheConfig::default(),
+            purge_grace: std::time::Duration::from_secs(24 * 3600),
             auth: scion_auth::GuardConfig::default(),
             policy_poll_interval: std::time::Duration::from_secs(30),
         }

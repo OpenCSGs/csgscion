@@ -119,6 +119,11 @@ impl QuerySvc {
         BlobTreeSource(self.blobs.clone())
     }
 
+    /// 读文件内容用的 BlobStore：redact 过的 blob 返回 REDACTED。
+    fn contents(&self, repo: &str) -> scion_store::RedactedBlobs {
+        scion_store::RedactedBlobs::new(self.blobs.clone(), self.meta.clone(), repo)
+    }
+
     pub(crate) async fn read_file(&self, repo: &str, revision: &str, path: &str) -> Result<(TreeEntry, Bytes), Status> {
         check_path(path)?;
         if path.is_empty() {
@@ -133,7 +138,7 @@ impl QuerySvc {
             return Err(Status::failed_precondition(format!("{path:?} is a directory")));
         }
         let data = self
-            .blobs
+            .contents(repo)
             .get(&entry.id)
             .await
             .map_err(status::from_store)?
@@ -248,7 +253,7 @@ impl QueryService for QuerySvc {
         }
         self.authorize_read(&p, &req.repo, &req.path).await?;
         Ok(Response::new(
-            history::blame(self.meta.as_ref(), self.blobs.as_ref(), req).await?,
+            history::blame(self.meta.as_ref(), &self.contents(&req.repo), req).await?,
         ))
     }
 

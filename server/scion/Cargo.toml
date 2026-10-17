@@ -13,14 +13,17 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+futures.workspace = true
 scion-api.workspace = true
 scion-cache.workspace = true
+scion-object.workspace = true
 scion-store.workspace = true
 scion-query.workspace = true
 scion-land.workspace = true
 scion-store-blob.workspace = true
 scion-store-sql.workspace = true
 tokio.workspace = true
+tonic.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
@@ -29,7 +32,6 @@ workspace = true
 
 [dev-dependencies]
 bytes.workspace = true
-scion-object.workspace = true
 tempfile.workspace = true
 scion-client.workspace = true
 scion-proto.workspace = true

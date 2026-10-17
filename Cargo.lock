@@ -3003,6 +3003,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "futures",
  "scion-api",
  "scion-cache",
  "scion-client",
@@ -3016,6 +3017,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tonic",
  "tracing",
  "tracing-subscriber",
 ]

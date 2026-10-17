@@ -56,6 +56,8 @@ pub mod features {
     pub const AUTH_DEVICE: &str = "auth.device";
     /// AdminService：策略与令牌管理。
     pub const ADMIN: &str = "admin";
+    /// redaction：读取 redact 过的对象返回 REDACTED，`ListRedactedObjects` 与 AdminService 的 redaction 接口可用。
+    pub const REDACTION: &str = "redaction";
 }
 
 #[cfg(test)]
