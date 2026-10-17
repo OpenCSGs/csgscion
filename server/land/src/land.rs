@@ -166,7 +166,7 @@ impl Lander {
     }
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
@@ -174,7 +174,7 @@ fn now_ms() -> i64 {
 }
 
 /// 抖动退避：上限随尝试次数翻倍（1、2、4… 毫秒，最多 64 毫秒），在 [上限/2, 上限] 中取值。
-fn backoff(attempt: u32) -> Duration {
+pub(crate) fn backoff(attempt: u32) -> Duration {
     let cap_us = 1000u64 << attempt.min(6);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

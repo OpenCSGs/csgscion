@@ -349,7 +349,7 @@ mod tests {
             .await
             .expect("c");
         let d = w.create(REPO, &mk(&[a.id], vec![put("other", b"4")])).await.expect("d");
-        let land = LandSvc::new(scion_land::Lander::new(w.writer().clone()));
+        let land = LandSvc::new(scion_land::Coordinator::new(w.writer().clone(), Default::default()));
         for x in [&a, &b, &c] {
             land.land(REPO, "main", x.id, false).await.expect("land");
         }

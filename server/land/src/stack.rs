@@ -64,6 +64,20 @@ pub async fn prepare(
     onto: Option<ObjectId>,
     opts: StackOptions,
 ) -> Result<Prepared> {
+    prepare_in_batch(writer, repo, reference, tip, onto, opts, &HashMap::new()).await
+}
+
+/// 与 [`prepare`] 相同，`in_batch` 是同一批中已接受、尚未提交的 change（change id → 进入历史的提交），
+/// 同样视为已合入，避免同一批里重复合入同一个 change。
+pub(crate) async fn prepare_in_batch(
+    writer: &ChangesetWriter,
+    repo: &str,
+    reference: &str,
+    tip: ObjectId,
+    onto: Option<ObjectId>,
+    opts: StackOptions,
+    in_batch: &HashMap<[u8; 16], ObjectId>,
+) -> Result<Prepared> {
     let meta = writer.meta().as_ref();
     let tip_rec = record(writer, repo, tip).await?;
     let Some(onto) = onto else {
@@ -134,12 +148,17 @@ pub async fn prepare(
         v
     };
     let ids: Vec<[u8; 16]> = changesets.iter().map(|c| c.change_id).collect();
-    let already: HashMap<[u8; 16], ObjectId> = meta
+    let mut already: HashMap<[u8; 16], ObjectId> = meta
         .landed_changes(repo, reference, &ids)
         .await?
         .into_iter()
         .map(|l| (l.change_id, l.landed))
         .collect();
+    for id in &ids {
+        if let Some(l) = in_batch.get(id) {
+            already.entry(*id).or_insert(*l);
+        }
+    }
 
     let trees = BlobTreeSource(writer.blobs().clone());
     let mut parent = record(writer, repo, onto).await?;

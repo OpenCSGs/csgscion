@@ -6,11 +6,13 @@
 //!
 //! 与协议无关：错误用 [`LandError`] 表示，由 API 层映射为 gRPC 状态。
 
+mod coordinator;
 mod create;
 mod land;
 mod record;
 mod stack;
 
+pub use coordinator::{Coordinator, CoordinatorConfig};
 pub use create::ChangesetWriter;
 pub use land::{LandOutcome, LandRequest, Lander};
 pub use stack::{Landed, Prepared, StackOptions, prepare};
@@ -54,6 +56,9 @@ pub enum LandError {
     /// 同一个 request id 被用于参数不同的请求。
     #[error("request id {0:?} was already used for a different land request")]
     RequestIdReused(String),
+    /// 合入队列已满（过载保护），稍后重试。
+    #[error("land queue for the ref is full")]
+    Overloaded,
     /// 条件更新多次失败（ref 写入竞争激烈），可重试。
     #[error("ref changed concurrently too many times")]
     Contention,

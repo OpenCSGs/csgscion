@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use scion_merge::ConflictKind;
@@ -519,131 +520,164 @@ async fn concurrent_lands_all_succeed_with_rebase() {
     }
 }
 
-#[tokio::test]
-async fn contention_is_reported_after_max_attempts() {
-    /// 每次条件更新都失败的存储。
-    struct AlwaysMoved(Arc<MemStore>);
-    #[async_trait::async_trait]
-    impl MetaStore for AlwaysMoved {
-        async fn create_repo(&self, r: &str) -> scion_store::Result<()> {
-            self.0.create_repo(r).await
-        }
-        async fn repo_exists(&self, r: &str) -> scion_store::Result<bool> {
-            self.0.repo_exists(r).await
-        }
-        async fn list_repos(&self) -> scion_store::Result<Vec<String>> {
-            self.0.list_repos().await
-        }
-        async fn get_ref(&self, r: &str, n: &str) -> scion_store::Result<Option<scion_store::RefState>> {
-            self.0.get_ref(r, n).await
-        }
-        async fn land_commit(
-            &self,
-            _: &str,
-            n: &str,
-            _: scion_store::RefExpect,
-            _: ObjectId,
-            _: &[scion_store::LandedChange],
-            _: &[scion_store::IdempotencyRecord],
-        ) -> scion_store::Result<scion_store::RefState> {
-            Err(scion_store::Error::RefVersionMismatch {
-                name: n.to_owned(),
-                current: Some(99),
-            })
-        }
-        async fn landed_changes(
-            &self,
-            r: &str,
-            n: &str,
-            c: &[[u8; 16]],
-        ) -> scion_store::Result<Vec<scion_store::LandedChange>> {
-            self.0.landed_changes(r, n, c).await
-        }
-        async fn get_idempotency(
-            &self,
-            r: &str,
-            id: &str,
-        ) -> scion_store::Result<Option<scion_store::IdempotencyRecord>> {
-            self.0.get_idempotency(r, id).await
-        }
-        async fn expire_idempotency(&self, before: i64) -> scion_store::Result<u64> {
-            self.0.expire_idempotency(before).await
-        }
-        async fn index_objects(&self, r: &str, o: &[IndexedObject]) -> scion_store::Result<()> {
-            self.0.index_objects(r, o).await
-        }
-        async fn missing_objects(&self, r: &str, ids: &[ObjectId]) -> scion_store::Result<Vec<ObjectId>> {
-            self.0.missing_objects(r, ids).await
-        }
-        async fn object_sizes(
-            &self,
-            r: &str,
-            ids: &[ObjectId],
-        ) -> scion_store::Result<std::collections::HashMap<ObjectId, u64>> {
-            self.0.object_sizes(r, ids).await
-        }
-        async fn put_changeset(&self, r: &str, rec: &scion_store::ChangesetRecord) -> scion_store::Result<()> {
-            self.0.put_changeset(r, rec).await
-        }
-        async fn get_changeset(
-            &self,
-            r: &str,
-            id: &ObjectId,
-        ) -> scion_store::Result<Option<scion_store::ChangesetRecord>> {
-            self.0.get_changeset(r, id).await
-        }
-        async fn list_refs(&self, r: &str) -> scion_store::Result<Vec<(String, scion_store::RefState)>> {
-            self.0.list_refs(r).await
-        }
-        async fn changesets_below(
-            &self,
-            r: &str,
-            g: u64,
-            l: usize,
-        ) -> scion_store::Result<Vec<scion_store::ChangesetRecord>> {
-            self.0.changesets_below(r, g, l).await
-        }
-        async fn repair_lineage(
-            &self,
-            r: &str,
-            id: &ObjectId,
-            p: &[ObjectId],
-            d: u64,
-            j: Option<ObjectId>,
-        ) -> scion_store::Result<()> {
-            self.0.repair_lineage(r, id, p, d, j).await
-        }
-        async fn index_paths(
-            &self,
-            r: &str,
-            cs: ObjectId,
-            g: u64,
-            c: &[scion_store::PathChange],
-        ) -> scion_store::Result<()> {
-            self.0.index_paths(r, cs, g, c).await
-        }
-        async fn path_history(
-            &self,
-            r: &str,
-            p: &str,
-            g: u64,
-            l: usize,
-        ) -> scion_store::Result<Vec<scion_store::PathHistoryEntry>> {
-            self.0.path_history(r, p, g, l).await
-        }
-        async fn get_derived(&self, r: &str, k: &str, v: u32, key: &[u8]) -> scion_store::Result<Option<Vec<u8>>> {
-            self.0.get_derived(r, k, v, key).await
-        }
-        async fn put_derived(&self, r: &str, k: &str, v: u32, key: &[u8], val: &[u8]) -> scion_store::Result<()> {
-            self.0.put_derived(r, k, v, key, val).await
+/// 可以注入故障的存储：让接下来若干次提交以版本不符失败、返回后端错误，或在提交前等待放行。
+struct Hooked {
+    inner: Arc<MemStore>,
+    mismatches: std::sync::atomic::AtomicU32,
+    backend_error: std::sync::atomic::AtomicBool,
+    gate: Option<Arc<tokio::sync::Semaphore>>,
+    commits: std::sync::atomic::AtomicU32,
+}
+
+/// 计数大于 0 时减 1 并返回 true。
+fn take_one(n: &std::sync::atomic::AtomicU32) -> bool {
+    let mut cur = n.load(Ordering::SeqCst);
+    while cur > 0 {
+        match n.compare_exchange(cur, cur - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(actual) => cur = actual,
         }
     }
+    false
+}
+
+impl Hooked {
+    fn new(inner: Arc<MemStore>) -> Self {
+        Self {
+            inner,
+            mismatches: 0.into(),
+            backend_error: false.into(),
+            gate: None,
+            commits: 0.into(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl MetaStore for Hooked {
+    async fn create_repo(&self, r: &str) -> scion_store::Result<()> {
+        self.inner.create_repo(r).await
+    }
+    async fn repo_exists(&self, r: &str) -> scion_store::Result<bool> {
+        self.inner.repo_exists(r).await
+    }
+    async fn list_repos(&self) -> scion_store::Result<Vec<String>> {
+        self.inner.list_repos().await
+    }
+    async fn get_ref(&self, r: &str, n: &str) -> scion_store::Result<Option<scion_store::RefState>> {
+        self.inner.get_ref(r, n).await
+    }
+    async fn land_commit(
+        &self,
+        r: &str,
+        n: &str,
+        e: scion_store::RefExpect,
+        t: ObjectId,
+        l: &[scion_store::LandedChange],
+        q: &[scion_store::IdempotencyRecord],
+    ) -> scion_store::Result<scion_store::RefState> {
+        if let Some(gate) = &self.gate {
+            gate.acquire().await.expect("gate").forget();
+        }
+        self.commits.fetch_add(1, Ordering::SeqCst);
+        if self.backend_error.load(Ordering::SeqCst) {
+            return Err(scion_store::Error::Backend("injected".into()));
+        }
+        if take_one(&self.mismatches) {
+            return Err(scion_store::Error::RefVersionMismatch {
+                name: n.to_owned(),
+                current: None,
+            });
+        }
+        self.inner.land_commit(r, n, e, t, l, q).await
+    }
+    async fn landed_changes(
+        &self,
+        r: &str,
+        n: &str,
+        c: &[[u8; 16]],
+    ) -> scion_store::Result<Vec<scion_store::LandedChange>> {
+        self.inner.landed_changes(r, n, c).await
+    }
+    async fn get_idempotency(&self, r: &str, id: &str) -> scion_store::Result<Option<scion_store::IdempotencyRecord>> {
+        self.inner.get_idempotency(r, id).await
+    }
+    async fn expire_idempotency(&self, before: i64) -> scion_store::Result<u64> {
+        self.inner.expire_idempotency(before).await
+    }
+    async fn index_objects(&self, r: &str, o: &[IndexedObject]) -> scion_store::Result<()> {
+        self.inner.index_objects(r, o).await
+    }
+    async fn missing_objects(&self, r: &str, ids: &[ObjectId]) -> scion_store::Result<Vec<ObjectId>> {
+        self.inner.missing_objects(r, ids).await
+    }
+    async fn object_sizes(
+        &self,
+        r: &str,
+        ids: &[ObjectId],
+    ) -> scion_store::Result<std::collections::HashMap<ObjectId, u64>> {
+        self.inner.object_sizes(r, ids).await
+    }
+    async fn put_changeset(&self, r: &str, rec: &scion_store::ChangesetRecord) -> scion_store::Result<()> {
+        self.inner.put_changeset(r, rec).await
+    }
+    async fn get_changeset(&self, r: &str, id: &ObjectId) -> scion_store::Result<Option<scion_store::ChangesetRecord>> {
+        self.inner.get_changeset(r, id).await
+    }
+    async fn list_refs(&self, r: &str) -> scion_store::Result<Vec<(String, scion_store::RefState)>> {
+        self.inner.list_refs(r).await
+    }
+    async fn changesets_below(
+        &self,
+        r: &str,
+        g: u64,
+        l: usize,
+    ) -> scion_store::Result<Vec<scion_store::ChangesetRecord>> {
+        self.inner.changesets_below(r, g, l).await
+    }
+    async fn repair_lineage(
+        &self,
+        r: &str,
+        id: &ObjectId,
+        p: &[ObjectId],
+        d: u64,
+        j: Option<ObjectId>,
+    ) -> scion_store::Result<()> {
+        self.inner.repair_lineage(r, id, p, d, j).await
+    }
+    async fn index_paths(
+        &self,
+        r: &str,
+        cs: ObjectId,
+        g: u64,
+        c: &[scion_store::PathChange],
+    ) -> scion_store::Result<()> {
+        self.inner.index_paths(r, cs, g, c).await
+    }
+    async fn path_history(
+        &self,
+        r: &str,
+        p: &str,
+        g: u64,
+        l: usize,
+    ) -> scion_store::Result<Vec<scion_store::PathHistoryEntry>> {
+        self.inner.path_history(r, p, g, l).await
+    }
+    async fn get_derived(&self, r: &str, k: &str, v: u32, key: &[u8]) -> scion_store::Result<Option<Vec<u8>>> {
+        self.inner.get_derived(r, k, v, key).await
+    }
+    async fn put_derived(&self, r: &str, k: &str, v: u32, key: &[u8], val: &[u8]) -> scion_store::Result<()> {
+        self.inner.put_derived(r, k, v, key, val).await
+    }
+}
+
+#[tokio::test]
+async fn contention_is_reported_after_max_attempts() {
     let fx = Fx::new().await;
     let a = fx.commit(&[], &[]).await;
-    let w = Arc::new(ChangesetWriter::new(
-        Arc::new(AlwaysMoved(fx.store.clone())),
-        fx.store.clone(),
-    ));
+    let hooked = Hooked::new(fx.store.clone());
+    hooked.mismatches.store(u32::MAX, Ordering::SeqCst);
+    let w = Arc::new(ChangesetWriter::new(Arc::new(hooked), fx.store.clone()));
     let l = Lander::new(w).with_max_attempts(2);
     assert_eq!(l.land(req(REPO, "main", a, false)).await, Err(LandError::Contention));
 }
@@ -728,4 +762,277 @@ fn error_conversions() {
         .to_string()
         .contains("0 paths")
     );
+}
+
+// ---- Coordinator ----
+
+fn coordinator(w: Arc<ChangesetWriter>) -> Coordinator {
+    Coordinator::new(w, CoordinatorConfig::default())
+}
+
+fn with_id<'a>(tip: ObjectId, id: &'a str) -> LandRequest<'a> {
+    LandRequest {
+        request_id: Some(id),
+        ..req(REPO, "main", tip, false)
+    }
+}
+
+#[tokio::test]
+async fn coordinator_lands_like_lander() {
+    let fx = Fx::new().await;
+    let c = coordinator(fx.w.clone());
+    let a = fx.commit(&[], &[("f", Some("1"))]).await;
+    let b = fx.commit(&[a], &[("f", Some("2"))]).await;
+    let side = fx.commit(&[a], &[("g", Some("1"))]).await;
+    let o = c.land(req(REPO, "main", a, false)).await.expect("create");
+    assert_eq!((o.state.version, o.landed.len()), (1, 1));
+    let o = c.land(with_id(b, "rb")).await.expect("ff");
+    assert_eq!((o.state.target, o.state.version), (b, 2));
+    assert_eq!(c.status(REPO, "rb").await, Ok(Some(o.clone())));
+    assert_eq!(
+        c.land(with_id(b, "rb")).await,
+        Ok(o.clone()),
+        "replayed without queueing"
+    );
+    let r = c.land(req(REPO, "main", side, false)).await.expect("rebase");
+    assert_eq!(fx.read(r.state.target, "f").await.as_deref(), Some("2"));
+    assert_eq!(fx.read(r.state.target, "g").await.as_deref(), Some("1"));
+    let noop = c.land(req(REPO, "main", b, false)).await.expect("included");
+    assert_eq!((noop.state, noop.landed.len()), (r.state, 0));
+    assert_eq!(c.status(REPO, "nope").await, Ok(None));
+    assert_eq!(
+        c.land(with_id(a, "rb")).await,
+        Err(LandError::RequestIdReused("rb".into()))
+    );
+    assert_eq!(
+        c.land(req(REPO, "bad//ref", a, false)).await,
+        Err(LandError::InvalidRef("bad//ref".into()))
+    );
+    assert_eq!(
+        c.land(req("nope", "main", a, false)).await,
+        Err(LandError::RepoNotFound("nope".into()))
+    );
+    assert_eq!(
+        c.land(req(REPO, "main", fx.commit(&[a], &[]).await, true)).await,
+        Err(LandError::NotFastForward { tip: r.state.target })
+    );
+    assert_eq!(c.writer().meta().list_repos().await.expect("repos"), [REPO]);
+}
+
+/// 并发的互不冲突的合入被攒成批：全部成功、每个 change 恰好一次，ref 版本数远少于请求数。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn coordinator_batches_concurrent_lands() {
+    let fx = Arc::new(Fx::new().await);
+    let base = fx.commit(&[], &[("base", Some("0"))]).await;
+    let c = coordinator(fx.w.clone());
+    c.land(req(REPO, "main", base, false)).await.expect("base");
+    const N: usize = 100;
+    let mut tips = Vec::new();
+    for i in 0..N {
+        let path = format!("f{i}");
+        tips.push(fx.commit(&[base], &[(path.as_str(), Some("x"))]).await);
+    }
+    let tasks: Vec<_> = tips
+        .into_iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let c = c.clone();
+            tokio::spawn(async move {
+                let id = format!("req-{i}");
+                c.land(LandRequest {
+                    request_id: Some(&id),
+                    ..req(REPO, "main", t, false)
+                })
+                .await
+            })
+        })
+        .collect();
+    let mut versions = std::collections::BTreeSet::new();
+    for t in tasks {
+        let o = t.await.expect("join").expect("land");
+        assert_eq!(o.landed.len(), 1);
+        versions.insert(o.state.version);
+    }
+    let head = fx.store.get_ref(REPO, "main").await.expect("get").expect("ref");
+    assert_eq!(fx.chain(head.target).await.len(), N + 1);
+    for i in 0..N {
+        assert_eq!(fx.read(head.target, &format!("f{i}")).await.as_deref(), Some("x"));
+    }
+    assert!(
+        head.version < (N as u64) / 2,
+        "batched: {} versions for {N} lands",
+        head.version
+    );
+    assert_eq!(
+        versions.len() as u64,
+        head.version - 1,
+        "every batch reports its own version"
+    );
+    // 每个请求都有幂等记录
+    assert!(c.status(REPO, "req-0").await.expect("status").is_some());
+    assert!(
+        c.status(REPO, &format!("req-{}", N - 1))
+            .await
+            .expect("status")
+            .is_some()
+    );
+}
+
+/// 批内某个请求与前面已接受的请求冲突：只有它失败，其余照常合入。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn coordinator_isolates_conflicts_within_a_batch() {
+    let fx = Arc::new(Fx::new().await);
+    let base = fx.commit(&[], &[("shared", Some("0\n"))]).await;
+    let c = coordinator(fx.w.clone());
+    c.land(req(REPO, "main", base, false)).await.expect("base");
+    let mut tips = Vec::new();
+    for i in 0..8 {
+        let path = format!("own{i}");
+        tips.push(fx.commit(&[base], &[(path.as_str(), Some("x"))]).await);
+    }
+    // 两个请求改了同一行：最多一个成功
+    tips.push(fx.commit(&[base], &[("shared", Some("left\n"))]).await);
+    tips.push(fx.commit(&[base], &[("shared", Some("right\n"))]).await);
+    let tasks: Vec<_> = tips
+        .into_iter()
+        .map(|t| {
+            let c = c.clone();
+            tokio::spawn(async move { c.land(req(REPO, "main", t, false)).await })
+        })
+        .collect();
+    let (mut ok, mut conflicts) = (0, 0);
+    for t in tasks {
+        match t.await.expect("join") {
+            Ok(_) => ok += 1,
+            Err(LandError::Conflict { .. }) => conflicts += 1,
+            Err(e) => panic!("unexpected {e:?}"),
+        }
+    }
+    assert_eq!((ok, conflicts), (9, 1));
+}
+
+/// 同一批中的重复请求：相同 request id 共用结果；不同 id 的同一个 change 只合入一次。
+#[tokio::test]
+async fn coordinator_dedupes_within_a_batch() {
+    let fx = Fx::new().await;
+    let base = fx.commit(&[], &[("a", Some("1"))]).await;
+    let c = Coordinator::new(
+        fx.w.clone(),
+        CoordinatorConfig {
+            max_wait: Duration::from_millis(200),
+            ..CoordinatorConfig::default()
+        },
+    );
+    c.land(req(REPO, "main", base, false)).await.expect("base");
+    let other = fx.commit(&[base], &[("b", Some("1"))]).await;
+    let stale = fx.commit(&[base], &[("c", Some("1"))]).await;
+    let (r1, r2, r3, r4, r5) = tokio::join!(
+        c.land(req(REPO, "main", other, false)),
+        c.land(with_id(stale, "same")),
+        c.land(with_id(stale, "same")),
+        c.land(with_id(stale, "different")),
+        c.land(with_id(other, "same")),
+    );
+    let first = r2.expect("stale");
+    assert_eq!(r3, Ok(first.clone()), "same request id shares the result");
+    let r4 = r4.expect("different id");
+    assert_eq!((r4.landed.len(), r4.previously_landed.len()), (0, 1));
+    assert_eq!(r5, Err(LandError::RequestIdReused("same".into())));
+    let head = r1.expect("other").state;
+    assert_eq!(head.version, 2, "one batch");
+    assert_eq!(fx.chain(head.target).await.len(), 3, "base, other, stale' (once)");
+}
+
+#[tokio::test]
+async fn coordinator_redoes_batch_when_ref_moves_and_reports_store_errors() {
+    let fx = Fx::new().await;
+    let base = fx.commit(&[], &[]).await;
+    let hooked = Arc::new(Hooked::new(fx.store.clone()));
+    let w = Arc::new(ChangesetWriter::new(hooked.clone(), fx.store.clone()));
+    let c = coordinator(w);
+    c.land(req(REPO, "main", base, false)).await.expect("base");
+    // 两次条件更新失败后成功
+    hooked.mismatches.store(2, Ordering::SeqCst);
+    let t = fx.commit(&[base], &[("x", Some("x"))]).await;
+    let before = hooked.commits.load(Ordering::SeqCst);
+    let o = c.land(req(REPO, "main", t, false)).await.expect("redone");
+    assert_eq!(o.state.version, 2);
+    assert_eq!(hooked.commits.load(Ordering::SeqCst) - before, 3);
+    // 一直失败：Contention
+    let cfg = CoordinatorConfig {
+        max_attempts: 2,
+        ..CoordinatorConfig::default()
+    };
+    let c2 = Coordinator::new(c.writer().clone(), cfg);
+    hooked.mismatches.store(u32::MAX, Ordering::SeqCst);
+    let t2 = fx.commit(&[t], &[("y", Some("y"))]).await;
+    assert_eq!(c2.land(req(REPO, "main", t2, false)).await, Err(LandError::Contention));
+    hooked.mismatches.store(0, Ordering::SeqCst);
+    // 存储故障：整批失败
+    hooked.backend_error.store(true, Ordering::SeqCst);
+    assert_eq!(
+        c.land(req(REPO, "main", t2, false)).await,
+        Err(LandError::Unavailable("injected".into()))
+    );
+}
+
+#[tokio::test]
+async fn coordinator_sheds_load_when_queue_is_full() {
+    let fx = Fx::new().await;
+    let base = fx.commit(&[], &[]).await;
+    let mut hooked = Hooked::new(fx.store.clone());
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    hooked.gate = Some(gate.clone());
+    let w = Arc::new(ChangesetWriter::new(Arc::new(hooked), fx.store.clone()));
+    let c = Coordinator::new(
+        w,
+        CoordinatorConfig {
+            max_batch: 1,
+            queue_capacity: 1,
+            ..CoordinatorConfig::default()
+        },
+    );
+    let tips = [
+        fx.commit(&[base], &[("a", Some("1"))]).await,
+        fx.commit(&[base], &[("b", Some("1"))]).await,
+    ];
+    // 第一个请求卡在提交上，第二个占满队列，第三个被拒
+    let first = tokio::spawn({
+        let c = c.clone();
+        async move { c.land(req(REPO, "main", base, false)).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let second = tokio::spawn({
+        let c = c.clone();
+        let t = tips[0];
+        async move { c.land(req(REPO, "main", t, false)).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        c.land(req(REPO, "main", tips[1], false)).await,
+        Err(LandError::Overloaded)
+    );
+    gate.add_permits(10);
+    first.await.expect("join").expect("first");
+    second.await.expect("join").expect("second");
+}
+
+#[tokio::test]
+async fn coordinator_tasks_exit_when_idle_and_restart() {
+    let fx = Fx::new().await;
+    let c = Coordinator::new(
+        fx.w.clone(),
+        CoordinatorConfig {
+            idle_timeout: Duration::from_millis(30),
+            ..CoordinatorConfig::default()
+        },
+    );
+    let a = fx.commit(&[], &[]).await;
+    c.land(req(REPO, "main", a, false)).await.expect("a");
+    c.land(req(REPO, "dev", a, false)).await.expect("dev");
+    assert_eq!(c.active_refs(), 2);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(c.active_refs(), 0);
+    let b = fx.commit(&[a], &[]).await;
+    assert_eq!(c.land(req(REPO, "main", b, false)).await.expect("b").state.version, 2);
 }

@@ -183,6 +183,12 @@ pub fn from_land(err: scion_land::LandError) -> Status {
         E::RequestIdReused(id) => {
             Status::invalid_argument(format!("request_id {id:?} was already used for a different request"))
         }
+        E::Overloaded => with_reason(
+            Code::ResourceExhausted,
+            ErrorReason::RateLimited,
+            "too many pending lands on this ref; retry with backoff",
+            HashMap::new(),
+        ),
         E::Contention => with_reason(
             Code::Unavailable,
             ErrorReason::LandContention,
@@ -373,6 +379,11 @@ mod tests {
             assert_eq!(from_land(e).code(), Code::FailedPrecondition);
         }
         assert_eq!(from_land(E::RequestIdReused("r".into())).code(), Code::InvalidArgument);
+        let s = from_land(E::Overloaded);
+        assert_eq!(
+            (s.code(), info(&s).0.as_str()),
+            (Code::ResourceExhausted, "RATE_LIMITED")
+        );
         let s = from_land(E::Contention);
         assert_eq!((s.code(), info(&s).0.as_str()), (Code::Unavailable, "LAND_CONTENTION"));
         let s = from_land(E::Corrupt("secret".into()));

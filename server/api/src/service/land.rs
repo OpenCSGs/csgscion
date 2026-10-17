@@ -1,7 +1,7 @@
 //! LandService：把 ref 移到指定提交，落后时在服务端 rebase（实现在 `scion-land`）。
 
 use bytes::Bytes;
-use scion_land::{LandError, LandOutcome, LandRequest as Request_, Landed, Lander};
+use scion_land::{Coordinator, LandError, LandOutcome, LandRequest as Request_, Landed};
 use scion_object::ObjectId;
 use scion_proto::v1::land_service_server::LandService;
 use scion_proto::v1::{
@@ -13,12 +13,12 @@ use crate::service::support::{check_repo, parse_id};
 use crate::status;
 
 pub struct LandSvc {
-    lander: Lander,
+    coordinator: Coordinator,
 }
 
 impl LandSvc {
-    pub fn new(lander: Lander) -> Self {
-        Self { lander }
+    pub fn new(coordinator: Coordinator) -> Self {
+        Self { coordinator }
     }
 
     #[cfg(test)]
@@ -40,7 +40,7 @@ impl LandSvc {
         fast_forward_only: bool,
         request_id: Option<&str>,
     ) -> Result<LandOutcome, Status> {
-        self.lander
+        self.coordinator
             .land(Request_ {
                 repo,
                 reference,
@@ -103,9 +103,9 @@ impl LandService for LandSvc {
         if req.request_id.is_empty() {
             return Err(Status::invalid_argument("request_id is required"));
         }
-        check_repo(self.lander.writer().meta().as_ref(), &req.repo).await?;
+        check_repo(self.coordinator.writer().meta().as_ref(), &req.repo).await?;
         let found = self
-            .lander
+            .coordinator
             .status(&req.repo, &req.request_id)
             .await
             .map_err(status::from_land)?;
@@ -132,7 +132,7 @@ mod tests {
     use tonic_types::StatusExt;
 
     fn land_svc(w: &WriteSvc) -> LandSvc {
-        LandSvc::new(Lander::new(w.writer().clone()))
+        LandSvc::new(Coordinator::new(w.writer().clone(), Default::default()))
     }
 
     fn reason(s: &Status) -> (Code, String, std::collections::HashMap<String, String>) {

@@ -113,7 +113,8 @@ pub async fn serve(
     // 上传的分块可能和读取分块一样大
     let write_svc = WriteSvc::new(app.config.clone(), app.meta.clone(), app.blobs.clone());
     // 合入与创建提交共用同一个写入器
-    let land = LandServiceServer::new(LandSvc::new(scion_land::Lander::new(write_svc.writer().clone())));
+    let coordinator = scion_land::Coordinator::new(write_svc.writer().clone(), app.config.land);
+    let land = LandServiceServer::new(LandSvc::new(coordinator));
     let write = WriteServiceServer::new(write_svc).max_decoding_message_size(max_msg);
     let refs = RefServiceServer::new(RefSvc::new(app.meta.clone()));
     let query = QueryServiceServer::new(QuerySvc::new(app.config.clone(), app.meta, app.blobs))

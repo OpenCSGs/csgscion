@@ -243,7 +243,7 @@ mod tests {
             )
             .await
             .expect("create");
-        LandSvc::new(scion_land::Lander::new(w.writer().clone()))
+        LandSvc::new(scion_land::Coordinator::new(w.writer().clone(), Default::default()))
             .land(REPO, "main", cs.id, false)
             .await
             .expect("land");

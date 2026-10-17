@@ -56,6 +56,8 @@ pub struct ServerConfig {
     pub idempotency_ttl: std::time::Duration,
     /// 清理过期幂等记录的间隔。
     pub janitor_interval: std::time::Duration,
+    /// 合入批处理参数（每个 ref 一个批处理任务）。
+    pub land: scion_land::CoordinatorConfig,
 }
 
 impl Default for ServerConfig {
@@ -68,6 +70,7 @@ impl Default for ServerConfig {
             warm_record_cache: true,
             idempotency_ttl: std::time::Duration::from_secs(24 * 3600),
             janitor_interval: std::time::Duration::from_secs(600),
+            land: scion_land::CoordinatorConfig::default(),
         }
     }
 }
