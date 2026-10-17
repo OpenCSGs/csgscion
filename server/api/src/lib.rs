@@ -81,6 +81,13 @@ async fn warm(cache: Arc<scion_store::CachedMeta>) {
     );
 }
 
+/// WriteService 请求的大小上限：不小于上传分块，且能容纳 `max_changes_per_changeset` 个平均 256 字节的
+/// 改动条目，最多 256 MiB。
+fn write_message_limit(limits: &Limits, chunk_msg: usize) -> usize {
+    let changes = usize::try_from(limits.max_changes_per_changeset).unwrap_or(usize::MAX);
+    changes.saturating_mul(256).clamp(chunk_msg, 256 << 20)
+}
+
 /// 在给定监听器上提供全部 gRPC 服务（含标准健康检查），直到 `shutdown` 完成。
 pub async fn serve(
     listener: TcpListener,
@@ -138,7 +145,9 @@ pub async fn serve(
         land_svc = land_svc.with_rate_limit(l);
     }
     let land = LandServiceServer::new(land_svc);
-    let write = WriteServiceServer::new(write_svc).max_decoding_message_size(max_msg);
+    // CreateChangeset 一次带全部改动条目：按条目数上限留足空间（每条路径最长 4 KiB，平均远小于此）
+    let max_write = write_message_limit(&app.config.limits, max_msg);
+    let write = WriteServiceServer::new(write_svc).max_decoding_message_size(max_write);
     let hub_for_shutdown = hub.clone();
     let refs = RefServiceServer::new(RefSvc::new(app.meta.clone(), hub));
     let query = QueryServiceServer::new(QuerySvc::new(app.config.clone(), app.meta, app.blobs))
@@ -200,6 +209,26 @@ mod tests {
         .await
         .expect("seed");
         s
+    }
+
+    #[test]
+    fn write_limit_fits_max_changes() {
+        let l = Limits::default();
+        assert_eq!(write_message_limit(&l, 1 << 20), 100_000 * 256);
+        let few = Limits {
+            max_changes_per_changeset: 1,
+            ..Limits::default()
+        };
+        assert_eq!(
+            write_message_limit(&few, 1 << 20),
+            1 << 20,
+            "never below the chunk size"
+        );
+        let many = Limits {
+            max_changes_per_changeset: u32::MAX,
+            ..Limits::default()
+        };
+        assert_eq!(write_message_limit(&many, 1 << 20), 256 << 20, "capped");
     }
 
     #[tokio::test]

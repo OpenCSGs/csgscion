@@ -1,7 +1,7 @@
 //! daemon 的本地对象存储：磁盘上按内容寻址的文件（`objects/<摘要首字节>/<id>`），前面加一层内存缓存。
 //!
-//! - 写入先写临时文件再改名，进程崩溃不会留下半个对象；
-//! - 读取时校验哈希，磁盘损坏的文件被删除并视为未命中；
+//! - 写入直接创建最终文件（不经临时文件和改名，检出大量小文件时文件系统操作减半）；进程崩溃留下的
+//!   半个文件在读取时校验哈希失败，被删除并视为未命中，磁盘损坏的文件同样处理；
 //! - 命中时更新文件修改时间；占用超过容量时按修改时间从旧到新删除，降到容量的 90%。
 
 use std::path::{Path, PathBuf};
@@ -24,8 +24,10 @@ pub struct Cas {
 impl Cas {
     /// 打开（必要时创建）`dir`。`capacity` 为磁盘占用上限，`memory_bytes` 为内存缓存大小。
     pub fn open(dir: &Path, capacity: u64, memory_bytes: u64) -> std::io::Result<Arc<Self>> {
-        std::fs::create_dir_all(dir.join("objects"))?;
-        std::fs::create_dir_all(dir.join("tmp"))?;
+        // 事先建好 256 个子目录，写入时不再逐个检查
+        for b in 0..=255u8 {
+            std::fs::create_dir_all(dir.join("objects").join(hex::encode([b])))?;
+        }
         let used = scan(&dir.join("objects"))?.iter().map(|(_, size, _)| size).sum();
         Ok(Arc::new(Self {
             dir: dir.to_path_buf(),
@@ -78,20 +80,29 @@ impl Cas {
 
     /// 写入（调用方已校验内容与 id 相符）。已存在时什么都不做。
     pub fn put(&self, id: ObjectId, data: &Bytes) -> std::io::Result<()> {
+        self.remember(id, data);
+        self.persist(id, data)
+    }
+
+    /// 只放进内存层（磁盘写入由 [`Cas::persist`] 稍后在后台完成）。
+    pub fn remember(&self, id: ObjectId, data: &Bytes) {
         self.memory.insert(id, data.clone());
+    }
+
+    /// 写入磁盘层。
+    pub fn persist(&self, id: ObjectId, data: &Bytes) -> std::io::Result<()> {
+        use std::io::Write;
         let path = self.path(&id);
-        if path.exists() {
-            return Ok(());
+        let mut f = match std::fs::File::options().write(true).create_new(true).open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        if let Err(e) = f.write_all(data) {
+            drop(f);
+            let _ = std::fs::remove_file(&path);
+            return Err(e);
         }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp = self
-            .dir
-            .join("tmp")
-            .join(format!("{}.{}", hex::encode(&id.digest()[..8]), std::process::id()));
-        std::fs::write(&tmp, data)?;
-        std::fs::rename(&tmp, &path)?;
         let used = self.used.fetch_add(data.len() as u64, Ordering::Relaxed) + data.len() as u64;
         if used > self.capacity {
             self.collect();

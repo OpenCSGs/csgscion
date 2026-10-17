@@ -2834,6 +2834,7 @@ dependencies = [
  "scion-object",
  "scion-proto",
  "scion-store",
+ "scion-wc",
  "tempfile",
  "thiserror",
  "tokio",
@@ -2996,6 +2997,7 @@ name = "scion-wc"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "futures",
  "scion-api",
  "scion-client",
  "scion-object",

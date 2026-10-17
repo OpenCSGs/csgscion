@@ -101,15 +101,26 @@ impl Daemon {
                     v
                 }
             };
+            let mut fetched = Vec::new();
             for (l, r) in leaders.into_iter().zip(results) {
                 let id = l.key().1;
                 if let Ok(b) = &r {
-                    if let Err(e) = self.cas.put(id, b) {
-                        tracing::warn!(%id, error = %e, "writing the object cache failed");
-                    }
+                    self.cas.remember(id, b);
+                    fetched.push((id, b.clone()));
                 }
                 l.complete(r.clone());
                 out.insert(id, r);
+            }
+            // 落盘不阻塞应答：对象已在内存层，随后的读取照样命中
+            if !fetched.is_empty() {
+                let cas = self.cas.clone();
+                tokio::task::spawn_blocking(move || {
+                    for (id, b) in fetched {
+                        if let Err(e) = cas.persist(id, &b) {
+                            tracing::warn!(%id, error = %e, "writing the object cache failed");
+                        }
+                    }
+                });
             }
         }
         let mut retry = Vec::new();

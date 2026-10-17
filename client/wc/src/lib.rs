@@ -122,21 +122,49 @@ async fn flatten(client: &Client, root: ObjectId) -> Result<BTreeMap<String, Tre
     Ok(out)
 }
 
-/// 批量读取一组文件的内容，按顺序交给 `f`。
-async fn fetch_files<'a>(
+/// 同时在途的批量读取数（检出时下载与写文件重叠）。
+const FETCHES_IN_FLIGHT: usize = 8;
+
+/// 检出：批量下载（多批并发）并在后台线程并行写入新文件，返回每个文件的 dirstate 记录。
+async fn checkout_files(
     client: &Client,
-    files: impl IntoIterator<Item = (&'a String, &'a TreeFile)>,
-    mut f: impl FnMut(&'a String, &'a TreeFile, bytes::Bytes) -> Result<()>,
-) -> Result<()> {
-    let files: Vec<_> = files.into_iter().collect();
-    for part in files.chunks(FETCH_BATCH) {
-        let ids: Vec<ObjectId> = part.iter().map(|(_, t)| t.id).collect();
-        let data = client.get_objects(&ids).await?;
-        for ((path, file), d) in part.iter().zip(data) {
-            f(path, file, d)?;
+    root: &Path,
+    files: &BTreeMap<String, TreeFile>,
+) -> Result<Vec<(String, FileRecord)>> {
+    use futures::StreamExt;
+    fsutil::create_parents(root, files.keys().map(String::as_str))?;
+    let list: Vec<(String, TreeFile)> = files.iter().map(|(p, f)| (p.clone(), *f)).collect();
+    let mut fetches = futures::stream::iter(list.chunks(FETCH_BATCH).map(<[_]>::to_vec))
+        .map(|part| async move {
+            let ids: Vec<ObjectId> = part.iter().map(|(_, f)| f.id).collect();
+            client.get_objects(&ids).await.map(|data| (part, data))
+        })
+        .buffered(FETCHES_IN_FLIGHT);
+    let mut writes = tokio::task::JoinSet::new();
+    let mut out = Vec::with_capacity(files.len());
+    while let Some(batch) = fetches.next().await {
+        let (part, data) = batch?;
+        let root = root.to_path_buf();
+        writes.spawn_blocking(move || -> Result<Vec<(String, FileRecord)>> {
+            part.into_iter()
+                .zip(data)
+                .map(|((path, f), d)| {
+                    let mtime_ns = fsutil::create_file(&root, &path, f.mode, &d)?;
+                    Ok((path, record(f.mode, f.id, d.len() as u64, mtime_ns)))
+                })
+                .collect()
+        });
+        // 写入跟不上下载时等一等，限制内存中的批数
+        while writes.len() >= FETCHES_IN_FLIGHT {
+            if let Some(done) = writes.join_next().await {
+                out.extend(done.map_err(|e| Error::Corrupt(format!("checkout task: {e}")))??);
+            }
         }
     }
-    Ok(())
+    while let Some(done) = writes.join_next().await {
+        out.extend(done.map_err(|e| Error::Corrupt(format!("checkout task: {e}")))??);
+    }
+    Ok(out)
 }
 
 impl WorkingCopy {
@@ -152,14 +180,7 @@ impl WorkingCopy {
         let mut dirstate = DirState::default();
         if let Some(tip) = client.resolve_ref(reference).await? {
             let files = flatten(client, tip.root_tree).await?;
-            fetch_files(client, &files, |path, f, data| {
-                let mtime_ns = fsutil::write_file(dir, path, f.mode, &data)?;
-                dirstate
-                    .files
-                    .insert(path.clone(), record(f.mode, f.id, data.len() as u64, mtime_ns));
-                Ok(())
-            })
-            .await?;
+            dirstate.files.extend(checkout_files(client, dir, &files).await?);
             state.base = Some(tip.changeset.to_string());
         }
         paths.save_dirstate(&mut dirstate)?;
