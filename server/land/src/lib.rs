@@ -8,10 +8,11 @@
 
 mod create;
 mod land;
+mod record;
 mod stack;
 
 pub use create::ChangesetWriter;
-pub use land::{LandOutcome, Lander};
+pub use land::{LandOutcome, LandRequest, Lander};
 pub use stack::{Landed, Prepared, StackOptions, prepare};
 
 use scion_merge::{Conflict, MergeError};
@@ -50,6 +51,9 @@ pub enum LandError {
     MergeInStack(ObjectId),
     #[error("stack has more than {0} changesets to rebase")]
     StackTooDeep(usize),
+    /// 同一个 request id 被用于参数不同的请求。
+    #[error("request id {0:?} was already used for a different land request")]
+    RequestIdReused(String),
     /// 条件更新多次失败（ref 写入竞争激烈），可重试。
     #[error("ref changed concurrently too many times")]
     Contention,

@@ -12,6 +12,7 @@ hex.workspace = true
 scion-object.workspace = true
 scion-proto.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true
 tonic-types.workspace = true

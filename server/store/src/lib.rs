@@ -32,6 +32,29 @@ pub struct RefState {
     pub version: u64,
 }
 
+/// 合入过 ref 的 change（`landed` 表）：同一 ref 上每个 change id 只合入一次。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LandedChange {
+    pub change_id: [u8; 16],
+    /// 客户端提交的 changeset。
+    pub changeset: ObjectId,
+    /// 进入 ref 历史的 changeset（经过 rebase 时与 `changeset` 不同）。
+    pub landed: ObjectId,
+    /// 合入后 ref 的版本。
+    pub ref_version: u64,
+}
+
+/// 写请求的结果（`idempotency` 表），按 (仓库, request id) 保存一段时间。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdempotencyRecord {
+    pub request_id: String,
+    /// 请求参数的指纹：同一 request id 参数不同时拒绝。
+    pub fingerprint: Vec<u8>,
+    /// 编码后的结果，原样返回给重试的请求。
+    pub response: Vec<u8>,
+    pub created_at_ms: i64,
+}
+
 /// ref CAS 的前置条件。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefExpect {
@@ -55,7 +78,32 @@ pub trait MetaStore: Send + Sync + 'static {
 
     /// 条件更新 ref：前置条件满足时把 target 设为 `target`，版本加 1（新建时版本为 1）。
     /// 条件不满足时返回 [`Error::RefVersionMismatch`]，其中带上当前版本。
-    async fn cas_ref(&self, repo: &str, name: &str, expect: RefExpect, target: ObjectId) -> Result<RefState>;
+    async fn cas_ref(&self, repo: &str, name: &str, expect: RefExpect, target: ObjectId) -> Result<RefState> {
+        self.land_commit(repo, name, expect, target, &[], &[]).await
+    }
+
+    /// 合入的原子提交（服务端设计文档 §6.2）：在同一个事务里条件更新 ref、登记合入的 change
+    /// （`landed`）和请求结果（`requests`，用于幂等）。ref 条件不满足时什么都不写。
+    ///
+    /// 同一 ref 上已登记过的 change id、已存在的 request id 保留第一次的记录。
+    async fn land_commit(
+        &self,
+        repo: &str,
+        name: &str,
+        expect: RefExpect,
+        target: ObjectId,
+        landed: &[LandedChange],
+        requests: &[IdempotencyRecord],
+    ) -> Result<RefState>;
+
+    /// 查询 change 是否已经合入过 ref，返回已登记的记录（顺序不定）。
+    async fn landed_changes(&self, repo: &str, name: &str, change_ids: &[[u8; 16]]) -> Result<Vec<LandedChange>>;
+
+    /// 读取请求结果（幂等表）。
+    async fn get_idempotency(&self, repo: &str, request_id: &str) -> Result<Option<IdempotencyRecord>>;
+
+    /// 删除 `created_at_ms` 早于 `before_ms` 的请求结果，返回删除的条数。
+    async fn expire_idempotency(&self, before_ms: i64) -> Result<u64>;
 
     /// 把对象登记到仓库的对象索引（幂等）。调用前对象字节必须已写入 [`BlobStore`]：
     /// 索引里有的对象一定可读，这是写入顺序不变式（服务端设计文档 §4.5）。

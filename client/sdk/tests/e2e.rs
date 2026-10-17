@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use scion_api::{App, Limits, ServerConfig, serve};
-use scion_client::{Auth, Client, Error, ObjectId, ProtocolVersion, Role};
+use scion_client::{Auth, Client, Code, Error, ObjectId, ProtocolVersion, Role};
 use scion_proto::v1::ErrorReason;
 use scion_store::{BlobStore, IndexedObject, MemStore, MetaStore};
 use tokio::net::TcpListener;
@@ -265,6 +265,47 @@ async fn write_land_and_query_end_to_end() {
     assert_eq!(rebased.landed[0].changeset, stale.id);
     assert_eq!(rebased.landed[0].landed, rebased.tip);
     assert_eq!(c.read_file("main", "x").await.expect("x").as_ref(), b"x");
+    // 指定 request id：重复调用返回同一结果，可以按 id 查询；同一 change 换 id 再合入不会重复
+    let tracked = c
+        .changeset(Some(rebased.tip))
+        .put("t", "t")
+        .create()
+        .await
+        .expect("tracked");
+    assert_eq!(c.land_status("req-tracked").await.expect("status"), None);
+    let first = c
+        .land_with_id("main", &tracked.id, "req-tracked", false)
+        .await
+        .expect("land");
+    let again = c
+        .land_with_id("main", &tracked.id, "req-tracked", false)
+        .await
+        .expect("replay");
+    assert_eq!(again, first);
+    assert_eq!(c.land_status("req-tracked").await.expect("status"), Some(first.clone()));
+    let err = c
+        .land_with_id("main", &stale.id, "req-tracked", false)
+        .await
+        .expect_err("id reused");
+    assert_eq!(err.reason(), None);
+    assert!(
+        matches!(
+            err,
+            Error::Rpc {
+                code: Code::InvalidArgument,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    let dup = c.land("main", &stale.id).await.expect("change already landed");
+    assert_eq!((dup.tip, dup.landed.len()), (first.tip, 0));
+    // stale 本身不在历史中（进入历史的是 rebase 后的提交），按 change id 认出它已合入
+    assert_eq!(dup.previously_landed.len(), 1);
+    assert_eq!(
+        (dup.previously_landed[0].changeset, dup.previously_landed[0].landed),
+        (stale.id, rebased.tip)
+    );
     // 与 ref 上的改动冲突：返回冲突详情
     let clash = c.changeset(Some(root.id)).put("x", "y").create().await.expect("clash");
     let err = c.land("main", &clash.id).await.expect_err("conflict");

@@ -7,8 +7,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use scion_object::ObjectId;
 use scion_store::{
-    ChangesetRecord, Error, IndexedObject, MetaStore, PathChange, PathHistoryEntry, RefExpect, RefState, Result,
-    validate_repo_name,
+    ChangesetRecord, Error, IdempotencyRecord, IndexedObject, LandedChange, MetaStore, PathChange, PathHistoryEntry,
+    RefExpect, RefState, Result, validate_repo_name,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous};
 
@@ -129,7 +129,15 @@ impl MetaStore for SqliteMetaStore {
         .transpose()
     }
 
-    async fn cas_ref(&self, repo: &str, name: &str, expect: RefExpect, target: ObjectId) -> Result<RefState> {
+    async fn land_commit(
+        &self,
+        repo: &str,
+        name: &str,
+        expect: RefExpect,
+        target: ObjectId,
+        landed: &[LandedChange],
+        requests: &[IdempotencyRecord],
+    ) -> Result<RefState> {
         let repo_id = self.repo_id(repo).await?;
         let target_bytes = target.to_bytes().to_vec();
         let mut tx = self.pool.begin().await.map_err(|e| backend("begin", e))?;
@@ -182,11 +190,105 @@ impl MetaStore for SqliteMetaStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| backend("append ref log", e))?;
+        let now = now_ms();
+        for l in landed {
+            sqlx::query(
+                "INSERT INTO landed (repo_id, ref, change_id, changeset, landed, ref_version, landed_at_ms) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (repo_id, ref, change_id) DO NOTHING",
+            )
+            .bind(repo_id)
+            .bind(name)
+            .bind(l.change_id.to_vec())
+            .bind(l.changeset.to_bytes().to_vec())
+            .bind(l.landed.to_bytes().to_vec())
+            .bind(version_to_db(l.ref_version)?)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| backend("record landed change", e))?;
+        }
+        for r in requests {
+            sqlx::query(
+                "INSERT INTO idempotency (repo_id, request_id, fingerprint, response, created_at_ms) \
+                 VALUES (?, ?, ?, ?, ?) ON CONFLICT (repo_id, request_id) DO NOTHING",
+            )
+            .bind(repo_id)
+            .bind(&r.request_id)
+            .bind(&r.fingerprint)
+            .bind(&r.response)
+            .bind(r.created_at_ms)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| backend("record request result", e))?;
+        }
         tx.commit().await.map_err(|e| backend("commit", e))?;
         Ok(RefState {
             target,
             version: new_version,
         })
+    }
+
+    async fn landed_changes(&self, repo: &str, name: &str, change_ids: &[[u8; 16]]) -> Result<Vec<LandedChange>> {
+        let repo_id = self.repo_id(repo).await?;
+        let mut out = Vec::new();
+        for chunk in change_ids.chunks(MAX_IDS_PER_QUERY) {
+            let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "SELECT change_id, changeset, landed, ref_version FROM landed WHERE repo_id = ",
+            );
+            qb.push_bind(repo_id)
+                .push(" AND ref = ")
+                .push_bind(name)
+                .push(" AND change_id IN (");
+            let mut sep = qb.separated(", ");
+            for c in chunk {
+                sep.push_bind(c.to_vec());
+            }
+            qb.push(")");
+            let rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, i64)> = qb
+                .build_query_as()
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| backend("landed changes", e))?;
+            for (change_id, changeset, landed, version) in rows {
+                out.push(LandedChange {
+                    change_id: change_id
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| Error::Backend(format!("corrupt change id ({} bytes)", change_id.len())))?,
+                    changeset: id_from_db(&changeset)?,
+                    landed: id_from_db(&landed)?,
+                    ref_version: version_from_db(version)?,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    async fn get_idempotency(&self, repo: &str, request_id: &str) -> Result<Option<IdempotencyRecord>> {
+        let repo_id = self.repo_id(repo).await?;
+        let row: Option<(Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT fingerprint, response, created_at_ms FROM idempotency WHERE repo_id = ? AND request_id = ?",
+        )
+        .bind(repo_id)
+        .bind(request_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| backend("get request result", e))?;
+        Ok(row.map(|(fingerprint, response, created_at_ms)| IdempotencyRecord {
+            request_id: request_id.to_owned(),
+            fingerprint,
+            response,
+            created_at_ms,
+        }))
+    }
+
+    async fn expire_idempotency(&self, before_ms: i64) -> Result<u64> {
+        let r = sqlx::query("DELETE FROM idempotency WHERE created_at_ms < ?")
+            .bind(before_ms)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| backend("expire request results", e))?;
+        Ok(r.rows_affected())
     }
 
     async fn index_objects(&self, repo: &str, objects: &[IndexedObject]) -> Result<()> {
@@ -550,6 +652,12 @@ mod tests {
     async fn conformance_derived() {
         let (_dir, s) = fresh().await;
         testsuite::derived(&s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_landing() {
+        let (_dir, s) = fresh().await;
+        testsuite::landing(&s).await;
     }
 
     #[tokio::test]

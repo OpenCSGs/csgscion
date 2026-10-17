@@ -1,5 +1,7 @@
 //! 待合入提交栈的 rebase（服务端设计文档 §6.2、§6.3）。
 
+use std::collections::HashMap;
+
 use scion_merge::{Limits, Outcome, rebase_delta};
 use scion_object::{Changeset, ObjectId};
 use scion_query::{GIT_SHA1_EXTENSION, is_ancestor, load_changeset};
@@ -23,6 +25,8 @@ pub struct Prepared {
     pub tip: ObjectId,
     /// 本次合入的提交，从旧到新。
     pub landed: Vec<Landed>,
+    /// 栈中早已合入过这个 ref 的 change（按 change id 去重，不再重复合入），从旧到新。
+    pub previously_landed: Vec<Landed>,
 }
 
 /// 合入选项。
@@ -49,9 +53,13 @@ impl Default for StackOptions {
 ///
 /// 提交栈是从 `tip` 沿第一父提交往回、直到遇到 `onto` 的祖先为止的提交。栈底的父提交就是 `onto`
 /// 时直接快进；否则逐个 rebase（三方合并），产生新的提交。不修改 ref。
+///
+/// rebase 时，栈中 change id 已经合入过 `reference` 的提交会被跳过（客户端超时后换了 request id 重试、
+/// 或者重复提交同一个 change），不会重复合入。
 pub async fn prepare(
     writer: &ChangesetWriter,
     repo: &str,
+    reference: &str,
     tip: ObjectId,
     onto: Option<ObjectId>,
     opts: StackOptions,
@@ -63,12 +71,14 @@ pub async fn prepare(
         return Ok(Prepared {
             tip,
             landed: vec![landed_as_is(writer, tip_rec.id).await?],
+            previously_landed: Vec::new(),
         });
     };
     if tip == onto || is_ancestor(meta, repo, tip, onto).await? {
         return Ok(Prepared {
             tip: onto,
             landed: Vec::new(),
+            previously_landed: Vec::new(),
         });
     }
 
@@ -86,7 +96,11 @@ pub async fn prepare(
             }
         }
         landed.reverse();
-        return Ok(Prepared { tip, landed });
+        return Ok(Prepared {
+            tip,
+            landed,
+            previously_landed: Vec::new(),
+        });
     }
     if opts.fast_forward_only {
         return Err(LandError::NotFastForward { tip: onto });
@@ -112,11 +126,34 @@ pub async fn prepare(
     }
     stack.reverse();
 
+    let changesets = {
+        let mut v = Vec::with_capacity(stack.len());
+        for r in &stack {
+            v.push(load_changeset(writer.blobs().as_ref(), r.id).await?);
+        }
+        v
+    };
+    let ids: Vec<[u8; 16]> = changesets.iter().map(|c| c.change_id).collect();
+    let already: HashMap<[u8; 16], ObjectId> = meta
+        .landed_changes(repo, reference, &ids)
+        .await?
+        .into_iter()
+        .map(|l| (l.change_id, l.landed))
+        .collect();
+
     let trees = BlobTreeSource(writer.blobs().clone());
     let mut parent = record(writer, repo, onto).await?;
     let mut landed = Vec::with_capacity(stack.len());
-    for r in stack {
-        let cs = load_changeset(writer.blobs().as_ref(), r.id).await?;
+    let mut previously_landed = Vec::new();
+    for (r, cs) in stack.into_iter().zip(changesets) {
+        if let Some(earlier) = already.get(&cs.change_id) {
+            previously_landed.push(Landed {
+                original: r.id,
+                landed: *earlier,
+                change_id: cs.change_id,
+            });
+            continue;
+        }
         let base_root = record(writer, repo, cs.parents[0]).await?.root_tree;
         let outcome = rebase_delta(
             &trees,
@@ -157,7 +194,11 @@ pub async fn prepare(
         });
         parent = new_rec;
     }
-    Ok(Prepared { tip: parent.id, landed })
+    Ok(Prepared {
+        tip: parent.id,
+        landed,
+        previously_landed,
+    })
 }
 
 async fn record(writer: &ChangesetWriter, repo: &str, id: ObjectId) -> Result<ChangesetRecord> {

@@ -52,6 +52,10 @@ pub struct ServerConfig {
     pub record_cache_capacity: u64,
     /// 启动后在后台把各仓库的提交记录预热进缓存。
     pub warm_record_cache: bool,
+    /// 写请求结果（幂等表）的保留时间。
+    pub idempotency_ttl: std::time::Duration,
+    /// 清理过期幂等记录的间隔。
+    pub janitor_interval: std::time::Duration,
 }
 
 impl Default for ServerConfig {
@@ -62,6 +66,8 @@ impl Default for ServerConfig {
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             record_cache_capacity: 1_000_000,
             warm_record_cache: true,
+            idempotency_ttl: std::time::Duration::from_secs(24 * 3600),
+            janitor_interval: std::time::Duration::from_secs(600),
         }
     }
 }

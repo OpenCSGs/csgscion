@@ -10,8 +10,8 @@ use scion_object::ObjectId;
 use crate::error::{Error, Result};
 use crate::repo::validate_repo_name;
 use crate::{
-    BlobStore, ChangesetRecord, IndexedObject, MetaStore, PathChange, PathHistoryEntry, RefExpect, RefState,
-    path_within,
+    BlobStore, ChangesetRecord, IdempotencyRecord, IndexedObject, LandedChange, MetaStore, PathChange,
+    PathHistoryEntry, RefExpect, RefState, path_within,
 };
 
 #[derive(Default)]
@@ -22,6 +22,10 @@ struct RepoData {
     derived: HashMap<(String, u32, Vec<u8>), Vec<u8>>,
     /// PathHistory：(路径, 提交) → (代数, 是否删除)。
     paths: BTreeMap<(String, ObjectId), (u64, bool)>,
+    /// (ref, change id) → 合入记录。
+    landed: HashMap<(String, [u8; 16]), LandedChange>,
+    /// request id → 请求结果。
+    idempotency: HashMap<String, IdempotencyRecord>,
 }
 
 #[derive(Default)]
@@ -93,7 +97,15 @@ impl MetaStore for MemStore {
         Ok(repo_ref(&inner, repo)?.refs.get(name).copied())
     }
 
-    async fn cas_ref(&self, repo: &str, name: &str, expect: RefExpect, target: ObjectId) -> Result<RefState> {
+    async fn land_commit(
+        &self,
+        repo: &str,
+        name: &str,
+        expect: RefExpect,
+        target: ObjectId,
+        landed: &[LandedChange],
+        requests: &[IdempotencyRecord],
+    ) -> Result<RefState> {
         let mut inner = self.write()?;
         let data = repo_mut(&mut inner, repo)?;
         let current = data.refs.get(name).map(|r| r.version);
@@ -114,7 +126,40 @@ impl MetaStore for MemStore {
             version: next_version,
         };
         data.refs.insert(name.to_owned(), state);
+        for l in landed {
+            data.landed.entry((name.to_owned(), l.change_id)).or_insert(*l);
+        }
+        for r in requests {
+            data.idempotency
+                .entry(r.request_id.clone())
+                .or_insert_with(|| r.clone());
+        }
         Ok(state)
+    }
+
+    async fn landed_changes(&self, repo: &str, name: &str, change_ids: &[[u8; 16]]) -> Result<Vec<LandedChange>> {
+        let inner = self.read()?;
+        let data = repo_ref(&inner, repo)?;
+        Ok(change_ids
+            .iter()
+            .filter_map(|c| data.landed.get(&(name.to_owned(), *c)).copied())
+            .collect())
+    }
+
+    async fn get_idempotency(&self, repo: &str, request_id: &str) -> Result<Option<IdempotencyRecord>> {
+        let inner = self.read()?;
+        Ok(repo_ref(&inner, repo)?.idempotency.get(request_id).cloned())
+    }
+
+    async fn expire_idempotency(&self, before_ms: i64) -> Result<u64> {
+        let mut inner = self.write()?;
+        let mut n = 0u64;
+        for data in inner.repos.values_mut() {
+            let before = data.idempotency.len();
+            data.idempotency.retain(|_, r| r.created_at_ms >= before_ms);
+            n += (before - data.idempotency.len()) as u64;
+        }
+        Ok(n)
     }
 
     async fn index_objects(&self, repo: &str, objects: &[IndexedObject]) -> Result<()> {
@@ -309,6 +354,11 @@ mod tests {
     #[tokio::test]
     async fn conformance_derived() {
         testsuite::derived(&MemStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_landing() {
+        testsuite::landing(&MemStore::new()).await;
     }
 
     #[tokio::test]

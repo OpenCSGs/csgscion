@@ -180,6 +180,9 @@ pub fn from_land(err: scion_land::LandError) -> Status {
         e @ (E::UnrelatedHistory { .. } | E::MergeInStack(_) | E::StackTooDeep(_)) => {
             Status::failed_precondition(e.to_string())
         }
+        E::RequestIdReused(id) => {
+            Status::invalid_argument(format!("request_id {id:?} was already used for a different request"))
+        }
         E::Contention => with_reason(
             Code::Unavailable,
             ErrorReason::LandContention,
@@ -369,6 +372,7 @@ mod tests {
         for e in [E::UnrelatedHistory { tip: id }, E::MergeInStack(id), E::StackTooDeep(3)] {
             assert_eq!(from_land(e).code(), Code::FailedPrecondition);
         }
+        assert_eq!(from_land(E::RequestIdReused("r".into())).code(), Code::InvalidArgument);
         let s = from_land(E::Contention);
         assert_eq!((s.code(), info(&s).0.as_str()), (Code::Unavailable, "LAND_CONTENTION"));
         let s = from_land(E::Corrupt("secret".into()));

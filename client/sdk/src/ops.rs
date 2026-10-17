@@ -6,10 +6,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bytes::{Bytes, BytesMut};
 use scion_object::{EntryMode, ObjectId};
 use scion_proto::v1::{
-    self, ChangesetSpec, CreateChangesetRequest, LandRequest, ListDirRequest, ListRefsRequest, ReadFileRequest,
-    ResolveRefRequest, UploadBlobsRequest, file_change, land_service_client::LandServiceClient,
-    query_service_client::QueryServiceClient, ref_service_client::RefServiceClient,
-    write_service_client::WriteServiceClient,
+    self, ChangesetSpec, CreateChangesetRequest, GetLandStatusRequest, LandRequest, LandResponse, LandState,
+    ListDirRequest, ListRefsRequest, ReadFileRequest, ResolveRefRequest, UploadBlobsRequest, file_change,
+    land_service_client::LandServiceClient, query_service_client::QueryServiceClient,
+    ref_service_client::RefServiceClient, write_service_client::WriteServiceClient,
 };
 
 use crate::client::Client;
@@ -38,6 +38,8 @@ pub struct Landed {
     pub version: u64,
     /// 本次合入的提交（从旧到新）；为空表示提交早已在 ref 的历史中。
     pub landed: Vec<LandedChangeset>,
+    /// 早已合入过这个 ref 的 change（同一 ref 上每个 change 只合入一次），没有重复合入。
+    pub previously_landed: Vec<LandedChangeset>,
 }
 
 impl Landed {
@@ -120,6 +122,31 @@ pub(crate) fn mode_from(m: i32) -> Result<EntryMode> {
     }
 }
 
+/// 一次合入在可重试错误下的最多尝试次数（同一个 request id）。
+pub const LAND_ATTEMPTS: u32 = 3;
+
+fn landed_from(resp: &LandResponse) -> Result<Landed> {
+    let list = |v: &[v1::LandedChangeset]| -> Result<Vec<LandedChangeset>> {
+        v.iter()
+            .map(|l| {
+                Ok(LandedChangeset {
+                    changeset: id_from(&l.changeset_id, "changeset id")?,
+                    landed: id_from(&l.landed_id, "landed id")?,
+                    change_id: l.change_id.as_ref().try_into().map_err(|_| {
+                        Error::Protocol(format!("change id must be 16 bytes, got {}", l.change_id.len()))
+                    })?,
+                })
+            })
+            .collect()
+    };
+    Ok(Landed {
+        tip: id_from(&resp.tip, "tip")?,
+        version: resp.ref_version,
+        landed: list(&resp.landed)?,
+        previously_landed: list(&resp.previously_landed)?,
+    })
+}
+
 fn request_id() -> String {
     uuid::Uuid::now_v7().to_string()
 }
@@ -200,43 +227,67 @@ impl Client {
     /// 合入：把 `reference` 移到 `changeset`。落后时由服务端 rebase，冲突时返回 MERGE_CONFLICT
     /// （详情见 [`crate::Error::merge_conflict`]）。
     pub async fn land(&self, reference: &str, changeset: &ObjectId) -> Result<Landed> {
-        self.land_with(reference, changeset, false).await
+        self.land_with_id(reference, changeset, &request_id(), false).await
     }
 
     /// 只允许快进的合入：落后时返回 NOT_FAST_FORWARD。
     pub async fn land_fast_forward(&self, reference: &str, changeset: &ObjectId) -> Result<Landed> {
-        self.land_with(reference, changeset, true).await
+        self.land_with_id(reference, changeset, &request_id(), true).await
     }
 
-    async fn land_with(&self, reference: &str, changeset: &ObjectId, fast_forward_only: bool) -> Result<Landed> {
+    /// 用调用方指定的 request id 合入（例如进程重启后用记下的 id 重试，或用 [`Client::land_status`] 查询）。
+    ///
+    /// 同一个 request id 最多尝试 [`LAND_ATTEMPTS`] 次：网络中断、超时、写入竞争等可重试错误时原样重试，
+    /// 服务端按 request id 去重，不会重复合入。
+    pub async fn land_with_id(
+        &self,
+        reference: &str,
+        changeset: &ObjectId,
+        request_id: &str,
+        fast_forward_only: bool,
+    ) -> Result<Landed> {
         let req = LandRequest {
             repo: self.repo()?,
-            request_id: request_id(),
+            request_id: request_id.to_owned(),
             r#ref: reference.to_owned(),
             changeset_id: bytes_of(changeset),
             fast_forward_only,
         };
+        let mut attempt = 0;
+        let resp = loop {
+            attempt += 1;
+            match LandServiceClient::new(self.channel.clone())
+                .land(self.request(req.clone())?)
+                .await
+            {
+                Ok(r) => break r.into_inner(),
+                Err(s) => {
+                    let e = Error::from(s);
+                    if attempt >= LAND_ATTEMPTS || !e.is_retryable() {
+                        return Err(e);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50 << attempt)).await;
+                }
+            }
+        };
+        landed_from(&resp)
+    }
+
+    /// 按 request id 查询合入结果：成功合入过返回结果；未收到、处理中、失败或已过期时为 `None`。
+    pub async fn land_status(&self, request_id: &str) -> Result<Option<Landed>> {
+        let req = GetLandStatusRequest {
+            repo: self.repo()?,
+            request_id: request_id.to_owned(),
+        };
         let resp = LandServiceClient::new(self.channel.clone())
-            .land(self.request(req)?)
+            .get_land_status(self.request(req)?)
             .await?
             .into_inner();
-        let mut landed = Vec::with_capacity(resp.landed.len());
-        for l in &resp.landed {
-            landed.push(LandedChangeset {
-                changeset: id_from(&l.changeset_id, "changeset id")?,
-                landed: id_from(&l.landed_id, "landed id")?,
-                change_id: l
-                    .change_id
-                    .as_ref()
-                    .try_into()
-                    .map_err(|_| Error::Protocol(format!("change id must be 16 bytes, got {}", l.change_id.len())))?,
-            });
+        match (LandState::try_from(resp.state), resp.result) {
+            (Ok(LandState::Landed), Some(r)) => Ok(Some(landed_from(&r)?)),
+            (Ok(LandState::Landed), None) => Err(Error::Protocol("LANDED status without a result".into())),
+            _ => Ok(None),
         }
-        Ok(Landed {
-            tip: id_from(&resp.tip, "tip")?,
-            version: resp.ref_version,
-            landed,
-        })
     }
 
     /// 解析 ref；不存在时返回 `Ok(None)`。

@@ -9,7 +9,8 @@ use bytes::Bytes;
 use scion_object::{ObjectId, ObjectKind};
 
 use crate::{
-    BlobStore, ChangesetRecord, Error, IndexedObject, MetaStore, PathChange, PathHistoryEntry, RefExpect, RefState,
+    BlobStore, ChangesetRecord, Error, IdempotencyRecord, IndexedObject, LandedChange, MetaStore, PathChange,
+    PathHistoryEntry, RefExpect, RefState,
 };
 
 fn cs(n: u8) -> ObjectId {
@@ -483,6 +484,138 @@ pub async fn fp_skip_chain<S: MetaStore>(s: &S) {
 }
 
 /// 并发 CAS：同一版本上的多个竞争者恰好只有一个成功，且版本严格连续。
+/// 合入的原子提交：ref CAS、landed 行与幂等记录同成同败；已存在的记录保留第一次的值。
+pub async fn landing<S: MetaStore + ?Sized>(s: &S) {
+    s.create_repo("land").await.expect("create");
+    s.create_repo("land2").await.expect("create");
+    let change = |n: u8, v: u64| LandedChange {
+        change_id: [n; 16],
+        changeset: cs(n),
+        landed: cs(n + 100),
+        ref_version: v,
+    };
+    let req = |id: &str, fp: &[u8], t: i64| IdempotencyRecord {
+        request_id: id.to_owned(),
+        fingerprint: fp.to_vec(),
+        response: format!("resp-{id}").into_bytes(),
+        created_at_ms: t,
+    };
+    assert_eq!(s.landed_changes("land", "main", &[[1; 16]]).await, Ok(vec![]));
+    assert_eq!(s.get_idempotency("land", "r1").await, Ok(None));
+
+    let st = s
+        .land_commit(
+            "land",
+            "main",
+            RefExpect::Absent,
+            cs(101),
+            &[change(1, 1)],
+            &[req("r1", b"fp1", 1_000)],
+        )
+        .await
+        .expect("first land");
+    assert_eq!(
+        st,
+        RefState {
+            target: cs(101),
+            version: 1
+        }
+    );
+    assert_eq!(s.get_ref("land", "main").await, Ok(Some(st)));
+    assert_eq!(
+        s.landed_changes("land", "main", &[[1; 16], [2; 16]]).await,
+        Ok(vec![change(1, 1)])
+    );
+    assert_eq!(
+        s.get_idempotency("land", "r1").await,
+        Ok(Some(req("r1", b"fp1", 1_000)))
+    );
+    // 作用域：ref 与仓库都参与区分
+    assert_eq!(s.landed_changes("land", "dev", &[[1; 16]]).await, Ok(vec![]));
+    assert_eq!(s.get_idempotency("land2", "r1").await, Ok(None));
+
+    // 批量：多个 change 与请求；已存在的 change / 请求保留第一次的记录
+    let st = s
+        .land_commit(
+            "land",
+            "main",
+            RefExpect::Version(1),
+            cs(103),
+            &[change(1, 2), change(2, 2), change(3, 2)],
+            &[
+                req("r1", b"other", 2_000),
+                req("r2", b"fp2", 2_000),
+                req("r3", b"fp3", 3_000),
+            ],
+        )
+        .await
+        .expect("batch");
+    assert_eq!(st.version, 2);
+    let mut got = s
+        .landed_changes("land", "main", &[[1; 16], [2; 16], [3; 16]])
+        .await
+        .expect("landed");
+    got.sort_by_key(|c| c.change_id);
+    assert_eq!(got, vec![change(1, 1), change(2, 2), change(3, 2)]);
+    assert_eq!(
+        s.get_idempotency("land", "r1").await,
+        Ok(Some(req("r1", b"fp1", 1_000)))
+    );
+    assert_eq!(
+        s.get_idempotency("land", "r3").await,
+        Ok(Some(req("r3", b"fp3", 3_000)))
+    );
+
+    // 条件不满足：什么都不写
+    let err = s
+        .land_commit(
+            "land",
+            "main",
+            RefExpect::Version(1),
+            cs(104),
+            &[change(4, 2)],
+            &[req("r4", b"fp4", 4_000)],
+        )
+        .await;
+    assert!(matches!(err, Err(Error::RefVersionMismatch { current: Some(2), .. })));
+    assert_eq!(s.landed_changes("land", "main", &[[4; 16]]).await, Ok(vec![]));
+    assert_eq!(s.get_idempotency("land", "r4").await, Ok(None));
+    assert_eq!(
+        s.get_ref("land", "main").await.expect("get").map(|r| r.version),
+        Some(2)
+    );
+    // cas_ref 等价于不带记录的 land_commit
+    assert_eq!(
+        s.cas_ref("land", "main", RefExpect::Version(2), cs(105))
+            .await
+            .map(|r| r.version),
+        Ok(3)
+    );
+
+    // 过期清理：只删除早于界限的记录，跨仓库生效
+    s.land_commit("land2", "main", RefExpect::Absent, cs(1), &[], &[req("old", b"x", 500)])
+        .await
+        .expect("land2");
+    assert_eq!(s.expire_idempotency(2_000).await, Ok(2), "r1 (1000) and old (500)");
+    assert_eq!(s.get_idempotency("land", "r1").await, Ok(None));
+    assert_eq!(s.get_idempotency("land2", "old").await, Ok(None));
+    assert!(
+        s.get_idempotency("land", "r2").await.expect("ok").is_some(),
+        "boundary is exclusive"
+    );
+    assert_eq!(s.expire_idempotency(0).await, Ok(0));
+
+    for r in [
+        s.landed_changes("nope", "main", &[[1; 16]]).await.err(),
+        s.get_idempotency("nope", "r").await.err(),
+        s.land_commit("nope", "main", RefExpect::Absent, cs(1), &[], &[])
+            .await
+            .err(),
+    ] {
+        assert!(matches!(r, Some(Error::RepoNotFound(_))), "{r:?}");
+    }
+}
+
 pub async fn concurrent_cas<S: MetaStore>(s: Arc<S>) {
     const WRITERS: u8 = 16;
     const ROUNDS: u64 = 20;

@@ -10,7 +10,10 @@ use async_trait::async_trait;
 use moka::sync::Cache;
 use scion_object::ObjectId;
 
-use crate::{ChangesetRecord, IndexedObject, MetaStore, PathChange, PathHistoryEntry, RefExpect, RefState, Result};
+use crate::{
+    ChangesetRecord, IdempotencyRecord, IndexedObject, LandedChange, MetaStore, PathChange, PathHistoryEntry,
+    RefExpect, RefState, Result,
+};
 
 /// 在任意 [`MetaStore`] 外加一层提交记录缓存。
 pub struct CachedMeta {
@@ -77,8 +80,30 @@ impl MetaStore for CachedMeta {
         self.inner.get_ref(repo, name).await
     }
 
-    async fn cas_ref(&self, repo: &str, name: &str, expect: RefExpect, target: ObjectId) -> Result<RefState> {
-        self.inner.cas_ref(repo, name, expect, target).await
+    async fn land_commit(
+        &self,
+        repo: &str,
+        name: &str,
+        expect: RefExpect,
+        target: ObjectId,
+        landed: &[LandedChange],
+        requests: &[IdempotencyRecord],
+    ) -> Result<RefState> {
+        self.inner
+            .land_commit(repo, name, expect, target, landed, requests)
+            .await
+    }
+
+    async fn landed_changes(&self, repo: &str, name: &str, change_ids: &[[u8; 16]]) -> Result<Vec<LandedChange>> {
+        self.inner.landed_changes(repo, name, change_ids).await
+    }
+
+    async fn get_idempotency(&self, repo: &str, request_id: &str) -> Result<Option<IdempotencyRecord>> {
+        self.inner.get_idempotency(repo, request_id).await
+    }
+
+    async fn expire_idempotency(&self, before_ms: i64) -> Result<u64> {
+        self.inner.expire_idempotency(before_ms).await
     }
 
     async fn index_objects(&self, repo: &str, objects: &[IndexedObject]) -> Result<()> {
@@ -205,6 +230,11 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_landing() {
+        testsuite::landing(&cached()).await;
+    }
+
+    #[tokio::test]
     async fn conformance_history_index() {
         testsuite::history_index(&cached()).await;
     }
@@ -239,8 +269,30 @@ mod tests {
         async fn get_ref(&self, repo: &str, name: &str) -> Result<Option<RefState>> {
             self.inner.get_ref(repo, name).await
         }
-        async fn cas_ref(&self, repo: &str, name: &str, expect: RefExpect, target: ObjectId) -> Result<RefState> {
-            self.inner.cas_ref(repo, name, expect, target).await
+        async fn land_commit(
+            &self,
+            repo: &str,
+            name: &str,
+            expect: RefExpect,
+            target: ObjectId,
+            landed: &[LandedChange],
+            requests: &[IdempotencyRecord],
+        ) -> Result<RefState> {
+            self.inner
+                .land_commit(repo, name, expect, target, landed, requests)
+                .await
+        }
+
+        async fn landed_changes(&self, repo: &str, name: &str, change_ids: &[[u8; 16]]) -> Result<Vec<LandedChange>> {
+            self.inner.landed_changes(repo, name, change_ids).await
+        }
+
+        async fn get_idempotency(&self, repo: &str, request_id: &str) -> Result<Option<IdempotencyRecord>> {
+            self.inner.get_idempotency(repo, request_id).await
+        }
+
+        async fn expire_idempotency(&self, before_ms: i64) -> Result<u64> {
+            self.inner.expire_idempotency(before_ms).await
         }
         async fn index_objects(&self, repo: &str, objects: &[IndexedObject]) -> Result<()> {
             self.inner.index_objects(repo, objects).await

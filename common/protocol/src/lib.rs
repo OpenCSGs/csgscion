@@ -33,6 +33,8 @@ pub mod features {
     pub const LAND_DIRECT: &str = "land.direct";
     /// 合入时在服务端 rebase 落后的提交栈，冲突返回 MERGE_CONFLICT。
     pub const LAND_REBASE: &str = "land.rebase";
+    /// GetLandStatus 与按 request id 的幂等合入。
+    pub const LAND_STATUS: &str = "land.status";
     pub const REFS: &str = "refs";
     pub const QUERY_READ_FILE: &str = "query.read_file";
     pub const QUERY_LIST_DIR: &str = "query.list_dir";

@@ -13,6 +13,16 @@ use super::*;
 
 const REPO: &str = "r";
 
+fn req<'a>(repo: &'a str, reference: &'a str, tip: ObjectId, fast_forward_only: bool) -> LandRequest<'a> {
+    LandRequest {
+        repo,
+        reference,
+        tip,
+        fast_forward_only,
+        request_id: None,
+    }
+}
+
 struct Fx {
     store: Arc<MemStore>,
     w: Arc<ChangesetWriter>,
@@ -94,7 +104,7 @@ impl Fx {
     }
 
     async fn prepare(&self, tip: ObjectId, onto: Option<ObjectId>) -> Result<Prepared> {
-        prepare(&self.w, REPO, tip, onto, StackOptions::default()).await
+        prepare(&self.w, REPO, "main", tip, onto, StackOptions::default()).await
     }
 
     fn lander(&self) -> Lander {
@@ -208,7 +218,7 @@ async fn prepare_fast_forward_records_the_stack() {
         max_stack: 1,
         ..StackOptions::default()
     };
-    let p = prepare(&fx.w, REPO, c, Some(a), opts).await.expect("long ff");
+    let p = prepare(&fx.w, REPO, "main", c, Some(a), opts).await.expect("long ff");
     assert_eq!((p.tip, p.landed.len()), (c, 1));
     // 合并提交（第一父是 ref 当前提交）可以快进
     let side = fx.commit(&[a], &[("side", Some("s"))]).await;
@@ -301,7 +311,7 @@ async fn prepare_rejections() {
         ..StackOptions::default()
     };
     assert_eq!(
-        prepare(&fx.w, REPO, s1, Some(head), ff_only).await,
+        prepare(&fx.w, REPO, "main", s1, Some(head), ff_only).await,
         Err(LandError::NotFastForward { tip: head })
     );
     let shallow = StackOptions {
@@ -309,7 +319,7 @@ async fn prepare_rejections() {
         ..StackOptions::default()
     };
     assert_eq!(
-        prepare(&fx.w, REPO, s2, Some(head), shallow).await,
+        prepare(&fx.w, REPO, "main", s2, Some(head), shallow).await,
         Err(LandError::StackTooDeep(1))
     );
     let other_root = fx.commit(&[], &[("x", Some("x"))]).await;
@@ -336,23 +346,126 @@ async fn land_creates_fast_forwards_rebases_and_is_idempotent() {
     let b = fx.commit(&[a], &[("f", Some("2"))]).await;
     let side = fx.commit(&[a], &[("g", Some("1"))]).await;
 
-    let o = l.land(REPO, "main", a, false).await.expect("create");
+    let o = l.land(req(REPO, "main", a, false)).await.expect("create");
     assert_eq!((o.state.target, o.state.version, o.landed.len()), (a, 1, 1));
-    let o = l.land(REPO, "main", b, false).await.expect("ff");
+    let o = l.land(req(REPO, "main", b, false)).await.expect("ff");
     assert_eq!((o.state.target, o.state.version), (b, 2));
     // 重复请求：不再写入
-    let again = l.land(REPO, "main", b, false).await.expect("retry");
+    let again = l.land(req(REPO, "main", b, false)).await.expect("retry");
     assert_eq!((again.state, again.landed.len()), (o.state, 0));
     // 落后的提交：服务端 rebase
-    let o = l.land(REPO, "main", side, false).await.expect("rebase");
+    let o = l.land(req(REPO, "main", side, false)).await.expect("rebase");
     assert_eq!(o.state.version, 3);
     assert_ne!(o.state.target, side);
     assert_eq!(fx.read(o.state.target, "f").await.as_deref(), Some("2"));
     assert_eq!(fx.read(o.state.target, "g").await.as_deref(), Some("1"));
     assert_eq!(
-        l.land(REPO, "main", fx.commit(&[a], &[]).await, true).await,
+        l.land(req(REPO, "main", fx.commit(&[a], &[]).await, true)).await,
         Err(LandError::NotFastForward { tip: o.state.target })
     );
+}
+
+#[tokio::test]
+async fn request_id_replays_first_result_and_rejects_reuse() {
+    let fx = Fx::new().await;
+    let l = fx.lander();
+    let a = fx.commit(&[], &[("f", Some("1"))]).await;
+    let b = fx.commit(&[a], &[("g", Some("1"))]).await;
+    l.land(req(REPO, "main", a, false)).await.expect("a");
+    let with_id = |tip, id| LandRequest {
+        request_id: Some(id),
+        ..req(REPO, "main", tip, false)
+    };
+    let first = l.land(with_id(b, "req-1")).await.expect("b");
+    assert_eq!((first.state.version, first.landed.len()), (2, 1));
+    // ref 之后又前进了：重放仍返回第一次的结果（而不是"已在历史中"的当前状态）
+    let c = fx.commit(&[b], &[("h", Some("1"))]).await;
+    l.land(req(REPO, "main", c, false)).await.expect("c");
+    assert_eq!(l.land(with_id(b, "req-1")).await, Ok(first.clone()));
+    assert_eq!(l.status(REPO, "req-1").await, Ok(Some(first)));
+    // 同一个 id 用于不同的请求
+    assert_eq!(
+        l.land(with_id(c, "req-1")).await,
+        Err(LandError::RequestIdReused("req-1".into()))
+    );
+    let ff_only = LandRequest {
+        fast_forward_only: true,
+        ..with_id(b, "req-1")
+    };
+    assert_eq!(l.land(ff_only).await, Err(LandError::RequestIdReused("req-1".into())));
+    // 没有记录：未收到、失败或无需写入的请求
+    assert_eq!(l.status(REPO, "never").await, Ok(None));
+    l.land(with_id(c, "noop")).await.expect("already included");
+    assert_eq!(l.status(REPO, "noop").await, Ok(None));
+    let conflict_base = fx.commit(&[c], &[("f", Some("2"))]).await;
+    l.land(req(REPO, "main", conflict_base, false)).await.expect("f=2");
+    let clash = fx.commit(&[c], &[("f", Some("3"))]).await;
+    assert!(matches!(
+        l.land(with_id(clash, "failed")).await,
+        Err(LandError::Conflict { .. })
+    ));
+    assert_eq!(l.status(REPO, "failed").await, Ok(None), "failures are not recorded");
+}
+
+/// 同一个 change 换了 request id 再次合入（例如客户端超时后重试）：不会重复合入。
+#[tokio::test]
+async fn change_ids_land_only_once_per_ref() {
+    let fx = Fx::new().await;
+    let l = fx.lander();
+    let base = fx.commit(&[], &[("a", Some("1"))]).await;
+    l.land(req(REPO, "main", base, false)).await.expect("base");
+    let other = fx.commit(&[base], &[("b", Some("1"))]).await;
+    l.land(req(REPO, "main", other, false)).await.expect("other");
+    // s1、s2 基于旧的 base：第一次合入时 rebase
+    let s1 = fx.commit(&[base], &[("c", Some("1"))]).await;
+    let first = l.land(req(REPO, "main", s1, false)).await.expect("s1");
+    assert!(first.landed[0].original != first.landed[0].landed);
+    // 再次合入 s1：change 已合入，不产生新提交
+    let again = l.land(req(REPO, "main", s1, false)).await.expect("s1 again");
+    assert_eq!((again.state, again.landed.len()), (first.state, 0));
+    assert_eq!(again.previously_landed, first.landed);
+    // 栈 [s1, s2]：s1 跳过，只合入 s2
+    let s2 = fx.commit(&[s1], &[("d", Some("1"))]).await;
+    let o = l.land(req(REPO, "main", s2, false)).await.expect("s2");
+    assert_eq!(o.landed.len(), 1);
+    assert_eq!(o.landed[0].original, s2);
+    assert_eq!(o.previously_landed[0].original, s1);
+    assert_eq!(fx.chain(o.state.target).await.len(), 4, "base, other, s1', s2'");
+    assert_eq!(fx.read(o.state.target, "d").await.as_deref(), Some("1"));
+    // 不同的 ref 各自独立
+    let dev = l.land(req(REPO, "dev", other, false)).await.expect("dev");
+    let on_dev = l.land(req(REPO, "dev", s1, false)).await.expect("s1 on dev");
+    assert_eq!(on_dev.landed.len(), 1);
+    assert_eq!(on_dev.state.version, dev.state.version + 1);
+}
+
+#[tokio::test]
+async fn corrupt_stored_result_is_reported() {
+    let fx = Fx::new().await;
+    let a = fx.commit(&[], &[]).await;
+    fx.store
+        .land_commit(
+            REPO,
+            "main",
+            scion_store::RefExpect::Absent,
+            a,
+            &[],
+            &[scion_store::IdempotencyRecord {
+                request_id: "bad".into(),
+                fingerprint: record::fingerprint("main", &a, false),
+                response: vec![9, 9],
+                created_at_ms: 0,
+            }],
+        )
+        .await
+        .expect("seed");
+    let l = fx.lander();
+    assert!(matches!(l.status(REPO, "bad").await, Err(LandError::Corrupt(_))));
+    let r = LandRequest {
+        request_id: Some("bad"),
+        ..req(REPO, "main", a, false)
+    };
+    assert!(matches!(l.land(r).await, Err(LandError::Corrupt(_))));
 }
 
 #[tokio::test]
@@ -361,16 +474,16 @@ async fn land_rejects_bad_input() {
     let l = fx.lander();
     let a = fx.commit(&[], &[]).await;
     assert_eq!(
-        l.land(REPO, "bad//ref", a, false).await,
+        l.land(req(REPO, "bad//ref", a, false)).await,
         Err(LandError::InvalidRef("bad//ref".into()))
     );
     assert_eq!(
-        l.land("nope", "main", a, false).await,
+        l.land(req("nope", "main", a, false)).await,
         Err(LandError::RepoNotFound("nope".into()))
     );
     let ghost = ObjectId::hash(ObjectKind::Changeset, b"ghost");
     assert_eq!(
-        l.land(REPO, "main", ghost, false).await,
+        l.land(req(REPO, "main", ghost, false)).await,
         Err(LandError::ObjectsNotUploaded(vec![ghost]))
     );
 }
@@ -380,7 +493,7 @@ async fn land_rejects_bad_input() {
 async fn concurrent_lands_all_succeed_with_rebase() {
     let fx = Arc::new(Fx::new().await);
     let base = fx.commit(&[], &[("base", Some("0"))]).await;
-    fx.lander().land(REPO, "main", base, false).await.expect("base");
+    fx.lander().land(req(REPO, "main", base, false)).await.expect("base");
     let mut tips = Vec::new();
     for i in 0..16 {
         let path = format!("f{i}");
@@ -391,7 +504,7 @@ async fn concurrent_lands_all_succeed_with_rebase() {
         .into_iter()
         .map(|t| {
             let l = lander.clone();
-            tokio::spawn(async move { l.land(REPO, "main", t, false).await })
+            tokio::spawn(async move { l.land(req(REPO, "main", t, false)).await })
         })
         .collect();
     for t in tasks {
@@ -424,17 +537,37 @@ async fn contention_is_reported_after_max_attempts() {
         async fn get_ref(&self, r: &str, n: &str) -> scion_store::Result<Option<scion_store::RefState>> {
             self.0.get_ref(r, n).await
         }
-        async fn cas_ref(
+        async fn land_commit(
             &self,
             _: &str,
             n: &str,
             _: scion_store::RefExpect,
             _: ObjectId,
+            _: &[scion_store::LandedChange],
+            _: &[scion_store::IdempotencyRecord],
         ) -> scion_store::Result<scion_store::RefState> {
             Err(scion_store::Error::RefVersionMismatch {
                 name: n.to_owned(),
                 current: Some(99),
             })
+        }
+        async fn landed_changes(
+            &self,
+            r: &str,
+            n: &str,
+            c: &[[u8; 16]],
+        ) -> scion_store::Result<Vec<scion_store::LandedChange>> {
+            self.0.landed_changes(r, n, c).await
+        }
+        async fn get_idempotency(
+            &self,
+            r: &str,
+            id: &str,
+        ) -> scion_store::Result<Option<scion_store::IdempotencyRecord>> {
+            self.0.get_idempotency(r, id).await
+        }
+        async fn expire_idempotency(&self, before: i64) -> scion_store::Result<u64> {
+            self.0.expire_idempotency(before).await
         }
         async fn index_objects(&self, r: &str, o: &[IndexedObject]) -> scion_store::Result<()> {
             self.0.index_objects(r, o).await
@@ -512,7 +645,7 @@ async fn contention_is_reported_after_max_attempts() {
         fx.store.clone(),
     ));
     let l = Lander::new(w).with_max_attempts(2);
-    assert_eq!(l.land(REPO, "main", a, false).await, Err(LandError::Contention));
+    assert_eq!(l.land(req(REPO, "main", a, false)).await, Err(LandError::Contention));
 }
 
 #[test]
