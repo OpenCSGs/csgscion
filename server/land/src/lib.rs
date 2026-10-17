@@ -52,7 +52,8 @@ pub enum LandError {
     /// 待合入的提交栈中有合并提交（服务端 rebase 只处理线性的提交栈）。
     #[error("changeset {0} in the stack is a merge; land it as a fast-forward or rebase it locally")]
     MergeInStack(ObjectId),
-    #[error("stack has more than {0} changesets to rebase")]
+    /// 一次合入的提交（快进、新建 ref 或 rebase）超过上限，客户端应分段合入。
+    #[error("more than {0} changesets to land at once; land them in smaller steps")]
     StackTooDeep(usize),
     /// 同一个 request id 被用于参数不同的请求。
     #[error("request id {0:?} was already used for a different land request")]

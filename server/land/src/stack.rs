@@ -187,6 +187,26 @@ impl<'a> Batch<'a> {
         })
     }
 
+    /// 快进或新建 ref 时本次进入 ref 的提交，从旧到新：从 `tip` 沿第一父提交往回，直到已在链中的提交
+    /// （新建 ref 时直到根提交）。它们的 change id 都要记下来供之后去重，所以超过 `max` 个时拒绝合入，
+    /// 而不是只记录最近的一部分；客户端应分段合入（`scn import git` 就是这样做的）。
+    async fn fast_forward_stack(&self, tip: &ChangesetRecord, max: usize) -> Result<Vec<Landed>> {
+        let mut landed = Vec::new();
+        let mut cur = tip.clone();
+        loop {
+            if landed.len() == max {
+                return Err(LandError::StackTooDeep(max));
+            }
+            landed.push(self.landed_as_is(cur.id).await?);
+            match cur.first_parent() {
+                Some(p) if !self.included(p).await? => cur = self.record(p).await?,
+                _ => break,
+            }
+        }
+        landed.reverse();
+        Ok(landed)
+    }
+
     fn accept(&mut self, onto: ChangesetRecord, landed: &[Landed]) {
         for l in landed {
             self.in_batch.insert(l.change_id, l.landed);
@@ -199,8 +219,8 @@ impl<'a> Batch<'a> {
         let meta = self.writer.meta().as_ref();
         let tip_rec = self.record(tip).await?;
         let Some(onto) = self.onto.clone() else {
-            // 新建 ref：直接指向 tip
-            let landed = vec![self.landed_as_is(tip).await?];
+            // 新建 ref：直接指向 tip，整段历史都是本次进入 ref 的
+            let landed = self.fast_forward_stack(&tip_rec, opts.max_stack).await?;
             self.base = Some(tip);
             self.accept(tip_rec, &landed);
             return Ok(Prepared {
@@ -217,18 +237,9 @@ impl<'a> Batch<'a> {
             });
         }
 
-        // 快进（链头已在存储中时才可能）：往回记录本次合入的提交，最多 max_stack 个，用于按 change id 去重
+        // 快进（链头已在存储中时才可能）
         if !self.pending.is_pending(&onto.id) && is_ancestor(meta, self.repo, onto.id, tip).await? {
-            let mut landed = Vec::new();
-            let mut cur = tip_rec.clone();
-            while landed.len() < opts.max_stack {
-                landed.push(self.landed_as_is(cur.id).await?);
-                match cur.first_parent() {
-                    Some(p) if !self.included(p).await? => cur = self.record(p).await?,
-                    _ => break,
-                }
-            }
-            landed.reverse();
+            let landed = self.fast_forward_stack(&tip_rec, opts.max_stack).await?;
             self.base = Some(tip);
             self.accept(tip_rec, &landed);
             return Ok(Prepared {

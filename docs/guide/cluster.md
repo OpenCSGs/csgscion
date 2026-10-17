@@ -9,6 +9,7 @@ Scion 服务端是无状态的：多个 `scion server` 节点共享同一个元�
 - 提交是 ref 当前提交的后继：直接快进。
 - ref 已经前进：服务端把待合入的提交栈 rebase 到最新的 ref 上（三方合并）。互不重叠的改动直接合入，双方改了同一个文件的不同位置时自动合并，改了同一处时返回 `MERGE_CONFLICT`，并附上冲突路径和 base / ours / theirs 三个版本的 id。
 - `fast_forward_only=true` 时只允许快进（`scn import git` 使用）。
+- 一次合入最多 256 个提交（快进、新建 ref 和 rebase 都算）：服务端要记下每个进入 ref 的提交的 change id 用于去重，超过时返回 `FAILED_PRECONDITION`，客户端应分段合入。`scn import git` 自动按 256 个一段快进。
 - **恰好一次**：每个请求带 request id。网络中断或超时后用同一个 request id 重试，服务端返回第一次成功的结果（结果保留 24 小时）。同一个 ref 上每个 change id 也只合入一次，即使客户端换了 request id 重新提交。`GetLandStatus` 可以按 request id 查询结果。Rust SDK 在可重试的错误下会自动用同一个 request id 重试。
 
 同一个 ref 上的并发合入由 LandCoordinator 合成批次（最多 64 个或 5 毫秒），按顺序 rebase 后一次提交。冲突的请求单独失败，不影响同批的其它请求。

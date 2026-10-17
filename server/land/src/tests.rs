@@ -195,8 +195,17 @@ async fn prepare_new_ref_and_already_included() {
     let b = fx.commit(&[a], &[("f", Some("2"))]).await;
     let p = fx.prepare(b, None).await.expect("new ref");
     assert_eq!(p.tip, b);
-    assert_eq!(p.landed.len(), 1);
-    assert_eq!((p.landed[0].original, p.landed[0].landed), (b, b));
+    // 新建 ref：整段第一父历史都记录下来（供之后按 change id 去重）
+    assert_eq!(p.landed.iter().map(|l| l.landed).collect::<Vec<_>>(), [a, b]);
+    assert!(p.landed.iter().all(|l| l.original == l.landed));
+    let shallow = StackOptions {
+        max_stack: 1,
+        ..StackOptions::default()
+    };
+    assert_eq!(
+        prepare(&fx.w, REPO, "main", b, None, shallow).await,
+        Err(LandError::StackTooDeep(1))
+    );
     // tip 已经在历史中
     for tip in [a, b] {
         let p = fx.prepare(tip, Some(b)).await.expect("included");
@@ -214,13 +223,23 @@ async fn prepare_fast_forward_records_the_stack() {
     assert_eq!(p.tip, c);
     assert_eq!(p.landed.iter().map(|l| l.landed).collect::<Vec<_>>(), [b, c]);
     assert!(p.landed.iter().all(|l| l.original == l.landed));
-    // 记录数受 max_stack 限制，但快进本身不受限
+    // 超过 max_stack 时拒绝，而不是只记录最近的一部分
+    let opts = StackOptions {
+        max_stack: 2,
+        ..StackOptions::default()
+    };
+    assert_eq!(
+        prepare(&fx.w, REPO, "main", c, Some(a), opts).await.map(|p| p.tip),
+        Ok(c)
+    );
     let opts = StackOptions {
         max_stack: 1,
         ..StackOptions::default()
     };
-    let p = prepare(&fx.w, REPO, "main", c, Some(a), opts).await.expect("long ff");
-    assert_eq!((p.tip, p.landed.len()), (c, 1));
+    assert_eq!(
+        prepare(&fx.w, REPO, "main", c, Some(a), opts).await,
+        Err(LandError::StackTooDeep(1))
+    );
     // 合并提交（第一父是 ref 当前提交）可以快进
     let side = fx.commit(&[a], &[("side", Some("s"))]).await;
     let merge = fx.commit(&[c, side], &[("side", Some("s"))]).await;
@@ -438,6 +457,34 @@ async fn change_ids_land_only_once_per_ref() {
     let on_dev = l.land(req(REPO, "dev", s1, false)).await.expect("s1 on dev");
     assert_eq!(on_dev.landed.len(), 1);
     assert_eq!(on_dev.state.version, dev.state.version + 1);
+}
+
+/// 新建 ref 和快进时整段历史的 change id 都记录下来：之后同一个 change 换了提交再合入时能去重。
+#[tokio::test]
+async fn change_ids_of_whole_new_ref_history_are_recorded() {
+    let fx = Fx::new().await;
+    let l = fx.lander();
+    let root = fx.commit(&[], &[("a", Some("1"))]).await;
+    let mid = fx.changeset(&[root], &[("b", Some("1"))]).await;
+    let mid_id = fx.w.create(REPO, &mid).await.expect("mid").id;
+    let tip = fx.commit(&[mid_id], &[("c", Some("1"))]).await;
+    let created = l.land(req(REPO, "main", tip, true)).await.expect("new ref");
+    assert_eq!(created.landed.len(), 3);
+    // 同一个 change（mid）在 root 上重新提交了一次：不再合入
+    let copy = Changeset::new(
+        vec![root],
+        sig(),
+        sig(),
+        "mid, amended",
+        mid.change_id,
+        vec![FileChange::put("b", EntryMode::File, fx.upload(b"2").await, 1)],
+        BTreeMap::new(),
+    )
+    .expect("cs");
+    let copy_id = fx.w.create(REPO, &copy).await.expect("copy").id;
+    let o = l.land(req(REPO, "main", copy_id, false)).await.expect("deduped");
+    assert_eq!((o.state, o.landed.len()), (created.state, 0));
+    assert_eq!(o.previously_landed[0].landed, mid_id);
 }
 
 #[tokio::test]
@@ -758,7 +805,7 @@ fn error_conversions() {
     // 错误信息
     assert_eq!(
         LandError::StackTooDeep(3).to_string(),
-        "stack has more than 3 changesets to rebase"
+        "more than 3 changesets to land at once; land them in smaller steps"
     );
     assert!(
         LandError::Conflict {
