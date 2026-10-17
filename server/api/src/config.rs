@@ -67,6 +67,8 @@ pub struct ServerConfig {
     /// WatchRefs 轮询元数据库的间隔，即集群中其它节点的合入通知到订阅者的最大延迟
     /// （本节点的合入立即通知）。只轮询有订阅者的仓库。
     pub ref_poll_interval: std::time::Duration,
+    /// L3 进程内的对象缓存与后端读并发上限。
+    pub blob_cache: scion_store::BlobCacheConfig,
 }
 
 /// 令牌桶参数：每秒补充 `per_second` 个，最多积攒 `burst` 个。
@@ -91,6 +93,7 @@ impl Default for ServerConfig {
             max_concurrent_requests: 10_000,
             repo_write_rate: None,
             ref_poll_interval: std::time::Duration::from_secs(1),
+            blob_cache: scion_store::BlobCacheConfig::default(),
         }
     }
 }

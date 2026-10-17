@@ -35,6 +35,18 @@ Earlier milestones: M2 added history queries (log / blame / diff / merge-base, p
 
 Next is M4: the cache layer.
 
+## Performance
+
+Benchmarks run on one machine (Apple M5, 10 cores) with objects in memory; client, cache and server share the machine. Each row links the benchmark so you can rerun it (`cargo test --release -p <crate> --test bench -- --ignored --nocapture`).
+
+| Area | Workload | Result | Target |
+|---|---|---|---|
+| Cache hit rate ([`server/cache/tests/bench.rs`](server/cache/tests/bench.rs)) | 200 clients check out the same 20,000 objects (1–4 KiB) from a cold cache | 99.5% of reads served without L3; each object fetched from L3 exactly once | ≥ 99% |
+| Cache throughput (same) | 64 clients, warm cache, batches of 64 objects over gRPC | 1.61M objects/s per node | ≥ 200k/s |
+| Cache throughput (same) | 64 clients, warm cache, one object per request | 166k requests/s per node | — |
+| Landing ([`server/land/tests/bench.rs`](server/land/tests/bench.rs)) | 2,000 lands on one ref from 200 concurrent clients | PostgreSQL 885/s (p99 379 ms); SQLite 1,921/s (p99 173 ms) | ≥ 200/s, p99 < 500 ms |
+| History queries ([`server/query/tests/bench.rs`](server/query/tests/bench.rs)) | 100,000 commits: log, diff, ancestry, merge-base, blame | p99 < 20 ms on SQLite and PostgreSQL (cold blame 13.6 ms, `log --path` 15.6 ms) | p99 < 100 ms |
+
 ## Quick start
 
 ```sh

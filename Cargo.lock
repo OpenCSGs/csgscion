@@ -2911,6 +2911,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "moka",
+ "scion-flight",
  "scion-object",
  "thiserror",
  "tokio",

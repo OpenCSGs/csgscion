@@ -33,6 +33,18 @@ PostgreSQL 下单个 ref 每秒合入 885 次（p99 379 ms）。线性一致性�
 
 下一步 M4：缓存层。
 
+## 性能
+
+基准在一台机器上运行（Apple M5，10 核），对象放在内存里，客户端、缓存和服务端在同一台机器。每一行都链接了对应的基准测试，可以自行复现（`cargo test --release -p <crate> --test bench -- --ignored --nocapture`）。
+
+| 方面 | 负载 | 结果 | 目标 |
+|---|---|---|---|
+| 缓存命中率（[`server/cache/tests/bench.rs`](server/cache/tests/bench.rs)） | 冷缓存，200 个客户端检出同一组 20000 个对象（1–4 KiB） | 99.5% 的读取不回源 L3；每个对象只从 L3 取一次 | ≥ 99% |
+| 缓存吞吐（同上） | 热缓存，64 个客户端，gRPC 每批 64 个对象 | 单节点每秒 161 万个对象 | ≥ 每秒 20 万 |
+| 缓存吞吐（同上） | 热缓存，64 个客户端，每次请求 1 个对象 | 单节点每秒 16.6 万次请求 | — |
+| 合入（[`server/land/tests/bench.rs`](server/land/tests/bench.rs)） | 200 个并发客户端向同一个 ref 合入 2000 次 | PostgreSQL 每秒 885 次（p99 379 ms）；SQLite 每秒 1921 次（p99 173 ms） | 每秒 ≥ 200 次，p99 < 500 ms |
+| 历史查询（[`server/query/tests/bench.rs`](server/query/tests/bench.rs)） | 10 万提交：log、diff、祖先判断、merge-base、blame | SQLite 与 PostgreSQL 下 p99 均低于 20 ms（冷 blame 13.6 ms，`log --path` 15.6 ms） | p99 < 100 ms |
+
 ## 目录结构
 
 ```

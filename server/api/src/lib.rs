@@ -100,7 +100,13 @@ pub async fn serve(
     if app.config.warm_record_cache {
         tokio::spawn(warm(cached.clone()));
     }
-    let app = App { meta: cached, ..app };
+    // 对象读取：小对象缓存、合并并发读、限制后端并发（§7.3）
+    let blobs: Arc<dyn BlobStore> = Arc::new(scion_store::CachedBlobs::new(app.blobs, app.config.blob_cache));
+    let app = App {
+        meta: cached,
+        blobs,
+        ..app
+    };
     tokio::spawn(janitor(
         app.meta.clone(),
         app.config.idempotency_ttl,

@@ -178,6 +178,20 @@ impl CacheNode {
             }
         }
 
+        // 成为 leader 后再查一次缓存：上一个 leader 可能刚好在我们查缓存和领取之间完成
+        let rechecked = join_all(leaders.iter().map(|l| self.store.get(l.key()))).await;
+        let mut pending = Vec::with_capacity(leaders.len());
+        for (l, hit) in leaders.into_iter().zip(rechecked) {
+            match hit {
+                Some(b) => {
+                    out.insert(*l.key(), Ok(b.clone()));
+                    l.complete(Ok(b));
+                }
+                None => pending.push(l),
+            }
+        }
+        let leaders = pending;
+
         // 自己负责回源的 id，按去向分组，各组并发
         let mut groups: HashMap<Route, Vec<scion_flight::Leader<ObjectId, Outcome>>> = HashMap::new();
         for l in leaders {
