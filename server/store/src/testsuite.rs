@@ -762,3 +762,55 @@ pub async fn concurrent_cas<S: MetaStore>(s: Arc<S>) {
     let last = s.get_ref("race", "main").await.expect("get").expect("exists");
     assert_eq!(last.version, ROUNDS + 1);
 }
+
+fn token(id: &str, subject: &str, created_at_ms: i64) -> crate::TokenRecord {
+    let mut hash = [7u8; 32];
+    hash[..id.len()].copy_from_slice(id.as_bytes());
+    crate::TokenRecord {
+        id: id.into(),
+        hash,
+        kind: "pat".into(),
+        subject: subject.into(),
+        groups: vec!["eng".into(), "ops".into()],
+        description: format!("token {id}"),
+        created_at_ms,
+        expires_at_ms: if id == "t1" { None } else { Some(created_at_ms + 1000) },
+    }
+}
+
+/// 令牌与全局设置。
+pub async fn tokens_and_settings<S: MetaStore + ?Sized>(s: &S) {
+    let (t1, t2, t3) = (
+        token("t1", "alice", 10),
+        token("t2", "bob", 20),
+        token("t3", "alice", 30),
+    );
+    for t in [&t2, &t1, &t3] {
+        s.put_token(t).await.expect("put token");
+    }
+    assert!(s.put_token(&t1).await.is_err(), "duplicate id rejected");
+    assert_eq!(s.get_token(&t1.hash).await.expect("get"), Some(t1.clone()));
+    assert_eq!(s.get_token(&[0; 32]).await.expect("get"), None);
+    assert_eq!(
+        s.list_tokens(None).await.expect("list"),
+        [t1.clone(), t2.clone(), t3.clone()]
+    );
+    assert_eq!(
+        s.list_tokens(Some("alice")).await.expect("list"),
+        [t1.clone(), t3.clone()]
+    );
+    assert!(s.delete_token("t1").await.expect("delete"));
+    assert!(!s.delete_token("t1").await.expect("delete again"));
+    assert_eq!(s.get_token(&t1.hash).await.expect("get"), None);
+    let no_groups = crate::TokenRecord {
+        groups: vec![],
+        ..token("t4", "carol", 40)
+    };
+    s.put_token(&no_groups).await.expect("put");
+    assert_eq!(s.get_token(&no_groups.hash).await.expect("get"), Some(no_groups));
+
+    assert_eq!(s.get_setting("acl").await.expect("get"), None);
+    s.put_setting("acl", b"v1").await.expect("put");
+    s.put_setting("acl", b"v2").await.expect("overwrite");
+    assert_eq!(s.get_setting("acl").await.expect("get").as_deref(), Some(&b"v2"[..]));
+}

@@ -10,6 +10,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "scion/v1/land.proto",
         "scion/v1/ref.proto",
         "scion/v1/query.proto",
+        "scion/v1/auth.proto",
+        "scion/v1/admin.proto",
     ];
     let fds = protox::compile(files, [&root])?;
     tonic_prost_build::configure().bytes(".").compile_fds(fds)?;

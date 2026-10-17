@@ -25,6 +25,7 @@ pub use blobcache::{BlobCacheConfig, CachedBlobs};
 pub use cached::CachedMeta;
 pub use error::{Error, Result};
 pub use mem::MemStore;
+
 pub use repo::{MAX_REPO_NAME_LEN, validate_repo_name};
 
 /// ref 的当前状态。`version` 每次更新加 1，作为 CAS 条件和 fencing token。
@@ -220,6 +221,56 @@ pub trait MetaStore: Send + Sync + 'static {
 
     /// 写入派生数据。派生值由输入唯一决定，重复写入保留第一次的值。
     async fn put_derived(&self, repo: &str, kind: &str, version: u32, key: &[u8], value: &[u8]) -> Result<()>;
+
+    /// 登记不透明令牌（`tokens` 表，只存哈希）。`id` 已存在时返回 [`Error::Backend`]。
+    async fn put_token(&self, _token: &TokenRecord) -> Result<()> {
+        Err(unsupported("tokens"))
+    }
+
+    /// 按令牌哈希查找。
+    async fn get_token(&self, _hash: &[u8; 32]) -> Result<Option<TokenRecord>> {
+        Err(unsupported("tokens"))
+    }
+
+    /// 列出令牌（`subject` 为 `None` 时列出全部），按创建时间排序。
+    async fn list_tokens(&self, _subject: Option<&str>) -> Result<Vec<TokenRecord>> {
+        Err(unsupported("tokens"))
+    }
+
+    /// 按公开标识删除令牌，返回是否存在。
+    async fn delete_token(&self, _id: &str) -> Result<bool> {
+        Err(unsupported("tokens"))
+    }
+
+    /// 读取全局设置（例如访问控制策略）。
+    async fn get_setting(&self, _key: &str) -> Result<Option<Vec<u8>>> {
+        Err(unsupported("settings"))
+    }
+
+    /// 写入（覆盖）全局设置。
+    async fn put_setting(&self, _key: &str, _value: &[u8]) -> Result<()> {
+        Err(unsupported("settings"))
+    }
+}
+
+fn unsupported(what: &str) -> Error {
+    Error::Backend(format!("{what} are not supported by this metadata store"))
+}
+
+/// 不透明令牌（PAT / service token / 刷新令牌）的记录。令牌本身不保存，只保存 SHA-256。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenRecord {
+    /// 公开标识：列出、吊销时使用。
+    pub id: String,
+    pub hash: [u8; 32],
+    /// `pat` 或 `refresh`。
+    pub kind: String,
+    pub subject: String,
+    /// 组名，不能包含换行。
+    pub groups: Vec<String>,
+    pub description: String,
+    pub created_at_ms: i64,
+    pub expires_at_ms: Option<i64>,
 }
 
 /// 已创建 changeset 的元数据。

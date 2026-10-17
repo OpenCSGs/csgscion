@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package scion.v1;
+
+// 管理接口。需要系统管理员权限（ACL 中 repos 含 "*" 且 actions 含 "admin" 的规则）。
+service AdminService {
+  // 当前的访问控制策略（TOML，格式见 docs/guide/auth.md）。
+  rpc GetPolicy(GetPolicyRequest) returns (GetPolicyResponse);
+  // 校验并替换策略；所有节点在 policy_poll 间隔内生效（本节点立即生效）。
+  rpc SetPolicy(SetPolicyRequest) returns (SetPolicyResponse);
+  // 创建不透明令牌（PAT / service token）。令牌只在这次响应中出现。
+  rpc CreateToken(CreateTokenRequest) returns (CreateTokenResponse);
+  rpc ListTokens(ListTokensRequest) returns (ListTokensResponse);
+  rpc RevokeToken(RevokeTokenRequest) returns (RevokeTokenResponse);
+}
+
+message GetPolicyRequest {}
+
+message GetPolicyResponse {
+  // 未设置时为空。
+  string policy = 1;
+}
+
+message SetPolicyRequest {
+  string policy = 1;
+}
+
+message SetPolicyResponse {
+  // 规则条数。
+  uint32 rules = 1;
+}
+
+message CreateTokenRequest {
+  string subject = 1;
+  repeated string groups = 2;
+  string description = 3;
+  // 有效期（秒）；0 表示不过期。
+  uint64 ttl_seconds = 4;
+}
+
+message TokenInfo {
+  // 令牌的公开标识（用于列出和吊销），不是令牌本身。
+  string id = 1;
+  string subject = 2;
+  repeated string groups = 3;
+  string description = 4;
+  // pat 或 refresh。
+  string kind = 5;
+  int64 created_at_ms = 6;
+  // 0 表示不过期。
+  int64 expires_at_ms = 7;
+}
+
+message CreateTokenResponse {
+  string token = 1;
+  TokenInfo info = 2;
+}
+
+message ListTokensRequest {
+  // 为空时列出全部。
+  string subject = 1;
+}
+
+message ListTokensResponse {
+  repeated TokenInfo tokens = 1;
+}
+
+message RevokeTokenRequest {
+  string id = 1;
+}
+
+message RevokeTokenResponse {
+  bool revoked = 1;
+}

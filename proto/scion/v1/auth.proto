@@ -1,0 +1,103 @@
+syntax = "proto3";
+
+package scion.v1;
+
+// 身份与令牌（服务端设计文档 §3.7）。
+//
+// 请求在 metadata `authorization: Bearer <token>` 中携带令牌。令牌可以是：
+// - 服务端签发的短期访问令牌（JWT，ES256，默认 15 分钟）；
+// - 不透明令牌（`scn_` 开头）：PAT / service token，以及 device login 得到的刷新令牌；
+// - 受信任的外部 issuer 签发的 JWT（例如 starhub），按 JWKS 验签。
+// 客户端通常用长期凭据（PAT、刷新令牌、外部 JWT）换取访问令牌，并在过期前重新换取。
+service AuthService {
+  // 当前身份。未开启认证时返回 anonymous。
+  rpc WhoAmI(WhoAmIRequest) returns (WhoAmIResponse);
+  // 用长期凭据换取短期访问令牌。凭据放在请求体中，不需要 authorization。
+  rpc ExchangeToken(ExchangeTokenRequest) returns (ExchangeTokenResponse);
+  // OIDC device flow 第一步：返回用户在浏览器中打开的地址和用户码。仅当服务端声明 feature "auth.device" 时可用。
+  rpc StartDeviceLogin(StartDeviceLoginRequest) returns (StartDeviceLoginResponse);
+  // device flow 第二步：按 interval 轮询，用户完成登录后返回刷新令牌和访问令牌。
+  rpc PollDeviceLogin(PollDeviceLoginRequest) returns (PollDeviceLoginResponse);
+  // 当前身份对仓库（以及可选的 ref / 路径）是否有某个权限。
+  rpc CheckAccess(CheckAccessRequest) returns (CheckAccessResponse);
+}
+
+message WhoAmIRequest {}
+
+message WhoAmIResponse {
+  string subject = 1;
+  repeated string groups = 2;
+  // 服务端是否要求认证。
+  bool auth_required = 3;
+  // 令牌过期时间（Unix 毫秒）；没有过期时间或未认证时为 0。
+  int64 expires_at_ms = 4;
+}
+
+message ExchangeTokenRequest {
+  // PAT、刷新令牌或受信任 issuer 的 JWT。
+  string subject_token = 1;
+}
+
+message ExchangeTokenResponse {
+  string access_token = 1;
+  int64 expires_at_ms = 2;
+  string subject = 3;
+}
+
+message StartDeviceLoginRequest {}
+
+message StartDeviceLoginResponse {
+  // 不透明的登录会话，轮询时带上。
+  string device_code = 1;
+  string user_code = 2;
+  string verification_uri = 3;
+  // 包含用户码的地址（IdP 支持时）。
+  string verification_uri_complete = 4;
+  // 建议的轮询间隔（秒）。
+  uint32 interval_seconds = 5;
+  int64 expires_at_ms = 6;
+}
+
+message PollDeviceLoginRequest {
+  string device_code = 1;
+}
+
+enum DeviceLoginState {
+  DEVICE_LOGIN_STATE_UNSPECIFIED = 0;
+  // 用户尚未完成登录，按 interval 继续轮询。
+  DEVICE_LOGIN_STATE_PENDING = 1;
+  // 轮询太快，加大间隔。
+  DEVICE_LOGIN_STATE_SLOW_DOWN = 2;
+  DEVICE_LOGIN_STATE_COMPLETE = 3;
+  // 用户拒绝或会话过期，需要重新开始。
+  DEVICE_LOGIN_STATE_DENIED = 4;
+  DEVICE_LOGIN_STATE_EXPIRED = 5;
+}
+
+message PollDeviceLoginResponse {
+  DeviceLoginState state = 1;
+  // state = COMPLETE 时：长期刷新令牌（妥善保存）与访问令牌。
+  string refresh_token = 2;
+  string access_token = 3;
+  int64 access_expires_at_ms = 4;
+  string subject = 5;
+}
+
+enum Action {
+  ACTION_UNSPECIFIED = 0;
+  ACTION_READ = 1;
+  ACTION_WRITE = 2;
+  ACTION_LAND = 3;
+  ACTION_ADMIN = 4;
+}
+
+message CheckAccessRequest {
+  string repo = 1;
+  Action action = 2;
+  string ref = 3;
+  string path = 4;
+}
+
+message CheckAccessResponse {
+  bool allowed = 1;
+}

@@ -12,7 +12,7 @@ use scion_object::ObjectId;
 
 use crate::{
     ChangesetRecord, IdempotencyRecord, IndexedObject, LandedChange, Lease, MetaStore, PathChange, PathHistoryEntry,
-    RefExpect, RefState, Result,
+    RefExpect, RefState, Result, TokenRecord,
 };
 
 /// 在任意 [`MetaStore`] 外加一层提交记录缓存。
@@ -211,6 +211,30 @@ impl MetaStore for CachedMeta {
     async fn put_derived(&self, repo: &str, kind: &str, version: u32, key: &[u8], value: &[u8]) -> Result<()> {
         self.inner.put_derived(repo, kind, version, key, value).await
     }
+
+    async fn put_token(&self, token: &TokenRecord) -> Result<()> {
+        self.inner.put_token(token).await
+    }
+
+    async fn get_token(&self, hash: &[u8; 32]) -> Result<Option<TokenRecord>> {
+        self.inner.get_token(hash).await
+    }
+
+    async fn list_tokens(&self, subject: Option<&str>) -> Result<Vec<TokenRecord>> {
+        self.inner.list_tokens(subject).await
+    }
+
+    async fn delete_token(&self, id: &str) -> Result<bool> {
+        self.inner.delete_token(id).await
+    }
+
+    async fn get_setting(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get_setting(key).await
+    }
+
+    async fn put_setting(&self, key: &str, value: &[u8]) -> Result<()> {
+        self.inner.put_setting(key, value).await
+    }
 }
 
 #[cfg(test)]
@@ -253,6 +277,7 @@ mod tests {
     #[tokio::test]
     async fn conformance_leases() {
         testsuite::leases(&cached()).await;
+        testsuite::tokens_and_settings(&cached()).await;
     }
 
     #[tokio::test]
