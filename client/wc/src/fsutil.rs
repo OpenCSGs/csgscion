@@ -144,6 +144,42 @@ pub(crate) fn write_file(root: &Path, rel: &str, mode: Mode, data: &[u8]) -> Res
     Ok(mtime_ns(&meta))
 }
 
+/// 在空目录里新建文件（检出用的快速路径）：不检查已有文件，上级目录由调用方事先建好，权限在创建
+/// 时设置（受 umask 影响，与 git 相同），修改时间从打开的文件读取。已存在时报错。
+pub(crate) fn create_file(root: &Path, rel: &str, mode: Mode, data: &[u8]) -> Result<u64> {
+    use std::io::Write;
+    let path = path_of(root, rel);
+    if mode == Mode::Symlink {
+        return write_file(root, rel, mode, data);
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(if mode == Mode::Executable { 0o755 } else { 0o644 });
+    }
+    let mut f = opts.open(&path).map_err(io(&path))?;
+    f.write_all(data).map_err(io(&path))?;
+    let meta = f.metadata().map_err(io(&path))?;
+    Ok(mtime_ns(&meta))
+}
+
+/// 建好一组文件的全部上级目录。
+pub(crate) fn create_parents<'a>(root: &Path, rels: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    let mut dirs: Vec<&str> = rels
+        .into_iter()
+        .filter_map(|r| r.rsplit_once('/').map(|(d, _)| d))
+        .collect();
+    dirs.sort_unstable();
+    dirs.dedup();
+    for d in dirs {
+        let path = path_of(root, d);
+        std::fs::create_dir_all(&path).map_err(io(&path))?;
+    }
+    Ok(())
+}
+
 /// 删除文件，并逐级删除因此变空的上级目录（不删 root）。
 pub(crate) fn remove_file(root: &Path, rel: &str) -> Result<()> {
     let path = path_of(root, rel);
@@ -208,6 +244,29 @@ mod tests {
             write_file(r, "bad", Mode::Symlink, &[0xff]),
             Err(Error::Corrupt(_))
         ));
+    }
+
+    #[test]
+    fn create_file_fast_path() {
+        let d = tempfile::tempdir().expect("tempdir");
+        let r = d.path();
+        create_parents(r, ["a/b/c.txt", "a/d.txt", "top.txt", "a/b/e.sh"]).expect("dirs");
+        assert!(r.join("a/b").is_dir());
+        create_file(r, "a/b/c.txt", Mode::File, b"c").expect("file");
+        create_file(r, "a/b/e.sh", Mode::Executable, b"#!/bin/sh").expect("exec");
+        create_file(r, "top.txt", Mode::Symlink, b"a/d.txt").expect("link");
+        let found = scan(r).expect("scan");
+        assert_eq!(found["a/b/c.txt"].mode, Mode::File);
+        assert_eq!(found["a/b/e.sh"].mode, Mode::Executable);
+        assert_eq!(found["top.txt"].mode, Mode::Symlink);
+        assert!(
+            create_file(r, "a/b/c.txt", Mode::File, b"again").is_err(),
+            "never overwrites"
+        );
+        assert!(
+            create_file(r, "missing/x", Mode::File, b"x").is_err(),
+            "parents must exist"
+        );
     }
 
     #[test]

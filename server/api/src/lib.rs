@@ -4,6 +4,7 @@ pub mod config;
 pub mod limit;
 mod service;
 pub mod status;
+pub mod watch;
 
 use std::future::Future;
 use std::sync::Arc;
@@ -80,6 +81,13 @@ async fn warm(cache: Arc<scion_store::CachedMeta>) {
     );
 }
 
+/// WriteService 请求的大小上限：不小于上传分块，且能容纳 `max_changes_per_changeset` 个平均 256 字节的
+/// 改动条目，最多 256 MiB。
+fn write_message_limit(limits: &Limits, chunk_msg: usize) -> usize {
+    let changes = usize::try_from(limits.max_changes_per_changeset).unwrap_or(usize::MAX);
+    changes.saturating_mul(256).clamp(chunk_msg, 256 << 20)
+}
+
 /// 在给定监听器上提供全部 gRPC 服务（含标准健康检查），直到 `shutdown` 完成。
 pub async fn serve(
     listener: TcpListener,
@@ -99,7 +107,13 @@ pub async fn serve(
     if app.config.warm_record_cache {
         tokio::spawn(warm(cached.clone()));
     }
-    let app = App { meta: cached, ..app };
+    // 对象读取：小对象缓存、合并并发读、限制后端并发（§7.3）
+    let blobs: Arc<dyn BlobStore> = Arc::new(scion_store::CachedBlobs::new(app.blobs, app.config.blob_cache));
+    let app = App {
+        meta: cached,
+        blobs,
+        ..app
+    };
     tokio::spawn(janitor(
         app.meta.clone(),
         app.config.idempotency_ttl,
@@ -125,13 +139,17 @@ pub async fn serve(
         Some(c) => scion_land::Coordinator::clustered(write_svc.writer().clone(), app.config.land, c.clone()),
         None => scion_land::Coordinator::new(write_svc.writer().clone(), app.config.land),
     };
-    let mut land_svc = LandSvc::new(coordinator.clone());
+    let hub = watch::RefHub::new(app.meta.clone(), app.config.ref_poll_interval);
+    let mut land_svc = LandSvc::new(coordinator.clone()).with_ref_hub(hub.clone());
     if let Some(l) = limiter {
         land_svc = land_svc.with_rate_limit(l);
     }
     let land = LandServiceServer::new(land_svc);
-    let write = WriteServiceServer::new(write_svc).max_decoding_message_size(max_msg);
-    let refs = RefServiceServer::new(RefSvc::new(app.meta.clone()));
+    // CreateChangeset 一次带全部改动条目：按条目数上限留足空间（每条路径最长 4 KiB，平均远小于此）
+    let max_write = write_message_limit(&app.config.limits, max_msg);
+    let write = WriteServiceServer::new(write_svc).max_decoding_message_size(max_write);
+    let hub_for_shutdown = hub.clone();
+    let refs = RefServiceServer::new(RefSvc::new(app.meta.clone(), hub));
     let query = QueryServiceServer::new(QuerySvc::new(app.config.clone(), app.meta, app.blobs))
         .max_encoding_message_size(max_msg);
 
@@ -144,7 +162,11 @@ pub async fn serve(
         .add_service(land)
         .add_service(refs)
         .add_service(query)
-        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
+        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+            shutdown.await;
+            // 结束 WatchRefs 的长连接，否则优雅停机会一直等它们
+            hub_for_shutdown.close();
+        })
         .await;
     // 不再有请求进来：让合入任务处理完手上的批并释放租约
     coordinator.shutdown();
@@ -187,6 +209,26 @@ mod tests {
         .await
         .expect("seed");
         s
+    }
+
+    #[test]
+    fn write_limit_fits_max_changes() {
+        let l = Limits::default();
+        assert_eq!(write_message_limit(&l, 1 << 20), 100_000 * 256);
+        let few = Limits {
+            max_changes_per_changeset: 1,
+            ..Limits::default()
+        };
+        assert_eq!(
+            write_message_limit(&few, 1 << 20),
+            1 << 20,
+            "never below the chunk size"
+        );
+        let many = Limits {
+            max_changes_per_changeset: u32::MAX,
+            ..Limits::default()
+        };
+        assert_eq!(write_message_limit(&many, 1 << 20), 256 << 20, "capped");
     }
 
     #[tokio::test]

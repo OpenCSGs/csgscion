@@ -4,6 +4,7 @@ members = [
     # 服务端和客户端共用：协议生成代码、对象模型
     "common/protocol",
     "common/object",
+    "common/flight",
     # 服务端
     "server/store",
     "server/store-sql",
@@ -12,11 +13,13 @@ members = [
     "server/merge",
     "server/land",
     "server/query",
+    "server/cache",
     "server/api",
     "server/scion",
     # 客户端
     "client/sdk",
     "client/wc",
+    "client/daemon",
     "client/gitimport",
     "client/cli",
     # 开发工具（依赖分层检查等）
@@ -32,6 +35,7 @@ license = "Apache-2.0"
 [workspace.dependencies]
 scion-proto = { path = "common/protocol" }
 scion-object = { path = "common/object" }
+scion-flight = { path = "common/flight" }
 scion-store = { path = "server/store" }
 scion-store-sql = { path = "server/store-sql" }
 scion-store-blob = { path = "server/store-blob" }
@@ -39,9 +43,11 @@ scion-tree = { path = "server/tree" }
 scion-merge = { path = "server/merge" }
 scion-land = { path = "server/land" }
 scion-query = { path = "server/query" }
+scion-cache = { path = "server/cache" }
 scion-api = { path = "server/api" }
 scion-client = { path = "client/sdk" }
 scion-wc = { path = "client/wc" }
+scion-daemon = { path = "client/daemon" }
 scion-gitimport = { path = "client/gitimport" }
 
 anyhow = "1"
@@ -73,6 +79,7 @@ tempfile = "3"
 moka = { version = "0.12", features = ["sync"] }
 object_store = { version = "0.14", default-features = false, features = ["aws", "fs"] }
 diffy = "0.5"
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 
 [workspace.lints.rust]

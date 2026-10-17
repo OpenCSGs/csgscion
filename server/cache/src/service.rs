@@ -1,0 +1,325 @@
+//! 缓存节点对外提供的 gRPC 服务：`ObjectService`（与 L3 的消息定义完全相同）和 `ServerInfoService`
+//! （角色为 CACHE）。
+
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use bytes::Bytes;
+use scion_object::ObjectId;
+use scion_proto::v1::object_service_client::ObjectServiceClient;
+use scion_proto::v1::object_service_server::ObjectService;
+use scion_proto::v1::server_info_service_server::ServerInfoService;
+use scion_proto::v1::{
+    self, Encoding, GetObjectsRequest, GetObjectsResponse, GetServerInfoRequest, GetServerInfoResponse,
+    HasObjectsRequest, HasObjectsResponse,
+};
+use tokio_stream::Stream;
+use tonic::transport::Channel;
+use tonic::{Request, Response, Status};
+
+use crate::node::CacheNode;
+use crate::upstream::{CACHE_FORWARDED_HEADER, RequestCtx};
+
+pub type GetObjectsStream = Pin<Box<dyn Stream<Item = Result<GetObjectsResponse, Status>> + Send>>;
+
+/// 把一个对象从 `start` 开始切成若干分块。`start == len` 时返回一个空的结尾块。
+fn chunk_object(id: &ObjectId, data: Bytes, start: usize, chunk: usize) -> Vec<GetObjectsResponse> {
+    let total = data.len();
+    let id_bytes = Bytes::copy_from_slice(&id.to_bytes());
+    let mut out = Vec::with_capacity((total - start).div_ceil(chunk).max(1));
+    let mut off = start;
+    loop {
+        let end = (off + chunk).min(total);
+        out.push(GetObjectsResponse {
+            id: id_bytes.clone(),
+            offset: off as u64,
+            data: data.slice(off..end),
+            encoding: Encoding::Identity.into(),
+            last: end == total,
+            total_size: total as u64,
+        });
+        if end == total {
+            return out;
+        }
+        off = end;
+    }
+}
+
+fn parse_id(raw: &[u8]) -> Result<ObjectId, Status> {
+    ObjectId::from_bytes(raw).map_err(|e| Status::invalid_argument(format!("invalid object id: {e}")))
+}
+
+fn ctx_of<T>(req: &Request<T>) -> (RequestCtx, bool) {
+    let ctx = RequestCtx {
+        authorization: req.metadata().get("authorization").cloned(),
+    };
+    (ctx, req.metadata().contains_key(CACHE_FORWARDED_HEADER))
+}
+
+pub struct CacheObjectSvc {
+    node: Arc<CacheNode>,
+    limits: v1::Limits,
+    /// HasObjects 不缓存（写路径用），直接转给上游。
+    upstreams: Vec<Channel>,
+    next: AtomicUsize,
+}
+
+impl CacheObjectSvc {
+    pub fn new(node: Arc<CacheNode>, limits: v1::Limits, upstreams: Vec<Channel>) -> Self {
+        Self {
+            node,
+            limits,
+            upstreams,
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    fn check_batch(&self, n: usize) -> Result<(), Status> {
+        let max = self.limits.max_batch_objects as usize;
+        if max > 0 && n > max {
+            return Err(Status::invalid_argument(format!(
+                "{n} objects requested; at most {max} per request (max_batch_objects)"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[tonic::async_trait]
+impl ObjectService for CacheObjectSvc {
+    type GetObjectsStream = GetObjectsStream;
+
+    async fn get_objects(&self, request: Request<GetObjectsRequest>) -> Result<Response<GetObjectsStream>, Status> {
+        let (ctx, forwarded) = ctx_of(&request);
+        let req = request.into_inner();
+        self.check_batch(req.wants.len())?;
+        if !req.accept_encodings.is_empty() && !req.accept_encodings.contains(&(Encoding::Identity as i32)) {
+            return Err(Status::failed_precondition(
+                "none of accept_encodings is supported; IDENTITY is always supported",
+            ));
+        }
+        let ids = req
+            .wants
+            .iter()
+            .map(|w| parse_id(&w.id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let objects = self.node.get_many(&req.repo, &ids, &ctx, forwarded).await?;
+        for ((id, data), want) in ids.iter().zip(&objects).zip(&req.wants) {
+            if want.offset > data.len() as u64 {
+                return Err(Status::out_of_range(format!(
+                    "offset {} beyond size {} of {id}",
+                    want.offset,
+                    data.len()
+                )));
+            }
+        }
+        let chunk = usize::try_from(self.limits.max_chunk_bytes)
+            .unwrap_or(usize::MAX)
+            .max(1);
+        let parts: Vec<_> = ids
+            .iter()
+            .zip(objects)
+            .zip(&req.wants)
+            .flat_map(|((id, data), want)| chunk_object(id, data, want.offset as usize, chunk))
+            .map(Ok)
+            .collect();
+        Ok(Response::new(Box::pin(tokio_stream::iter(parts))))
+    }
+
+    async fn has_objects(&self, request: Request<HasObjectsRequest>) -> Result<Response<HasObjectsResponse>, Status> {
+        if self.upstreams.is_empty() {
+            return Err(Status::unavailable("no upstream configured"));
+        }
+        let (ctx, _) = ctx_of(&request);
+        let i = self.next.fetch_add(1, Ordering::Relaxed) % self.upstreams.len();
+        let mut fwd = Request::new(request.into_inner());
+        if let Some(a) = ctx.authorization {
+            fwd.metadata_mut().insert("authorization", a);
+        }
+        let resp = ObjectServiceClient::new(self.upstreams[i].clone())
+            .has_objects(fwd)
+            .await?;
+        Ok(Response::new(resp.into_inner()))
+    }
+}
+
+pub struct CacheInfoSvc {
+    info: v1::ServerInfo,
+}
+
+impl CacheInfoSvc {
+    /// 由上游的 ServerInfo 派生：限额相同，角色为 CACHE，只声明对象读取相关的能力。
+    pub fn from_upstream(upstream: &v1::ServerInfo) -> Self {
+        let keep = [scion_proto::features::OBJECTS_GET, scion_proto::features::OBJECTS_HAS];
+        let info = v1::ServerInfo {
+            protocol_version: scion_proto::PROTOCOL_VERSION.to_string(),
+            features: upstream
+                .features
+                .iter()
+                .filter(|f| keep.contains(&f.as_str()))
+                .cloned()
+                .collect(),
+            limits: upstream.limits,
+            read_endpoints: Vec::new(),
+            hash_algo: upstream.hash_algo,
+            server_version: env!("CARGO_PKG_VERSION").to_string(),
+            role: v1::ServerRole::Cache.into(),
+        };
+        Self { info }
+    }
+
+    pub fn info(&self) -> &v1::ServerInfo {
+        &self.info
+    }
+}
+
+#[tonic::async_trait]
+impl ServerInfoService for CacheInfoSvc {
+    async fn get_server_info(
+        &self,
+        _request: Request<GetServerInfoRequest>,
+    ) -> Result<Response<GetServerInfoResponse>, Status> {
+        Ok(Response::new(GetServerInfoResponse {
+            info: Some(self.info.clone()),
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ring::Ring;
+    use crate::store::{ObjectCache, StorageConfig};
+    use crate::upstream::tests::Fake;
+    use crate::upstream::{PoolConfig, Upstream, UpstreamPool};
+    use scion_proto::v1::ObjectWant;
+    use std::collections::HashMap;
+    use tokio_stream::StreamExt;
+    use tonic::Code;
+
+    const BIG: &[u8] = b"0123456789";
+
+    async fn svc(limits: v1::Limits) -> CacheObjectSvc {
+        let store = ObjectCache::open(&StorageConfig::default()).await.expect("cache");
+        let up = Arc::new(Fake::new("l3", &[BIG]));
+        let pool = UpstreamPool::new(vec![up as Arc<dyn Upstream>], PoolConfig::default());
+        let node = Arc::new(CacheNode::new(store, Ring::new(Vec::new()), None, HashMap::new(), pool));
+        CacheObjectSvc::new(node, limits, Vec::new())
+    }
+
+    fn limits(batch: u32, chunk: u64) -> v1::Limits {
+        v1::Limits {
+            max_batch_objects: batch,
+            max_chunk_bytes: chunk,
+            ..Default::default()
+        }
+    }
+
+    fn want(data: &[u8], offset: u64) -> ObjectWant {
+        ObjectWant {
+            id: Bytes::copy_from_slice(&ObjectId::of_blob(data).to_bytes()),
+            offset,
+        }
+    }
+
+    async fn get(s: &CacheObjectSvc, req: GetObjectsRequest) -> Result<Vec<GetObjectsResponse>, Status> {
+        s.get_objects(Request::new(req)).await?.into_inner().collect().await
+    }
+
+    #[tokio::test]
+    async fn get_objects_chunks_and_resumes() {
+        let s = svc(limits(10, 4)).await;
+        let parts = get(
+            &s,
+            GetObjectsRequest {
+                repo: "r".into(),
+                wants: vec![want(BIG, 0), want(BIG, 8)],
+                accept_encodings: vec![],
+            },
+        )
+        .await
+        .expect("ok");
+        let offsets: Vec<_> = parts.iter().map(|p| (p.offset, p.last)).collect();
+        assert_eq!(offsets, [(0, false), (4, false), (8, true), (8, true)]);
+        let whole: Vec<u8> = parts[..3].iter().flat_map(|p| p.data.to_vec()).collect();
+        assert_eq!(whole, BIG);
+        // 从末尾续传：一个空的结尾块
+        let end = get(
+            &s,
+            GetObjectsRequest {
+                repo: "r".into(),
+                wants: vec![want(BIG, 10)],
+                accept_encodings: vec![Encoding::Identity as i32],
+            },
+        )
+        .await
+        .expect("ok");
+        assert_eq!((end.len(), end[0].data.len(), end[0].last), (1, 0, true));
+    }
+
+    #[tokio::test]
+    async fn get_objects_rejections() {
+        let s = svc(limits(1, 4)).await;
+        let code = |r: Result<Vec<GetObjectsResponse>, Status>| r.err().map(|e| e.code());
+        let req = |wants, enc| GetObjectsRequest {
+            repo: "r".into(),
+            wants,
+            accept_encodings: enc,
+        };
+        assert_eq!(
+            code(get(&s, req(vec![want(BIG, 0), want(BIG, 0)], vec![])).await),
+            Some(Code::InvalidArgument),
+            "batch limit"
+        );
+        assert_eq!(
+            code(get(&s, req(vec![want(BIG, 0)], vec![Encoding::Zstd as i32])).await),
+            Some(Code::FailedPrecondition)
+        );
+        let bad = ObjectWant {
+            id: Bytes::from_static(b"x"),
+            offset: 0,
+        };
+        assert_eq!(code(get(&s, req(vec![bad], vec![])).await), Some(Code::InvalidArgument));
+        assert_eq!(
+            code(get(&s, req(vec![want(BIG, 11)], vec![])).await),
+            Some(Code::OutOfRange)
+        );
+        assert_eq!(
+            code(get(&s, req(vec![want(b"missing", 0)], vec![])).await),
+            Some(Code::FailedPrecondition),
+            "upstream error passed through"
+        );
+        let unlimited = svc(limits(0, 0)).await;
+        assert!(
+            get(&unlimited, req(vec![want(BIG, 0), want(BIG, 0)], vec![]))
+                .await
+                .is_ok()
+        );
+        let none = unlimited
+            .has_objects(Request::new(HasObjectsRequest::default()))
+            .await
+            .map(|_| ());
+        assert_eq!(none.map_err(|e| e.code()), Err(Code::Unavailable));
+    }
+
+    #[test]
+    fn info_keeps_object_features_and_limits() {
+        let up = v1::ServerInfo {
+            protocol_version: "1.0".into(),
+            features: vec![
+                scion_proto::features::OBJECTS_GET.into(),
+                scion_proto::features::LAND_DIRECT.into(),
+                scion_proto::features::OBJECTS_HAS.into(),
+            ],
+            limits: Some(limits(7, 9)),
+            hash_algo: v1::HashAlgo::Blake3256.into(),
+            role: v1::ServerRole::Server.into(),
+            ..Default::default()
+        };
+        let i = CacheInfoSvc::from_upstream(&up);
+        assert_eq!(i.info().features, ["objects.get", "objects.has"]);
+        assert_eq!(i.info().role, v1::ServerRole::Cache as i32);
+        assert_eq!(i.info().limits.map(|l| l.max_batch_objects), Some(7));
+    }
+}

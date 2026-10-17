@@ -7,6 +7,7 @@
 //! 本 crate 提供内存实现 [`MemStore`]；SQLite / PostgreSQL / YugabyteDB 与 S3 实现位于其它 crate，
 //! 都必须通过 [`testsuite`]（feature `testsuite`）中的一致性测试。
 
+mod blobcache;
 mod cached;
 mod error;
 mod mem;
@@ -20,6 +21,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use scion_object::ObjectId;
 
+pub use blobcache::{BlobCacheConfig, CachedBlobs};
 pub use cached::CachedMeta;
 pub use error::{Error, Result};
 pub use mem::MemStore;

@@ -8,7 +8,7 @@ license.workspace = true
 
 [features]
 # 对外提供 conformance 测试套件，供其它存储后端（SQLite / PG / YugabyteDB / S3）复用
-testsuite = ["dep:tokio"]
+testsuite = []
 
 [dependencies]
 async-trait.workspace = true
@@ -16,7 +16,8 @@ bytes.workspace = true
 moka.workspace = true
 scion-object.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, optional = true }
+scion-flight.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

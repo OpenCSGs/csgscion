@@ -29,6 +29,7 @@ impl ServerInfoSvc {
             features::LAND_REBASE,
             features::LAND_STATUS,
             features::REFS,
+            features::REFS_WATCH,
             features::QUERY_READ_FILE,
             features::QUERY_LIST_DIR,
             features::QUERY_LOG,

@@ -12,6 +12,8 @@ fn scn(args: &[&str]) -> std::process::Output {
         .args(args)
         .env_remove("SCION_ENDPOINT")
         .env_remove("SCION_TOKEN")
+        // daemon 有专门的测试；其余测试直连，不在机器上留下后台进程
+        .env("SCION_NO_DAEMON", "1")
         .output()
         .expect("run scn")
 }
@@ -97,6 +99,7 @@ fn scn_in(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
         .env_remove("SCION_TOKEN")
         .env_remove("SCION_REPO")
         .env_remove("SCION_AUTHOR")
+        .env("SCION_NO_DAEMON", "1")
         .output()
         .expect("run scn")
 }
@@ -362,4 +365,71 @@ async fn log_and_diff_commands() {
     .await
     .expect("join");
     let _ = tx.send(());
+}
+
+/// 默认经 daemon：第一次连接时自动拉起，之后 status / stop 管理它。
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn daemon_is_started_on_demand_and_can_be_stopped() {
+    let store = Arc::new(MemStore::new());
+    scion_store::MetaStore::create_repo(store.as_ref(), "mono")
+        .await
+        .expect("repo");
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("addr"));
+    let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let app = App {
+        config: Arc::new(ServerConfig::default()),
+        meta: store.clone(),
+        blobs: store,
+    };
+    tokio::spawn(serve(listener, app, async {
+        let _ = rx.await;
+    }));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("d.sock");
+    let run = |args: &[&str]| {
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let socket = socket.clone();
+        let cache = dir.path().join("cache");
+        let url = url.clone();
+        std::thread::spawn(move || {
+            Command::new(env!("CARGO_BIN_EXE_scn"))
+                .args(&args)
+                .env("SCION_ENDPOINT", &url)
+                .env("SCION_DAEMON_SOCKET", &socket)
+                .env("SCION_DAEMON_CACHE_DIR", &cache)
+                .env_remove("SCION_NO_DAEMON")
+                .env_remove("SCION_TOKEN")
+                .output()
+                .expect("run scn")
+        })
+        .join()
+        .expect("thread")
+    };
+    let out = run(&["daemon", "status", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(v["running"], false);
+
+    // doctor 经 daemon 连接：daemon 被自动拉起
+    let out = run(&["doctor", "--json"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert!(v["objects"].as_str().expect("objects").starts_with("daemon"), "{v}");
+    assert_eq!(v["role"], "server", "capabilities come from the server");
+
+    let out = run(&["daemon", "status", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(v["running"], true);
+    assert!(v["pid"].as_u64().is_some());
+
+    // 写入与读取都经 daemon
+    let out = run(&["ls", "--repo", "mono", "main:"]);
+    assert!(!out.status.success(), "ref main does not exist yet");
+    let out = run(&["daemon", "stop", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(v["stopped"], true, "{v}");
+    assert!(!socket.exists());
+    let out = run(&["daemon", "stop"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("not running"));
 }

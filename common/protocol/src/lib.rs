@@ -36,6 +36,8 @@ pub mod features {
     /// GetLandStatus 与按 request id 的幂等合入。
     pub const LAND_STATUS: &str = "land.status";
     pub const REFS: &str = "refs";
+    /// WatchRefs：订阅 ref 变化。
+    pub const REFS_WATCH: &str = "refs.watch";
     pub const QUERY_READ_FILE: &str = "query.read_file";
     pub const QUERY_LIST_DIR: &str = "query.list_dir";
     pub const QUERY_LOG: &str = "query.log";

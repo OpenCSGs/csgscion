@@ -1,0 +1,36 @@
+[package]
+name = "scion-daemon"
+description = "Scion node daemon (L1): local object cache, transparent forwarding and WatchRefs prefetch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+axum = { version = "0.8", default-features = false }
+bytes.workspace = true
+hex.workspace = true
+http.workspace = true
+moka.workspace = true
+scion-client.workspace = true
+scion-flight.workspace = true
+scion-object.workspace = true
+scion-proto.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tower = { workspace = true, features = ["util"] }
+tracing.workspace = true
+
+[dev-dependencies]
+# 只有测试可以在进程内拉起服务端（客户端文档 §0）
+scion-api.workspace = true
+scion-store.workspace = true
+tempfile.workspace = true
+scion-wc.workspace = true
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

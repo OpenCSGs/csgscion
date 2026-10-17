@@ -14,6 +14,11 @@ path = "src/main.rs"
 clap.workspace = true
 bytes.workspace = true
 scion-client.workspace = true
+scion-daemon.workspace = true
+tonic.workspace = true
+tower = { workspace = true, features = ["util"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tracing-subscriber.workspace = true
 scion-gitimport.workspace = true
 scion-wc.workspace = true
 scion-proto.workspace = true
