@@ -130,6 +130,7 @@ server/              server side (may depend on common and lower server crates)
   store/             scion-store       MetaStore / BlobStore traits, in-memory backend, conformance suite
   store-sql/         scion-store-sql   SQLite / PostgreSQL metadata store
   store-blob/        scion-store-blob  local directory / S3-compatible object store
+  auth/              scion-auth        tokens, external issuers (JWKS / HS256), introspection, OIDC, ACL
   tree/              scion-tree        incremental tree building
   merge/             scion-merge       server-side rebase: replay a delta onto a newer tree with three-way merge
   land/              scion-land        changeset creation, stack rebase, LandCoordinator, leases

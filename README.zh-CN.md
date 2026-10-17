@@ -85,6 +85,7 @@ server/              服务端（可依赖 common 与更低层的 server crate�
   store/             scion-store       MetaStore / BlobStore trait、内存实现、后端一致性测试套件
   store-sql/         scion-store-sql   SQLite / PostgreSQL 元数据存储
   store-blob/        scion-store-blob  本地目录 / S3 兼容对象存储
+  auth/              scion-auth        令牌、外部签发方（JWKS / HS256）、内省、OIDC、ACL
   tree/              scion-tree        增量建树
   merge/             scion-merge       服务端 rebase：把 delta 重放到更新的目录树上，三方合并
   land/              scion-land        创建提交、提交栈 rebase、LandCoordinator、租约
