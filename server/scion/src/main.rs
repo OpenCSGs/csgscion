@@ -411,26 +411,35 @@ async fn reindex(args: &ReindexArgs, env: impl Fn(&str) -> Option<String>) -> an
     Ok(out)
 }
 
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
+/// 立即注册 SIGINT / SIGTERM（在打印「listening」之前，避免信号在注册前到达时进程被默认处理杀掉），
+/// 返回收到信号时完成的 future。
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
     #[cfg(unix)]
-    let term = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut s) => {
-                s.recv().await;
+    let term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    #[cfg(unix)]
+    let int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
+    async move {
+        #[cfg(unix)]
+        {
+            let wait = |s: Option<tokio::signal::unix::Signal>| async move {
+                match s {
+                    Some(mut s) => {
+                        s.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                () = wait(term) => {},
+                () = wait(int) => {},
             }
-            Err(_) => std::future::pending::<()>().await,
         }
-    };
-    #[cfg(not(unix))]
-    let term = std::future::pending::<()>();
-    tokio::select! {
-        () = ctrl_c => {},
-        () = term => {},
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        tracing::info!("shutdown signal received, draining");
     }
-    tracing::info!("shutdown signal received, draining");
 }
 
 async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
@@ -442,9 +451,10 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
     if backends.contains("meta=mem") || backends.contains("blobs=mem") {
         tracing::warn!("in-memory storage in use; data is lost on exit");
     }
+    let shutdown = shutdown_signal();
     // 集成测试按这一行解析实际监听地址，修改时同步 tests/
     tracing::info!(%addr, repos = ?args.repos, %backends, "scion server listening");
-    scion_api::serve(listener, app, shutdown_signal()).await?;
+    scion_api::serve(listener, app, shutdown).await?;
     tracing::info!("scion server stopped");
     Ok(())
 }
@@ -456,10 +466,11 @@ async fn run_cache(args: CacheArgs) -> anyhow::Result<()> {
         .with_context(|| format!("bind {}", args.listen))?;
     let addr = listener.local_addr()?;
     let (node, info, channels) = scion_cache::build(&config).await?;
+    let shutdown = shutdown_signal();
     // 集成测试按这一行解析实际监听地址
     tracing::info!(%addr, upstreams = ?config.upstreams, peers = ?config.peers,
         disk = ?config.storage.disk.as_ref().map(|d| d.dir.display().to_string()), "scion cache listening");
-    scion_cache::serve_node(listener, node, info, channels, &config, shutdown_signal()).await?;
+    scion_cache::serve_node(listener, node, info, channels, &config, shutdown).await?;
     tracing::info!("scion cache stopped");
     Ok(())
 }
