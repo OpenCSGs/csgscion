@@ -281,7 +281,9 @@ mod tests {
         let unsupported = |e: crate::Error| matches!(e, crate::Error::Backend(m) if m.contains("not supported"));
         assert!(unsupported(s.put_redactions(&[]).await.expect_err("put")));
         assert!(unsupported(s.get_redactions("r", &[id]).await.expect_err("get")));
-        assert!(unsupported(s.list_redactions(&RedactionFilter::default()).await.expect_err("list")));
+        assert!(unsupported(
+            s.list_redactions(&RedactionFilter::default()).await.expect_err("list")
+        ));
         assert!(unsupported(s.object_repos(&id).await.expect_err("repos")));
         assert!(unsupported(s.list_leases().await.expect_err("leases")));
         assert!(unsupported(s.get_setting("k").await.expect_err("setting")));

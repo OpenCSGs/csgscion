@@ -181,7 +181,10 @@ mod tests {
             Err(Error::Backend(m)) if m.contains("not supported")
         ));
         let cached = CachedBlobs::new(back, BlobCacheConfig::default());
-        assert!(cached.delete(&ObjectId::of_blob(b"x")).await.is_err(), "errors pass through");
+        assert!(
+            cached.delete(&ObjectId::of_blob(b"x")).await.is_err(),
+            "errors pass through"
+        );
     }
 
     #[tokio::test]
