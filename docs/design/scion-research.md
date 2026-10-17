@@ -351,7 +351,7 @@ scn sparse add|rm <dir>
 
 ### 11.1 仓库结构建议
 ```
-csgscion/
+scion/
   proto/scion/v1/*.proto        # 唯一事实来源，三层共用
   pkg/object/                   # 哈希、编码、Tree/Changeset、diff3
   pkg/metastore/{sqlite,pg,yb}/ # 接口 + 实现
